@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/rogpeppe/go-internal/testscript"
 )
 
@@ -643,6 +644,163 @@ func TestResolveCityFlag(t *testing.T) {
 			t.Errorf("resolveCity() = %q, want %q", got, cityDir)
 		}
 	})
+}
+
+// --- validateCityPath: resolve --city by registered name (gascity#1449 / cc-mu6) ---
+
+// TestValidateCityPathAcceptsRegisteredCityName covers the upstream fix for
+// gascity#1449: `gc --city <name>` should resolve via the supervisor
+// registry, not just by treating <name> as a relative path.
+func TestValidateCityPathAcceptsRegisteredCityName(t *testing.T) {
+	setupRegistry := func(t *testing.T, registeredName string) (cityPath string) {
+		t.Helper()
+		gcHome := t.TempDir()
+		t.Setenv("GC_HOME", gcHome)
+
+		cityRoot := t.TempDir()
+		cityPath = filepath.Join(cityRoot, "my-city")
+		if err := os.MkdirAll(cityPath, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cityPath, "city.toml"),
+			[]byte("[workspace]\nname = \""+registeredName+"\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		reg := supervisor.NewRegistry(supervisor.RegistryPath())
+		if err := reg.Register(cityPath, registeredName); err != nil {
+			t.Fatalf("seeding registry: %v", err)
+		}
+		return cityPath
+	}
+
+	t.Run("bare_name_resolves_via_registry", func(t *testing.T) {
+		cityPath := setupRegistry(t, "trader")
+
+		got, err := validateCityPath("trader")
+		if err != nil {
+			t.Fatalf("validateCityPath(\"trader\") = err %v, want registered city path", err)
+		}
+		if canonicalTestPath(got) != canonicalTestPath(cityPath) {
+			t.Errorf("validateCityPath(\"trader\") = %q, want %q", got, cityPath)
+		}
+	})
+
+	t.Run("absolute_path_still_works", func(t *testing.T) {
+		cityPath := setupRegistry(t, "trader")
+
+		got, err := validateCityPath(cityPath)
+		if err != nil {
+			t.Fatalf("validateCityPath(abs path) error: %v", err)
+		}
+		if canonicalTestPath(got) != canonicalTestPath(cityPath) {
+			t.Errorf("validateCityPath(abs path) = %q, want %q", got, cityPath)
+		}
+	})
+
+	t.Run("registered_name_wins_over_cwd_dir_with_same_name", func(t *testing.T) {
+		// The user wrote `gc --city trader`. There happens to be a
+		// "./trader" directory in cwd that is NOT a city. Without the
+		// registry-first lookup, the old code would call filepath.Abs
+		// → cwd/trader → "not a city directory". Verify the registry
+		// match takes precedence and we resolve to the real city.
+		cityPath := setupRegistry(t, "trader")
+
+		cwd := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(cwd, "trader"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		old, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(old) })
+
+		got, err := validateCityPath("trader")
+		if err != nil {
+			t.Fatalf("validateCityPath(\"trader\") = err %v, want registered city path even when cwd has a sibling dir", err)
+		}
+		if canonicalTestPath(got) != canonicalTestPath(cityPath) {
+			t.Errorf("validateCityPath(\"trader\") = %q, want registered %q (not cwd/trader)", got, cityPath)
+		}
+	})
+
+	t.Run("unknown_bare_name_errors_with_helpful_hint", func(t *testing.T) {
+		setupRegistry(t, "trader")
+
+		_, err := validateCityPath("nonexistent-city-name")
+		if err == nil {
+			t.Fatal("validateCityPath(unknown name) should error")
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "nonexistent-city-name") || !strings.Contains(msg, "gc cities") {
+			t.Errorf("error %q should mention the bare name and `gc cities` hint", msg)
+		}
+	})
+
+	t.Run("path_input_skips_registry_lookup", func(t *testing.T) {
+		// Inputs containing a path separator must NOT be treated as
+		// registered names — they go straight to filesystem validation.
+		// This protects users who pass relative paths like "./foo" or
+		// fully-qualified absolute paths from accidental registry hits.
+		setupRegistry(t, "trader")
+
+		dir := t.TempDir()
+		path := filepath.Join(dir, "trader")
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := validateCityPath(path)
+		if err == nil {
+			t.Errorf("validateCityPath(%q) should error: it's a path input that is not a city directory and must not silently match the registry", path)
+		}
+	})
+
+	t.Run("missing_registry_falls_back_to_path_validation", func(t *testing.T) {
+		// If the registry file does not exist (fresh machine), bare
+		// names should still produce the helpful error rather than
+		// crashing on registry I/O.
+		gcHome := t.TempDir() // no cities.toml inside
+		t.Setenv("GC_HOME", gcHome)
+
+		_, err := validateCityPath("trader")
+		if err == nil {
+			t.Fatal("validateCityPath should error on a fresh machine with no registry")
+		}
+		if !strings.Contains(err.Error(), "gc cities") {
+			t.Errorf("error %q should still hint at `gc cities` even when registry is missing", err.Error())
+		}
+	})
+}
+
+func TestLooksLikeBareCityName(t *testing.T) {
+	cases := []struct {
+		input string
+		want  bool
+	}{
+		{"trader", true},
+		{"my-city", true},
+		{"city.with.dots", true},
+		{"", false},
+		{"./trader", false},
+		{"../trader", false},
+		{"~/trader", false},
+		{"/abs/path", false},
+		{"rel/path", false},
+		{"sub\\windows", false},
+		{".hidden", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			if got := looksLikeBareCityName(tc.input); got != tc.want {
+				t.Errorf("looksLikeBareCityName(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
 }
 
 // --- doRigAdd (with fsys.Fake) ---

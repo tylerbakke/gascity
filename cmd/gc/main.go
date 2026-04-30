@@ -438,7 +438,28 @@ func resolveContextFromPath(path string) (resolvedContext, error) {
 }
 
 // validateCityPath resolves and validates a path as a city directory.
+// validateCityPath resolves the value of the --city flag (or equivalent
+// env vars) to an absolute city root path.
+//
+// Resolution order:
+//
+//  1. If the input looks like a bare name (no path separators, no leading
+//     '.', '/' or '~'), try the supervisor registry first. This lets users
+//     write `gc --city trader` instead of needing the absolute path.
+//  2. Fall back to filesystem-path validation: an absolute or relative path
+//     that resolves to a directory containing city.toml or .gc/.
+//
+// On miss, the error message points the user at `gc cities` so they know
+// how to discover registered names. Registry I/O errors are non-fatal at
+// this layer — a missing or unreadable registry simply means we skip step
+// (1) and let path validation produce the canonical error.
 func validateCityPath(p string) (string, error) {
+	if looksLikeBareCityName(p) {
+		if entry, ok, err := lookupRegisteredCityByName(p); err == nil && ok {
+			return entry.Path, nil
+		}
+	}
+
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return "", err
@@ -446,7 +467,29 @@ func validateCityPath(p string) (string, error) {
 	if citylayout.HasCityConfig(abs) || citylayout.HasRuntimeRoot(abs) {
 		return abs, nil
 	}
+
+	if looksLikeBareCityName(p) {
+		return "", fmt.Errorf("city %q is not a registered city name and not a directory in the current cwd; run `gc cities` to list registered cities, or pass an absolute path", p)
+	}
 	return "", fmt.Errorf("not a city directory: %s (no city.toml or .gc/ found)", abs)
+}
+
+// looksLikeBareCityName reports whether p is plausibly a registered-city
+// alias rather than a filesystem path. Inputs that contain a path
+// separator, or that begin with '.', '/', or '~', are treated as paths
+// and skip the registry lookup. Empty strings are handled by the caller.
+func looksLikeBareCityName(p string) bool {
+	if p == "" {
+		return false
+	}
+	if strings.ContainsAny(p, "/\\") {
+		return false
+	}
+	switch p[0] {
+	case '.', '~':
+		return false
+	}
+	return true
 }
 
 // resolveRigToContext resolves a rig name or path to a full context by scanning

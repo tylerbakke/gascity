@@ -118,6 +118,27 @@ func registeredCityEntry(cityPath string) (supervisor.CityEntry, bool, error) {
 	return supervisor.CityEntry{}, false, nil
 }
 
+// lookupRegisteredCityByName resolves a registered city name (the
+// EffectiveName surfaced by `gc cities`) to its registry entry. Returns
+// (entry, true, nil) on a match, (zero, false, nil) when no city is
+// registered under that name, and (zero, false, err) only on registry
+// I/O errors. A missing registry file is not an error: it is reported
+// as "not found" so callers can fall back to alternative resolution
+// strategies (e.g. treating the input as a filesystem path).
+func lookupRegisteredCityByName(name string) (supervisor.CityEntry, bool, error) {
+	reg := supervisor.NewRegistry(supervisor.RegistryPath())
+	entries, err := reg.List()
+	if err != nil {
+		return supervisor.CityEntry{}, false, err
+	}
+	for _, entry := range entries {
+		if entry.EffectiveName() == name {
+			return entry, true, nil
+		}
+	}
+	return supervisor.CityEntry{}, false, nil
+}
+
 func cityUsesManagedReconciler(cityPath string) bool {
 	if controllerAlive(cityPath) != 0 {
 		return true
