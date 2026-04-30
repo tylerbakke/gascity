@@ -252,6 +252,19 @@ export function cityAPI(cityName: string) {
       });
     },
 
+    // sendMessage POSTs a nudge into a running session's tmux pane via
+    // the supervisor's typed messages endpoint. The supervisor handles
+    // wait-nudge withdrawal and convoy bookkeeping; callers only supply
+    // the session ID and the message text. Used by the oversight panel
+    // and the command palette so users can talk to agents from the
+    // browser without dropping into a terminal.
+    sendMessage(sessionId: string, message: string) {
+      return api.POST("/v0/city/{cityName}/session/{id}/messages", {
+        params: { path: { cityName, id: sessionId }, header: mutationHeaders },
+        body: { message },
+      });
+    },
+
     sling(body: { bead: string; rig?: string; target: string }) {
       return api.POST("/v0/city/{cityName}/sling", {
         params: { path: { cityName }, header: mutationHeaders },

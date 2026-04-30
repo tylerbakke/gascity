@@ -20,6 +20,7 @@ import {
   type DashboardResource,
 } from "./state";
 import { renderSupervisorOverview } from "./panels/supervisor";
+import { renderOversight, installOversightInteractions } from "./panels/oversight";
 import { installSharedModals } from "./modals";
 
 const CITY_SCOPED_PANEL_IDS = [
@@ -106,6 +107,7 @@ function installInteractions(): void {
   installConvoyInteractions();
   installActivityInteractions();
   installAdminInteractions();
+  installOversightInteractions();
   installCommandPalette({ refreshAll });
 }
 
@@ -245,6 +247,13 @@ async function refreshVisibleResources(force = false): Promise<void> {
 
   if (dirty.has("supervisor") || dirty.has("cities")) {
     renderSupervisorOverview();
+    // Oversight piggybacks on the same gate as supervisor overview:
+    // both are supervisor-mode-only and care about the city list.
+    // The render fans out per-city /sessions calls internally, so we
+    // fire-and-forget here and let it surface its own errors. Adding
+    // it as a tracked task would gate the whole refresh on per-city
+    // session timeouts, which we don't want.
+    void renderOversight().catch((error) => reportUIError("Oversight refresh failed", error));
   }
 }
 

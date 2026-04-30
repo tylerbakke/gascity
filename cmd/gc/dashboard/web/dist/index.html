@@ -48,6 +48,34 @@
           <div class="panel-body" id="supervisor-overview-body"></div>
         </div>
 
+        <div class="panel panel-full" id="oversight-panel" hidden>
+          <div class="panel-header">
+            <h2>📡 Oversight</h2>
+            <span class="count" id="oversight-session-count">0</span>
+            <button class="collapse-btn" aria-label="Toggle panel">▼</button>
+            <button class="expand-btn">Expand</button>
+          </div>
+          <div class="panel-body">
+            <div id="oversight-sessions" class="oversight-sessions"></div>
+            <form id="oversight-chat-form" class="oversight-chat-form" autocomplete="off">
+              <label class="oversight-chat-label" for="oversight-chat-target">
+                Send to:
+                <select id="oversight-chat-target" name="target"></select>
+              </label>
+              <textarea
+                id="oversight-chat-input"
+                name="message"
+                rows="3"
+                placeholder="Type a nudge — Cmd+Enter to send"
+              ></textarea>
+              <div class="oversight-chat-actions">
+                <span id="oversight-chat-status" class="oversight-chat-status"></span>
+                <button type="submit" id="oversight-chat-send" class="primary">Send</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
         <div class="panel" id="convoy-panel">
           <div class="panel-header">
             <h2>🚚 Convoys</h2>
