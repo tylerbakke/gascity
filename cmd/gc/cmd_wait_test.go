@@ -84,21 +84,16 @@ func waitTestRealBDPath(t *testing.T) string {
 	t.Helper()
 	skipSlowCmdGCTest(t, "requires a managed bd lifecycle city; run make test-cmd-gc-process for full coverage")
 	waitTestRealBDPathOnce.Do(func() {
-		for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
-			if strings.TrimSpace(dir) == "" {
-				continue
-			}
-			candidate := filepath.Join(dir, "bd")
-			info, err := os.Stat(candidate)
-			if err != nil || info.IsDir() {
-				continue
-			}
-			cmd := exec.Command(candidate, "init", "--help")
-			out, err := cmd.CombinedOutput()
-			if err == nil || !strings.Contains(string(out), `unknown subcommand "init"`) {
-				waitTestRealBDCached = candidate
-				return
-			}
+		candidate, err := findPreferredBinary("bd")
+		if err != nil {
+			waitTestRealBDErr = errors.New("bd with init not installed")
+			return
+		}
+		cmd := exec.Command(candidate, "init", "--help")
+		out, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), `unknown subcommand "init"`) {
+			waitTestRealBDCached = candidate
+			return
 		}
 		waitTestRealBDErr = errors.New("bd with init not installed")
 	})

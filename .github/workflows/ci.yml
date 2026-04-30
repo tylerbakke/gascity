@@ -86,42 +86,19 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Pinned dependency versions — keep in sync with deps.env.
-      DOLT_VERSION: "1.86.1"
-      BD_VERSION: "v1.0.0"
+      DOLT_VERSION: "1.86.6"
+      BD_VERSION: "v1.0.3"
       # Make TestGeneratedClientInSync fatal on missing oapi-codegen so the
       # spec→client drift check can never silently skip in CI.
       GC_REQUIRE_OAPI_CODEGEN: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+      - uses: ./.github/actions/setup-gascity-ubuntu
         with:
-          go-version: "1.25.8"
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y tmux jq
-
-      - name: Install dolt v${{ env.DOLT_VERSION }}
-        run: |
-          curl -fsSL https://github.com/dolthub/dolt/releases/download/v${{ env.DOLT_VERSION }}/install.sh | sudo bash
-          dolt version
-
-      - name: Install released bd v${{ env.BD_VERSION }}
-        run: |
-          archive="beads_${BD_VERSION#v}_linux_amd64.tar.gz"
-          mkdir -p "$RUNNER_TEMP/beads"
-          curl -fsSL -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/gastownhall/beads/releases/download/${BD_VERSION}/${archive}"
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/beads" bd
-          sudo install -m 0755 "$RUNNER_TEMP/beads/bd" /usr/local/bin/bd
-          bd version
-
-      - name: Install Claude CLI
-        run: npm install -g @anthropic-ai/claude-code
+          dolt-version: ${{ env.DOLT_VERSION }}
+          bd-version: ${{ env.BD_VERSION }}
+          install-claude-cli: "true"
 
       - name: Install tools
         run: make install-tools
@@ -176,8 +153,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      DOLT_VERSION: "1.86.1"
-      BD_VERSION: "v1.0.0"
+      DOLT_VERSION: "1.86.6"
+      BD_VERSION: "v1.0.3"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu
@@ -213,8 +190,8 @@ jobs:
             timeout_minutes: 35
             command: make test-integration-rest
     env:
-      DOLT_VERSION: "1.86.1"
-      BD_VERSION: "v1.0.0"
+      DOLT_VERSION: "1.86.6"
+      BD_VERSION: "v1.0.3"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu
@@ -841,34 +818,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+      - uses: ./.github/actions/setup-gascity-ubuntu
         with:
-          go-version: "1.25.8"
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y tmux jq
-      - name: Install dolt
-        run: |
-          curl -fsSL https://github.com/dolthub/dolt/releases/download/v${{ env.DOLT_VERSION }}/install.sh | sudo bash
-      - name: Install released bd v${{ env.BD_VERSION }}
-        run: |
-          archive="beads_${BD_VERSION#v}_linux_amd64.tar.gz"
-          mkdir -p "$RUNNER_TEMP/beads"
-          curl -fsSL -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/gastownhall/beads/releases/download/${BD_VERSION}/${archive}"
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/beads" bd
-          sudo install -m 0755 "$RUNNER_TEMP/beads/bd" /usr/local/bin/bd
-      - name: Install Claude CLI
-        run: npm install -g @anthropic-ai/claude-code
+          dolt-version: ${{ env.DOLT_VERSION }}
+          bd-version: ${{ env.BD_VERSION }}
+          install-claude-cli: "true"
       - name: Install tools
         run: make install-tools
       - name: Pack compatibility tests
         run: make test-acceptance
     env:
-      DOLT_VERSION: "1.86.1"
-      BD_VERSION: "v1.0.0"
+      DOLT_VERSION: "1.86.6"
+      BD_VERSION: "v1.0.3"
 
   # Dashboard SPA typecheck + tests + build. Runs on every push/PR
   # so TS drift against the spec (e.g. a query param tightening from
@@ -885,7 +846,7 @@ jobs:
         with:
           node-version: "22"
       - name: Install SPA dependencies
-        run: npm install --silent
+        run: npm ci --silent
         working-directory: cmd/gc/dashboard/web
       - name: Verify generated TS schema is in sync
         run: |
@@ -927,7 +888,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install mcp_agent_mail
-        run: pip install 'mcp-agent-mail==0.1.0'
+        run: python -m pip install --require-hashes -r .github/requirements/mcp-agent-mail.txt
 
       - name: MCP mail conformance test
         run: make test-mcp-mail

@@ -7,8 +7,8 @@ permissions:
   contents: read
 
 env:
-  DOLT_VERSION: "1.86.1"
-  BD_VERSION: "v1.0.0"
+  DOLT_VERSION: "1.86.6"
+  BD_VERSION: "v1.0.3"
 
 jobs:
   # Reuse the shared CI graph so RC inherits new parity checks automatically.
@@ -309,18 +309,9 @@ jobs:
         with:
           # The mac runner still needs Go for `make test`, but not for building bd.
           cache: false
-          go-version: "1.25.8"
+          go-version: "1.25.9"
       - name: Install released bd
-        run: |
-          BD_MAC_RELEASE_TARBALL="beads_${BD_VERSION#v}_darwin_arm64.tar.gz"
-          mkdir -p "$HOME/.local/bin"
-          mkdir -p "$RUNNER_TEMP/beads"
-          curl -fsSL -o "$RUNNER_TEMP/$BD_MAC_RELEASE_TARBALL" \
-            "https://github.com/gastownhall/beads/releases/download/${BD_VERSION}/${BD_MAC_RELEASE_TARBALL}"
-          tar -xzf "$RUNNER_TEMP/$BD_MAC_RELEASE_TARBALL" -C "$RUNNER_TEMP/beads" --strip-components=1
-          install -m 0755 "$RUNNER_TEMP/beads/bd" "$HOME/.local/bin/bd"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/bd" version
+        run: .github/scripts/install-bd-archive.sh "${{ env.BD_VERSION }}" --cache
       - name: Run make test
         run: make test
 

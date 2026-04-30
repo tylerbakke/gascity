@@ -1054,6 +1054,95 @@ func TestResolveSessionNameWithStore(t *testing.T) {
 	}
 }
 
+type noBroadSessionNameLookupStore struct {
+	*beads.MemStore
+	t *testing.T
+}
+
+func (s noBroadSessionNameLookupStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == sessionBeadLabel && len(query.Metadata) == 0 {
+		s.t.Fatalf("session name lookup used broad session label scan: %+v", query)
+	}
+	return s.MemStore.List(query)
+}
+
+func TestFindSessionNameByTemplateUsesTargetedLookup(t *testing.T) {
+	store := noBroadSessionNameLookupStore{MemStore: beads.NewMemStore(), t: t}
+	_, err := store.Create(beads.Bead{
+		Title:  "worker-pool",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":           "worker",
+			"template":             "worker",
+			"session_name":         "s-pool",
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":   "worker",
+			"session_name": "s-worker",
+			"state":        "asleep",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := findSessionNameByTemplate(store, "worker")
+	if got != "s-worker" {
+		t.Fatalf("findSessionNameByTemplate(worker) = %q, want s-worker", got)
+	}
+}
+
+func TestResolveTemplateSessionBeadIDUsesTargetedLookup(t *testing.T) {
+	store := noBroadSessionNameLookupStore{MemStore: beads.NewMemStore(), t: t}
+	bead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":   "worker",
+			"session_name": "s-worker",
+			"state":        "asleep",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := &agentBuildParams{
+		cityName:   "phase0-city",
+		cityPath:   t.TempDir(),
+		workspace:  &config.Workspace{Provider: "test-agent"},
+		providers:  map[string]config.ProviderSpec{"test-agent": {DisplayName: "Test Agent", Command: "true"}},
+		lookPath:   func(string) (string, error) { return filepath.Join("/usr/bin", "true"), nil },
+		fs:         fsys.OSFS{},
+		beaconTime: time.Unix(0, 0),
+		beadNames:  make(map[string]string),
+		beadStore:  store,
+		stderr:     io.Discard,
+	}
+	agentCfg := &config.Agent{
+		Name:     "worker",
+		Provider: "test-agent",
+	}
+
+	tp, err := resolveTemplate(params, agentCfg, agentCfg.QualifiedName(), nil)
+	if err != nil {
+		t.Fatalf("resolveTemplate: %v", err)
+	}
+	if got := tp.Env["GC_SESSION_ID"]; got != bead.ID {
+		t.Fatalf("GC_SESSION_ID = %q, want %q", got, bead.ID)
+	}
+}
+
 func TestFindSessionNameByTemplate_SkipsClosedBeads(t *testing.T) {
 	store := beads.NewMemStore()
 	b, err := store.Create(beads.Bead{
