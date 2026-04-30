@@ -500,6 +500,115 @@ func TestSweepUndesiredPoolSessionBeads_SweepsStaleCreatingState(t *testing.T) {
 	}
 }
 
+// Stale beads carrying pending_create_claim=true (in-flight create marker)
+// MUST be sweepable once the bead has aged past staleCreatingStateTimeout
+// without lifecycle progress (no last_woke_at written, no state advance).
+//
+// Without this, a never-cleared claim flag protects the bead from sweep
+// indefinitely. Observed in jarvis 2026-04-29: pool session beads created
+// by createPoolSessionBead with pending_create_claim=true sat stuck in
+// state=creating for >6 minutes because the lifecycle Start() attempt was
+// silently lost — the reconciler never emitted a creation-attempt trace
+// record, never wrote last_woke_at, and the existing sweep predicate at
+// city_runtime.go skipped the bead solely because pending_create_claim
+// was still set. The bead became permanently undead, blocking the
+// pool's ability to recreate.
+//
+// The fix mirrors the symmetric protection on state="creating" by
+// reusing isStaleCreating(CreatedAt). Both protections are markers for
+// "create is in flight" and should expire on the same schedule.
+//
+// Upstream: github.com/gastownhall/gascity#1542
+// Mirror bead: command-center/cc-0w7
+func TestSweepUndesiredPoolSessionBeads_SweepsStuckPendingCreateClaim(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:worker"},
+		Metadata: map[string]string{
+			"session_name":         "worker-bd-stuck-claim",
+			"template":             "worker",
+			"agent_name":           "worker",
+			"pool_slot":            "1",
+			poolManagedMetadataKey: boolMetadata(true),
+			// The actual stuck-bead shape observed in jarvis: claim is
+			// set, state never advanced past "creating", last_woke_at
+			// was never written because Start() never landed.
+			"pending_create_claim": "true",
+			"state":                "creating",
+			"continuation_epoch":   "1",
+			"generation":           "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	bead.CreatedAt = time.Now().Add(-2 * time.Minute)
+	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
+
+	closed := sweepUndesiredPoolSessionBeads(
+		store,
+		nil,
+		sessionBeads,
+		nil,
+		&config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}},
+		runtime.NewFake(),
+		false,
+	)
+	if closed != 1 {
+		t.Fatalf("closed = %d, want 1 — stuck pending_create_claim past staleCreatingStateTimeout must be sweepable", closed)
+	}
+}
+
+// Fresh beads with pending_create_claim=true (claim was just set, lifecycle
+// hasn't advanced yet) MUST remain protected. This is the transient window
+// the existing protection was designed for, and it must keep working.
+func TestSweepUndesiredPoolSessionBeads_SkipsFreshPendingCreateClaim(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:worker"},
+		Metadata: map[string]string{
+			"session_name":         "worker-bd-fresh-claim",
+			"template":             "worker",
+			"agent_name":           "worker",
+			"pool_slot":            "1",
+			poolManagedMetadataKey: boolMetadata(true),
+			"pending_create_claim": "true",
+			"state":                "creating",
+			"continuation_epoch":   "1",
+			"generation":           "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// CreatedAt remains "now" — well within the protection window.
+	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
+
+	closed := sweepUndesiredPoolSessionBeads(
+		store,
+		nil,
+		sessionBeads,
+		nil,
+		&config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}},
+		runtime.NewFake(),
+		false,
+	)
+	if closed != 0 {
+		t.Fatalf("closed = %d, want 0 — fresh pending_create_claim must be preserved", closed)
+	}
+	got, err := store.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status == "closed" {
+		t.Fatalf("fresh pending_create_claim bead was swept: %+v", got)
+	}
+}
+
 // Stale post-creating beads (state=active, last_woke_at="",
 // creation_complete_at older than staleCreatingStateTimeout) MUST be
 // sweepable. Without this, the grace window would never expire.
@@ -818,11 +927,24 @@ func TestSweepUndesiredPoolSessionBeads_SkipsPendingCreateClaim(t *testing.T) {
 	}
 }
 
-// pending_create_claim is an authoritative ownership flag for the lifecycle
-// reconciler (sessionStartRequested in session_reconcile.go). The sweep must
-// honor that contract regardless of age — expiring it here would let the
-// sweep close a bead the reconciler still considers live.
-func TestSweepUndesiredPoolSessionBeads_SkipsStalePendingCreateClaim(t *testing.T) {
+// pending_create_claim is the lifecycle reconciler's in-flight ownership
+// flag. The sweep honors that contract while the claim is fresh, but
+// MUST bound the protection by age — a never-cleared claim must not
+// protect the bead from sweep forever.
+//
+// Previously this test asserted "skip regardless of age" (the original
+// contract), which turned out to be the root of jarvis 2026-04-29:
+// pool session beads with pending_create_claim=true sat stuck >6
+// minutes because the lifecycle Start() attempt was silently lost,
+// the reconciler emitted no creation-attempt trace records, and this
+// sweep predicate kept the bead alive indefinitely. The fix bounds
+// the claim protection by isStaleCreating(CreatedAt) — symmetric with
+// the state="creating" protection on the next predicate — so the
+// sweep can recover the pool when the lifecycle stalls.
+//
+// Upstream: github.com/gastownhall/gascity#1542
+// Mirror bead: command-center/cc-0w7
+func TestSweepUndesiredPoolSessionBeads_SweepsStalePendingCreateClaim(t *testing.T) {
 	store := beads.NewMemStore()
 	bead, err := store.Create(beads.Bead{
 		Title:  "worker",
@@ -854,8 +976,8 @@ func TestSweepUndesiredPoolSessionBeads_SkipsStalePendingCreateClaim(t *testing.
 		runtime.NewFake(),
 		false,
 	)
-	if closed != 0 {
-		t.Fatalf("closed = %d, want 0 — pending_create_claim must remain authoritative regardless of age", closed)
+	if closed != 1 {
+		t.Fatalf("closed = %d, want 1 — pending_create_claim past staleCreatingStateTimeout must be sweepable", closed)
 	}
 }
 

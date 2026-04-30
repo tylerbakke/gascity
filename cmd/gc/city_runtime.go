@@ -1466,16 +1466,25 @@ func sweepUndesiredPoolSessionBeads(
 		// sessionStartRequested (session_reconcile.go) exactly so the two
 		// loops agree about ownership:
 		//   - pending_create_claim=true: in-flight create claim, protected
-		//     regardless of age until the lifecycle clears it.
+		//     until staleCreatingStateTimeout has elapsed. Bounding by age
+		//     is essential — without it, a never-cleared claim flag
+		//     protects the bead from sweep forever. Observed in jarvis
+		//     2026-04-29: pool session beads with pending_create_claim=true
+		//     sat stuck in state=creating >6 minutes because the lifecycle
+		//     Start() attempt was silently lost; the bead never advanced
+		//     and the pool could not recreate it. The age bound matches
+		//     state=creating's protection below for symmetry — both
+		//     markers say "create is in flight" and should expire on the
+		//     same schedule (gh-gastownhall/gascity-1542 / cc-0w7).
 		//   - state=creating: protected until staleCreatingState would
 		//     return true (i.e., until staleCreatingStateTimeout has
 		//     elapsed; zero CreatedAt is treated as stale, matching
 		//     staleCreatingState in session_reconcile.go).
-		// Without this, a pool's freshly-created session bead gets swept
+		// Without these, a pool's freshly-created session bead gets swept
 		// on the same tick it's created (no work assigned →
 		// GCSweepSessionBeads closes it), spinning the pool in a rapid
 		// create→sweep→recreate loop.
-		if strings.TrimSpace(bead.Metadata["pending_create_claim"]) == "true" {
+		if strings.TrimSpace(bead.Metadata["pending_create_claim"]) == "true" && !isStaleCreating(bead.CreatedAt) {
 			continue
 		}
 		if strings.TrimSpace(bead.Metadata["state"]) == "creating" && !isStaleCreating(bead.CreatedAt) {
