@@ -727,6 +727,13 @@ func runHealthScriptZombieScanExcludesRigLocalServers(t *testing.T, rigConfig st
 		t.Fatal(err)
 	}
 
+	// --config paths each process advertises via ps. All three PIDs
+	// claim ownership under this city so the city-ownership check
+	// admits them; the rig PID must still be filtered by the rig-port
+	// exclusion (the property under test), not by ownership.
+	cityConfig := filepath.Join(cityPath, ".gc/runtime/packs/dolt/dolt-config.yaml")
+	rigCityConfig := filepath.Join(cityPath, "rigs/enterprise/.gc/runtime/packs/dolt/dolt-config.yaml")
+
 	// Fake gc: fail so metadata_files() falls back to find.
 	writeExecutable(t, filepath.Join(fakeBin, "gc"), "#!/bin/sh\nexit 1\n")
 
@@ -748,15 +755,23 @@ exit 1
 `, mainPort, mainPID, rigPort, rigPID))
 
 	// Fake ps: handles pid_is_running (-o pid=) and zombie scan (-o args=).
-	writeExecutable(t, filepath.Join(fakeBin, "ps"), `#!/bin/sh
+	// args= responses include a --config path under this city so the
+	// ownership filter admits each PID for further classification.
+	writeExecutable(t, filepath.Join(fakeBin, "ps"), fmt.Sprintf(`#!/bin/sh
 if [ "$1" = "-p" ] && [ "$3" = "-o" ]; then
   case "$4" in
-    pid=) printf ' %s\n' "$2"; exit 0 ;;
-    args=) echo "dolt sql-server"; exit 0 ;;
+    pid=) printf ' %%s\n' "$2"; exit 0 ;;
+    args=)
+      case "$2" in
+        %s) echo "dolt sql-server --config %s"; exit 0 ;;
+        %s) echo "dolt sql-server --config %s"; exit 0 ;;
+        %s) echo "dolt sql-server --config %s"; exit 0 ;;
+      esac
+      ;;
   esac
 fi
 exit 1
-`)
+`, mainPID, cityConfig, rigPID, rigCityConfig, zombiePID, cityConfig))
 
 	// Fake nc: unreachable (no real server).
 	writeExecutable(t, filepath.Join(fakeBin, "nc"), "#!/bin/sh\nexit 1\n")
@@ -820,6 +835,114 @@ func TestHealthScriptZombieScanExcludesRigLocalServers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			runHealthScriptZombieScanExcludesRigLocalServers(t, tc.rigConfig)
 		})
+	}
+}
+
+// TestHealthScriptZombieScanIgnoresOtherCities verifies that Dolt
+// sql-server processes belonging to other registered cities are not
+// flagged as zombies. Regression guard for gt-7ctg: the patrol formula
+// prescribes `kill <zombie_pid>`, so misclassifying another city's
+// Dolt server would cause cross-city interference (or, with literal
+// automation, kill it outright).
+func TestHealthScriptZombieScanIgnoresOtherCities(t *testing.T) {
+	parent := t.TempDir()
+	thisCity := filepath.Join(parent, "this-city")
+	otherCity := filepath.Join(parent, "other-city")
+	for _, d := range []string{thisCity, otherCity} {
+		if err := os.MkdirAll(filepath.Join(d, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, ".beads", "metadata.json"),
+			[]byte(`{"dolt_database":"city"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeBin := t.TempDir()
+
+	mainPort := "19911"
+	mainPID := "525201"
+	otherCityPID := "525202"
+	zombiePID := "525203"
+
+	// --config paths each process advertises via ps.
+	thisCityConfig := filepath.Join(thisCity, ".gc/runtime/packs/dolt/dolt-config.yaml")
+	otherCityConfig := filepath.Join(otherCity, ".gc/runtime/packs/dolt/dolt-config.yaml")
+
+	// Fake gc: fail so metadata_files() falls back to find.
+	writeExecutable(t, filepath.Join(fakeBin, "gc"), "#!/bin/sh\nexit 1\n")
+
+	// Fake pgrep: returns all three PIDs; the script must filter by
+	// server_pid + ownership rather than by what pgrep returns.
+	writeExecutable(t, filepath.Join(fakeBin, "pgrep"),
+		fmt.Sprintf("#!/bin/sh\necho %s\necho %s\necho %s\n", mainPID, otherCityPID, zombiePID))
+
+	// Fake lsof: only the main port has a listener (no rig ports).
+	writeExecutable(t, filepath.Join(fakeBin, "lsof"),
+		fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    -iTCP:%s) echo %s; exit 0 ;;
+  esac
+done
+exit 1
+`, mainPort, mainPID))
+
+	// Fake ps: pid_is_running uses `-o pid=`; zombie scan uses `-o args=`.
+	// Each PID's args= response carries a different --config path so the
+	// script can determine ownership.
+	writeExecutable(t, filepath.Join(fakeBin, "ps"), fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "-p" ] && [ "$3" = "-o" ]; then
+  case "$4" in
+    pid=) printf ' %%s\n' "$2"; exit 0 ;;
+    args=)
+      case "$2" in
+        %s) echo "dolt sql-server --config %s"; exit 0 ;;
+        %s) echo "dolt sql-server --config %s"; exit 0 ;;
+        %s) echo "dolt sql-server --config %s"; exit 0 ;;
+      esac
+      ;;
+  esac
+fi
+exit 1
+`, mainPID, thisCityConfig, otherCityPID, otherCityConfig, zombiePID, thisCityConfig))
+
+	// Fake nc: unreachable (no real server).
+	writeExecutable(t, filepath.Join(fakeBin, "nc"), "#!/bin/sh\nexit 1\n")
+
+	// Fake dolt: SELECT 1 fails (no real server).
+	writeExecutable(t, filepath.Join(fakeBin, "dolt"), "#!/bin/sh\nexit 1\n")
+
+	root := repoRoot(t)
+	cmd := exec.Command("sh", filepath.Join(root, healthScript), "--json")
+	cmd.Env = append(
+		filteredEnv("GC_CITY_PATH", "GC_PACK_DIR", "GC_DOLT_HOST", "GC_DOLT_PORT",
+			"GC_DOLT_USER", "GC_DOLT_PASSWORD", "GC_HEALTH_SKIP_ZOMBIE_SCAN", "PATH"),
+		"GC_CITY_PATH="+thisCity,
+		"GC_PACK_DIR="+root,
+		"GC_DOLT_HOST=127.0.0.1",
+		"GC_DOLT_PORT="+mainPort,
+		"GC_DOLT_USER=root",
+		"GC_DOLT_PASSWORD=",
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("health.sh failed: %v\n%s", err, out)
+	}
+
+	output := string(out)
+
+	// Exactly one zombie: the orphaned server in this city. The other
+	// city's server must be ignored entirely.
+	if !strings.Contains(output, `"zombie_count": 1`) {
+		t.Errorf("expected zombie_count 1; got:\n%s", output)
+	}
+	if strings.Contains(output, otherCityPID) {
+		t.Errorf("other-city Dolt PID %s must not appear in zombie_pids; got:\n%s", otherCityPID, output)
+	}
+	if !strings.Contains(output, zombiePID) {
+		t.Errorf("orphaned this-city PID %s should be in zombie_pids; got:\n%s", zombiePID, output)
 	}
 }
 

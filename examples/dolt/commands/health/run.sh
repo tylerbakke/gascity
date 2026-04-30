@@ -238,6 +238,13 @@ fi
 # Rig-local Dolt servers (configured via dolt.port in config.yaml)
 # are legitimate — exclude any PID listening on a known rig port.
 #
+# Other cities' Dolt servers are also legitimate. Each managed Dolt
+# is launched with `--config <CITY>/.gc/runtime/packs/dolt/...`; if
+# that config path is NOT under our $GC_CITY_PATH, the process belongs
+# to another city and we must ignore it entirely (the patrol formula
+# prescribes `kill <zombie_pid>`, so flagging another city's server is
+# a foot-gun).
+#
 # GC_HEALTH_SKIP_ZOMBIE_SCAN is a test-only escape hatch. Zombie
 # enumeration spawns one `ps` per matching process, which on shared
 # dev machines with many accumulated dolt processes dominates the
@@ -260,12 +267,31 @@ if [ "${GC_HEALTH_SKIP_ZOMBIE_SCAN:-0}" != "1" ]; then
     [ -n "$rig_pid" ] && rig_dolt_pids="$rig_dolt_pids $rig_pid "
   done < "$_meta_cache"
 
+  # Strip any trailing slash so the prefix match below is unambiguous
+  # ("/foo/" would otherwise fail to match "/foo/bar").
+  city_path_prefix="${GC_CITY_PATH%/}"
+
   for p in $(pgrep -x dolt 2>/dev/null || true); do
     [ "$p" = "$server_pid" ] && continue
     case "$rig_dolt_pids" in *" $p "*) continue ;; esac
     cmd=$(ps -p "$p" -o args= 2>/dev/null || true)
     case "$cmd" in
       *sql-server*) ;;
+      *) continue ;;
+    esac
+    # Extract --config <path> (or --config=<path>). Stops at the next
+    # whitespace, which is fine because gas-city always passes an
+    # absolute config path with no embedded spaces.
+    config_path=$(printf '%s' "$cmd" | sed -n 's/.*--config[= ]\{1,\}\([^ ]*\).*/\1/p')
+    # Ownership rule: only flag as zombie if we can positively identify
+    # the process as belonging to THIS city (config under $GC_CITY_PATH).
+    # Unknown ownership ⇒ skip; killing a server we don't own is worse
+    # than leaving an actual zombie for the next patrol cycle.
+    if [ -z "$city_path_prefix" ] || [ -z "$config_path" ]; then
+      continue
+    fi
+    case "$config_path" in
+      "$city_path_prefix"/*) ;;
       *) continue ;;
     esac
     zombie_count=$((zombie_count + 1))
