@@ -136,10 +136,19 @@ cat > "$FILENAME" <<EOF
 Implementation of $BEAD_TITLE.
 EOF
 
-sleep "${GC_POLECAT_WORK_DELAY:-30}"  # Simulate work time (visible speedup when EKS parallelizes)
+sleep "${GC_POLECAT_WORK_DELAY:-3}"  # Simulate work time (override via GC_POLECAT_WORK_DELAY)
 
-git add "$FILENAME"
-git commit -m "feat: $BEAD_TITLE ($BEAD_ID)" 2>/dev/null || true
+# Stage and commit. Skip pre-commit hooks (.beads/ chatter from bd-installed
+# git-hooks can leave the worktree in a half-staged state). Fail loud, not silent.
+if ! git add -- "$FILENAME"; then
+    echo "[$AGENT_SHORT] git add failed for $FILENAME — aborting" >&2
+    exit 1
+fi
+if ! git -c commit.gpgsign=false commit --no-verify \
+        -m "feat: $BEAD_TITLE ($BEAD_ID)"; then
+    echo "[$AGENT_SHORT] git commit failed on $BRANCH — aborting" >&2
+    exit 1
+fi
 echo "[$AGENT_SHORT] Committed on $BRANCH"
 
 # ── Step 5: Push branch (if remote exists) ────────────────────────────────
@@ -158,8 +167,14 @@ echo "[$AGENT_SHORT] Worktree cleaned up. Branch $BRANCH persists."
 # ── Step 7: Hand off to refinery ──────────────────────────────────────────
 
 # Set branch metadata and reassign to the refinery for merge.
+# Refinery filters on status=in_progress, so flip it explicitly during handoff.
 REFINERY="${GC_AGENT%/*}/refinery"
-bd update "$BEAD_ID" --metadata "{\"branch\":\"$BRANCH\"}" --assignee="$REFINERY" 2>/dev/null || true
+if ! bd update "$BEAD_ID" \
+        --metadata "{\"branch\":\"$BRANCH\"}" \
+        --assignee="$REFINERY" \
+        --status=in_progress; then
+    echo "[$AGENT_SHORT] bd handoff failed for $BEAD_ID — refinery will not pick up this branch" >&2
+fi
 
 gc mail send --all "READY FOR MERGE: $BRANCH ($BEAD_TITLE) → $REFINERY" 2>/dev/null || true
 
