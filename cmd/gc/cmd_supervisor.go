@@ -54,6 +54,7 @@ to add cities.`,
 		newSupervisorStopCmd(stdout, stderr),
 		newSupervisorStatusCmd(stdout, stderr),
 		newSupervisorReloadCmd(stdout, stderr),
+		newSupervisorRestartCityCmd(stdout, stderr),
 		newSupervisorLogsCmd(stdout, stderr),
 		newSupervisorInstallCmd(stdout, stderr),
 		newSupervisorUninstallCmd(stdout, stderr),
@@ -211,7 +212,7 @@ func (s *shutdownState) finish(err error) {
 	close(s.done)
 }
 
-func startSupervisorSocket(sockPath string, cancelFn context.CancelFunc, reconcileCh chan reconcileRequest, shut *shutdownState) (net.Listener, error) {
+func startSupervisorSocket(sockPath string, cancelFn context.CancelFunc, reconcileCh chan reconcileRequest, restartCityCh chan restartCityRequest, shut *shutdownState) (net.Listener, error) {
 	os.Remove(sockPath) //nolint:errcheck // remove stale socket from previous crash
 	lis, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -229,7 +230,7 @@ func startSupervisorSocket(sockPath string, cancelFn context.CancelFunc, reconci
 				fmt.Fprintf(os.Stderr, "gc supervisor: socket accept: %v\n", err) //nolint:errcheck
 				continue
 			}
-			go handleSupervisorConn(conn, cancelFn, reconcileCh, shut)
+			go handleSupervisorConn(conn, cancelFn, reconcileCh, restartCityCh, shut)
 		}
 	}()
 	return lis, nil
@@ -237,18 +238,25 @@ func startSupervisorSocket(sockPath string, cancelFn context.CancelFunc, reconci
 
 // handleSupervisorConn reads from a connection and dispatches commands.
 // Supported: "stop" (shutdown), "ping" (liveness check, returns PID),
-// "reload" (trigger immediate reconciliation of all cities).
+// "reload" (trigger immediate reconciliation of all cities),
+// "restart-city <name> force=<bool> timeout_ms=<int>" (per-city
+// controller hot-swap).
 //
 // For "stop", the handler first sends "ok\n" (backward compatible ACK),
 // then — if the client keeps the connection open — blocks until shutdown
 // completes and sends a second line "done:ok\n" or "done:err:<detail>\n"
 // so --wait clients can distinguish clean shutdown from partial failure.
-func handleSupervisorConn(conn net.Conn, cancelFn context.CancelFunc, reconcileCh chan reconcileRequest, shut *shutdownState) {
+func handleSupervisorConn(conn net.Conn, cancelFn context.CancelFunc, reconcileCh chan reconcileRequest, restartCityCh chan restartCityRequest, shut *shutdownState) {
 	defer conn.Close()                                     //nolint:errcheck
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck
 	scanner := bufio.NewScanner(conn)
 	if scanner.Scan() {
-		switch scanner.Text() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "restart-city ") || line == "restart-city" {
+			handleSupervisorRestartCity(conn, line, restartCityCh)
+			return
+		}
+		switch line {
 		case "stop":
 			cancelFn()
 			if _, err := conn.Write([]byte("ok\n")); err != nil {
@@ -652,6 +660,12 @@ func runSupervisor(stdout, stderr io.Writer) int {
 	// or the "reload" socket command.
 	reconcileCh := make(chan reconcileRequest, 1)
 
+	// Restart-city channel — drains and respawns a single city's
+	// controller in response to "restart-city" socket commands. Sized
+	// > 1 so a slow operator script issuing back-to-back restart
+	// commands queues instead of getting "busy" right away.
+	restartCityCh := make(chan restartCityRequest, 4)
+
 	// Signal handler: SIGINT/SIGTERM → shutdown, SIGHUP → immediate reconcile.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -738,7 +752,7 @@ func runSupervisor(stdout, stderr io.Writer) int {
 		return 1
 	}
 	shut := newShutdownState()
-	lis, err := startSupervisorSocket(sockPath, cancel, reconcileCh, shut)
+	lis, err := startSupervisorSocket(sockPath, cancel, reconcileCh, restartCityCh, shut)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc supervisor: %v\n", err) //nolint:errcheck
 		return 1
@@ -806,6 +820,16 @@ func runSupervisor(stdout, stderr io.Writer) int {
 			if req.done != nil {
 				close(req.done)
 			}
+		case req := <-restartCityCh:
+			supervisorRec := supervisorEventRecorderForCity(registry, req.name, stderr)
+			dispatchRestartCity(req, registry, reconcileCh, supervisorRec, stderr)
+			// Run reconcile inline so the respawn happens before
+			// returning the reply to the client. The reconcile request
+			// queued by performCityRestart unblocks the next select
+			// cycle; calling safeReconcile here makes the contract
+			// "restart-city completes once the city is back" instead
+			// of "restart-city completes after queueing a reconcile".
+			safeReconcile()
 		case <-ctx.Done():
 			// Shutdown all cities. Collect under lock, then stop outside
 			// to avoid blocking API requests during graceful shutdown.

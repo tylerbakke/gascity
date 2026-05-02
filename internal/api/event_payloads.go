@@ -74,6 +74,22 @@ type BeadEventPayload struct {
 // IsEventPayload marks BeadEventPayload as an events.Payload variant.
 func (BeadEventPayload) IsEventPayload() {}
 
+// ControllerRestartPayload is the typed payload for controller.restart
+// events emitted when the supervisor performs a per-city controller
+// hot-swap (e.g. via `gc supervisor restart-city <name>`). The
+// before/after binary SHA fields let observability surface live binary
+// drift recovery without requiring a town-wide drain.
+type ControllerRestartPayload struct {
+	City            string `json:"city"`
+	OldBinarySHA    string `json:"old_binary_sha,omitempty"`
+	NewBinarySHA    string `json:"new_binary_sha,omitempty"`
+	Forced          bool   `json:"forced"`
+	DrainDurationMs int64  `json:"drain_duration_ms"`
+}
+
+// IsEventPayload marks ControllerRestartPayload as an events.Payload variant.
+func (ControllerRestartPayload) IsEventPayload() {}
+
 // WorkerOperationEventPayload is the typed payload projected for
 // worker.operation events on the supervisor event stream.
 type WorkerOperationEventPayload struct {
@@ -130,6 +146,7 @@ func init() {
 	events.RegisterPayload(events.ConvoyClosed, events.NoPayload{})
 	events.RegisterPayload(events.ControllerStarted, events.NoPayload{})
 	events.RegisterPayload(events.ControllerStopped, events.NoPayload{})
+	events.RegisterPayload(events.ControllerRestart, ControllerRestartPayload{})
 	events.RegisterPayload(events.CitySuspended, events.NoPayload{})
 	events.RegisterPayload(events.CityResumed, events.NoPayload{})
 	events.RegisterPayload(events.CityCreated, CityCreatedPayload{})

@@ -40,6 +40,7 @@ const (
 	ConvoyClosed            = "convoy.closed"
 	ControllerStarted       = "controller.started"
 	ControllerStopped       = "controller.stopped"
+	ControllerRestart       = "controller.restart"
 	CitySuspended           = "city.suspended"
 	CityResumed             = "city.resumed"
 	CityCreated             = "city.created"
@@ -76,7 +77,7 @@ var KnownEventTypes = []string{
 	MailSent, MailRead, MailArchived, MailMarkedRead, MailMarkedUnread,
 	MailReplied, MailDeleted,
 	ConvoyCreated, ConvoyClosed,
-	ControllerStarted, ControllerStopped,
+	ControllerStarted, ControllerStopped, ControllerRestart,
 	CitySuspended, CityResumed,
 	CityCreated, CityReady, CityInitFailed,
 	CityUnregisterRequested, CityUnregistered, CityUnregisterFailed,
