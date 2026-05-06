@@ -637,6 +637,15 @@ type ConfigValidateOutputBody struct {
 	Warnings *[]string `json:"warnings"`
 }
 
+// ControllerRestartPayload defines model for ControllerRestartPayload.
+type ControllerRestartPayload struct {
+	City            string  `json:"city"`
+	DrainDurationMs int64   `json:"drain_duration_ms"`
+	Forced          bool    `json:"forced"`
+	NewBinarySha    *string `json:"new_binary_sha,omitempty"`
+	OldBinarySha    *string `json:"old_binary_sha,omitempty"`
+}
+
 // ConversationGroupParticipant defines model for ConversationGroupParticipant.
 type ConversationGroupParticipant struct {
 	GroupID   string            `json:"GroupID"`
@@ -1035,6 +1044,85 @@ type FanoutPolicy struct {
 	Enabled                    bool  `json:"Enabled"`
 	MaxPeerTriggeredPublishes  int64 `json:"MaxPeerTriggeredPublishes"`
 	MaxTotalPeerDeliveries     int64 `json:"MaxTotalPeerDeliveries"`
+}
+
+// FleetHost defines model for FleetHost.
+type FleetHost struct {
+	// Address Configured primary address (Tailscale, LAN, or DNS).
+	Address string `json:"address"`
+
+	// AddressUsed Address the probe actually reached (may differ from address when public-fallback fired).
+	AddressUsed string `json:"address_used"`
+
+	// DiskFreeGb Free disk space in GiB on the host. Null when unreachable.
+	DiskFreeGb *float64 `json:"disk_free_gb"`
+
+	// DoltServers Running dolt server count on the host. Null when unreachable.
+	DoltServers *int64 `json:"dolt_servers"`
+
+	// Error Probe error string for unreachable hosts. Null on success.
+	Error *string `json:"error"`
+
+	// Event Bus event name the snapshot row came from (e.g. "fleet.host").
+	Event string `json:"event"`
+
+	// GcVersion gc binary version reported by the host. Null when unreachable or not installed.
+	GcVersion *string `json:"gc_version"`
+
+	// Host Logical host name (matches the fleet inventory).
+	Host string `json:"host"`
+
+	// MemFreeGb Free memory in GiB on the host. Null when unreachable.
+	MemFreeGb *float64 `json:"mem_free_gb"`
+
+	// Reachable True when the probe successfully completed.
+	Reachable bool `json:"reachable"`
+
+	// Role Host role label (e.g. primary-control-plane, worker, dr-target).
+	Role string `json:"role"`
+
+	// SessionsActive Active session count on the host. Null when unreachable.
+	SessionsActive *int64 `json:"sessions_active"`
+
+	// SupervisorRunning True when a gc supervisor is running on the host. Null when unreachable.
+	SupervisorRunning *bool `json:"supervisor_running"`
+
+	// Via Transport the probe used (local, tailscale, public-fallback, unreachable).
+	Via string `json:"via"`
+}
+
+// FleetStatusBody defines model for FleetStatusBody.
+type FleetStatusBody struct {
+	// AgeSec Age of the snapshot in seconds, computed from generated_at.
+	AgeSec int64 `json:"age_sec"`
+
+	// GeneratedAt When the snapshot was written by the fleet-status order.
+	GeneratedAt time.Time `json:"generated_at"`
+
+	// Hosts Per-host probe rows from the snapshot.
+	Hosts *[]FleetHost `json:"hosts"`
+
+	// Stale True when the snapshot is older than the freshness window (30 minutes). The data is still returned so the dashboard can render an honest "last seen" rather than disappearing.
+	Stale   bool         `json:"stale"`
+	Summary FleetSummary `json:"summary"`
+}
+
+// FleetSummary defines model for FleetSummary.
+type FleetSummary struct {
+	// Event Bus event name (e.g. "fleet.summary").
+	Event string `json:"event"`
+
+	// GeneratedAt When the snapshot was written.
+	GeneratedAt time.Time `json:"generated_at"`
+
+	// Reachable Number of hosts the probe successfully reached.
+	Reachable int64 `json:"reachable"`
+
+	// Total Total host count probed.
+	Total int64 `json:"total"`
+
+	// Unreachable Number of hosts the probe could not reach.
+	Unreachable int64 `json:"unreachable"`
 }
 
 // FormulaDetailResponse defines model for FormulaDetailResponse.
@@ -2681,6 +2769,18 @@ type TypedEventStreamEnvelopeCityUnregistered struct {
 	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopeControllerRestart defines model for TypedEventStreamEnvelopeControllerRestart.
+type TypedEventStreamEnvelopeControllerRestart struct {
+	Actor    string                   `json:"actor"`
+	Message  *string                  `json:"message,omitempty"`
+	Payload  ControllerRestartPayload `json:"payload"`
+	Seq      int64                    `json:"seq"`
+	Subject  *string                  `json:"subject,omitempty"`
+	Ts       time.Time                `json:"ts"`
+	Type     string                   `json:"type"`
+	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeControllerStarted defines model for TypedEventStreamEnvelopeControllerStarted.
 type TypedEventStreamEnvelopeControllerStarted struct {
 	Actor    string                   `json:"actor"`
@@ -3206,6 +3306,19 @@ type TypedTaggedEventStreamEnvelopeCityUnregistered struct {
 	City     string                   `json:"city"`
 	Message  *string                  `json:"message,omitempty"`
 	Payload  CityLifecyclePayload     `json:"payload"`
+	Seq      int64                    `json:"seq"`
+	Subject  *string                  `json:"subject,omitempty"`
+	Ts       time.Time                `json:"ts"`
+	Type     string                   `json:"type"`
+	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeControllerRestart defines model for TypedTaggedEventStreamEnvelopeControllerRestart.
+type TypedTaggedEventStreamEnvelopeControllerRestart struct {
+	Actor    string                   `json:"actor"`
+	City     string                   `json:"city"`
+	Message  *string                  `json:"message,omitempty"`
+	Payload  ControllerRestartPayload `json:"payload"`
 	Seq      int64                    `json:"seq"`
 	Subject  *string                  `json:"subject,omitempty"`
 	Ts       time.Time                `json:"ts"`
@@ -4905,6 +5018,32 @@ func (t *EventPayload) MergeCityLifecyclePayload(v CityLifecyclePayload) error {
 	return err
 }
 
+// AsControllerRestartPayload returns the union data inside the EventPayload as a ControllerRestartPayload
+func (t EventPayload) AsControllerRestartPayload() (ControllerRestartPayload, error) {
+	var body ControllerRestartPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromControllerRestartPayload overwrites any union data inside the EventPayload as the provided ControllerRestartPayload
+func (t *EventPayload) FromControllerRestartPayload(v ControllerRestartPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeControllerRestartPayload performs a merge with any union data inside the EventPayload, using the provided ControllerRestartPayload
+func (t *EventPayload) MergeControllerRestartPayload(v ControllerRestartPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsGroupCreatedEventPayload returns the union data inside the EventPayload as a GroupCreatedEventPayload
 func (t EventPayload) AsGroupCreatedEventPayload() (GroupCreatedEventPayload, error) {
 	var body GroupCreatedEventPayload
@@ -5483,6 +5622,34 @@ func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeCityUnregistered(
 // MergeTypedEventStreamEnvelopeCityUnregistered performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeCityUnregistered
 func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeCityUnregistered(v TypedEventStreamEnvelopeCityUnregistered) error {
 	v.Type = "city.unregistered"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsTypedEventStreamEnvelopeControllerRestart returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeControllerRestart
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeControllerRestart() (TypedEventStreamEnvelopeControllerRestart, error) {
+	var body TypedEventStreamEnvelopeControllerRestart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeControllerRestart overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeControllerRestart
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeControllerRestart(v TypedEventStreamEnvelopeControllerRestart) error {
+	v.Type = "controller.restart"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeControllerRestart performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeControllerRestart
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeControllerRestart(v TypedEventStreamEnvelopeControllerRestart) error {
+	v.Type = "controller.restart"
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -6425,6 +6592,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeCityUnregisterRequested()
 	case "city.unregistered":
 		return t.AsTypedEventStreamEnvelopeCityUnregistered()
+	case "controller.restart":
+		return t.AsTypedEventStreamEnvelopeControllerRestart()
 	case "controller.started":
 		return t.AsTypedEventStreamEnvelopeControllerStarted()
 	case "controller.stopped":
@@ -6802,6 +6971,34 @@ func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeCityU
 // MergeTypedTaggedEventStreamEnvelopeCityUnregistered performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeCityUnregistered
 func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeCityUnregistered(v TypedTaggedEventStreamEnvelopeCityUnregistered) error {
 	v.Type = "city.unregistered"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsTypedTaggedEventStreamEnvelopeControllerRestart returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeControllerRestart
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeControllerRestart() (TypedTaggedEventStreamEnvelopeControllerRestart, error) {
+	var body TypedTaggedEventStreamEnvelopeControllerRestart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeControllerRestart overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeControllerRestart
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeControllerRestart(v TypedTaggedEventStreamEnvelopeControllerRestart) error {
+	v.Type = "controller.restart"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeControllerRestart performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeControllerRestart
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeControllerRestart(v TypedTaggedEventStreamEnvelopeControllerRestart) error {
+	v.Type = "controller.restart"
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -7744,6 +7941,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeCityUnregisterRequested()
 	case "city.unregistered":
 		return t.AsTypedTaggedEventStreamEnvelopeCityUnregistered()
+	case "controller.restart":
+		return t.AsTypedTaggedEventStreamEnvelopeControllerRestart()
 	case "controller.started":
 		return t.AsTypedTaggedEventStreamEnvelopeControllerStarted()
 	case "controller.stopped":
@@ -8118,6 +8317,9 @@ type ClientInterface interface {
 	PostV0CityByCityNameExtmsgUnbindWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgUnbindParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	PostV0CityByCityNameExtmsgUnbind(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgUnbindParams, body PostV0CityByCityNameExtmsgUnbindJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetV0CityByCityNameFleetStatus request
+	GetV0CityByCityNameFleetStatus(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetV0CityByCityNameFormulaByName request
 	GetV0CityByCityNameFormulaByName(ctx context.Context, cityName string, name string, params *GetV0CityByCityNameFormulaByNameParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -9380,6 +9582,18 @@ func (c *Client) PostV0CityByCityNameExtmsgUnbindWithBody(ctx context.Context, c
 
 func (c *Client) PostV0CityByCityNameExtmsgUnbind(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgUnbindParams, body PostV0CityByCityNameExtmsgUnbindJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostV0CityByCityNameExtmsgUnbindRequest(c.Server, cityName, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetV0CityByCityNameFleetStatus(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetV0CityByCityNameFleetStatusRequest(c.Server, cityName)
 	if err != nil {
 		return nil, err
 	}
@@ -14354,6 +14568,40 @@ func NewPostV0CityByCityNameExtmsgUnbindRequestWithBody(server string, cityName 
 
 		req.Header.Set("X-GC-Request", headerParam0)
 
+	}
+
+	return req, nil
+}
+
+// NewGetV0CityByCityNameFleetStatusRequest generates requests for GetV0CityByCityNameFleetStatus
+func NewGetV0CityByCityNameFleetStatusRequest(server string, cityName string) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/fleet/status", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
 	}
 
 	return req, nil
@@ -19932,6 +20180,9 @@ type ClientWithResponsesInterface interface {
 
 	PostV0CityByCityNameExtmsgUnbindWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgUnbindParams, body PostV0CityByCityNameExtmsgUnbindJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgUnbindResponse, error)
 
+	// GetV0CityByCityNameFleetStatusWithResponse request
+	GetV0CityByCityNameFleetStatusWithResponse(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameFleetStatusResponse, error)
+
 	// GetV0CityByCityNameFormulaByNameWithResponse request
 	GetV0CityByCityNameFormulaByNameWithResponse(ctx context.Context, cityName string, name string, params *GetV0CityByCityNameFormulaByNameParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameFormulaByNameResponse, error)
 
@@ -21567,6 +21818,29 @@ func (r PostV0CityByCityNameExtmsgUnbindResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r PostV0CityByCityNameExtmsgUnbindResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type GetV0CityByCityNameFleetStatusResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	JSON200                       *FleetStatusBody
+	ApplicationproblemJSONDefault *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r GetV0CityByCityNameFleetStatusResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetV0CityByCityNameFleetStatusResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -24216,6 +24490,15 @@ func (c *ClientWithResponses) PostV0CityByCityNameExtmsgUnbindWithResponse(ctx c
 		return nil, err
 	}
 	return ParsePostV0CityByCityNameExtmsgUnbindResponse(rsp)
+}
+
+// GetV0CityByCityNameFleetStatusWithResponse request returning *GetV0CityByCityNameFleetStatusResponse
+func (c *ClientWithResponses) GetV0CityByCityNameFleetStatusWithResponse(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameFleetStatusResponse, error) {
+	rsp, err := c.GetV0CityByCityNameFleetStatus(ctx, cityName, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetV0CityByCityNameFleetStatusResponse(rsp)
 }
 
 // GetV0CityByCityNameFormulaByNameWithResponse request returning *GetV0CityByCityNameFormulaByNameResponse
@@ -27019,6 +27302,39 @@ func ParsePostV0CityByCityNameExtmsgUnbindResponse(rsp *http.Response) (*PostV0C
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
 		var dest ExtMsgUnbindBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetV0CityByCityNameFleetStatusResponse parses an HTTP response from a GetV0CityByCityNameFleetStatusWithResponse call
+func ParseGetV0CityByCityNameFleetStatusResponse(rsp *http.Response) (*GetV0CityByCityNameFleetStatusResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetV0CityByCityNameFleetStatusResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest FleetStatusBody
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}

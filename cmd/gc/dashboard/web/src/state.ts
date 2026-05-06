@@ -8,6 +8,7 @@ export type DashboardResource =
   | "convoys"
   | "activity"
   | "admin"
+  | "fleet"
   | "options";
 
 export interface CityInfoSummary {
@@ -29,6 +30,7 @@ const ALL_RESOURCES: DashboardResource[] = [
   "convoys",
   "activity",
   "admin",
+  "fleet",
   "options",
 ];
 
@@ -40,6 +42,7 @@ const CITY_SCOPED_RESOURCES: DashboardResource[] = [
   "convoys",
   "activity",
   "admin",
+  "fleet",
   "options",
 ];
 

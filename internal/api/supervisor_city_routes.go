@@ -245,6 +245,10 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	cityGet(sm, "/service/{name}", (*Server).humaHandleServiceGet)
 	cityPost(sm, "/service/{name}/restart", (*Server).humaHandleServiceRestart)
 
+	// Fleet status — typed read-side projection of the snapshot the
+	// fleet-status order writes under <city>/.gc/runtime/fleet-status.json.
+	cityGet(sm, "/fleet/status", (*Server).humaHandleFleetStatus)
+
 	// Sessions (non-stream — stream is the SSE registration below).
 	cityRegister(sm, huma.Operation{
 		OperationID:   "create-session",

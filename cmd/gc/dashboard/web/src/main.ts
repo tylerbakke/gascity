@@ -7,6 +7,7 @@ import { renderMail, installMailInteractions } from "./panels/mail";
 import { renderConvoys, installConvoyInteractions } from "./panels/convoys";
 import { eventTypeFromMessage, loadActivityHistory, startActivityStream, stopActivityStream, installActivityInteractions } from "./panels/activity";
 import { renderAdminPanels, installAdminInteractions } from "./panels/admin";
+import { renderFleetStatus } from "./panels/fleet-status";
 import { invalidateOptions } from "./panels/options";
 import { installPanelAffordances, popPause, refreshPaused, reportUIError, setPopPauseListener } from "./ui";
 import { installCommandPalette } from "./palette";
@@ -14,6 +15,7 @@ import { installDashboardLogging, logInfo } from "./logger";
 import {
   consumeInvalidated,
   currentCityStatus,
+  invalidate,
   invalidateAll,
   invalidateForEventType,
   syncCityScopeFromLocation,
@@ -30,6 +32,7 @@ const CITY_SCOPED_PANEL_IDS = [
   "mail-panel",
   "escalations-panel",
   "services-panel",
+  "fleet-panel",
   "rigs-panel",
   "pooled-panel",
   "queues-panel",
@@ -123,7 +126,24 @@ async function boot(): Promise<void> {
   });
   await refreshAllForced();
   wireSSE();
+  installFleetStatusPolling();
   logInfo("dashboard", "Boot complete", { city: cityScope(), href: window.location.href });
+}
+
+// installFleetStatusPolling keeps the Fleet Status panel fresh on a
+// 60s cadence. The fleet-status order writes its snapshot every
+// 5 minutes; polling at 60s catches stale-banner transitions without
+// hammering the supervisor. Once the bus carries fleet.host /
+// fleet.summary events (cc-fleet-status-sse), the polling loop
+// can be removed in favor of invalidateForEventType.
+function installFleetStatusPolling(): void {
+  const intervalMs = 60_000;
+  setInterval(() => {
+    if (refreshPaused()) return;
+    if (cityScope() === "") return;
+    invalidate("fleet");
+    void refreshVisibleResources().catch((error) => reportUIError("Fleet refresh failed", error));
+  }, intervalMs);
 }
 
 function byId(id: string): HTMLElement | null {
@@ -237,6 +257,7 @@ async function refreshVisibleResources(force = false): Promise<void> {
     queueRefresh(tasks, dirty, "mail", () => renderMail());
     queueRefresh(tasks, dirty, "convoys", () => renderConvoys());
     queueRefresh(tasks, dirty, "admin", () => renderAdminPanels());
+    queueRefresh(tasks, dirty, "fleet", () => renderFleetStatus());
   }
 
   const results = await Promise.allSettled(tasks);

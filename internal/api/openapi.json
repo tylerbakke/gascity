@@ -1421,6 +1421,33 @@
         ],
         "type": "object"
       },
+      "ControllerRestartPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "city": {
+            "type": "string"
+          },
+          "drain_duration_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "forced": {
+            "type": "boolean"
+          },
+          "new_binary_sha": {
+            "type": "string"
+          },
+          "old_binary_sha": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city",
+          "forced",
+          "drain_duration_ms"
+        ],
+        "type": "object"
+      },
       "ConversationGroupParticipant": {
         "additionalProperties": false,
         "properties": {
@@ -1961,6 +1988,9 @@
             "$ref": "#/components/schemas/CityLifecyclePayload"
           },
           {
+            "$ref": "#/components/schemas/ControllerRestartPayload"
+          },
+          {
             "$ref": "#/components/schemas/GroupCreatedEventPayload"
           },
           {
@@ -2458,6 +2488,187 @@
           "AllowUntargetedPublication",
           "MaxPeerTriggeredPublishes",
           "MaxTotalPeerDeliveries"
+        ],
+        "type": "object"
+      },
+      "FleetHost": {
+        "additionalProperties": false,
+        "properties": {
+          "address": {
+            "description": "Configured primary address (Tailscale, LAN, or DNS).",
+            "type": "string"
+          },
+          "address_used": {
+            "description": "Address the probe actually reached (may differ from address when public-fallback fired).",
+            "type": "string"
+          },
+          "disk_free_gb": {
+            "description": "Free disk space in GiB on the host. Null when unreachable.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "dolt_servers": {
+            "description": "Running dolt server count on the host. Null when unreachable.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Probe error string for unreachable hosts. Null on success.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event": {
+            "description": "Bus event name the snapshot row came from (e.g. \"fleet.host\").",
+            "type": "string"
+          },
+          "gc_version": {
+            "description": "gc binary version reported by the host. Null when unreachable or not installed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "description": "Logical host name (matches the fleet inventory).",
+            "type": "string"
+          },
+          "mem_free_gb": {
+            "description": "Free memory in GiB on the host. Null when unreachable.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "reachable": {
+            "description": "True when the probe successfully completed.",
+            "type": "boolean"
+          },
+          "role": {
+            "description": "Host role label (e.g. primary-control-plane, worker, dr-target).",
+            "type": "string"
+          },
+          "sessions_active": {
+            "description": "Active session count on the host. Null when unreachable.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "supervisor_running": {
+            "description": "True when a gc supervisor is running on the host. Null when unreachable.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "via": {
+            "description": "Transport the probe used (local, tailscale, public-fallback, unreachable).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event",
+          "host",
+          "address",
+          "address_used",
+          "role",
+          "via",
+          "reachable",
+          "gc_version",
+          "supervisor_running",
+          "sessions_active",
+          "dolt_servers",
+          "mem_free_gb",
+          "disk_free_gb",
+          "error"
+        ],
+        "type": "object"
+      },
+      "FleetStatusBody": {
+        "additionalProperties": false,
+        "properties": {
+          "age_sec": {
+            "description": "Age of the snapshot in seconds, computed from generated_at.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "generated_at": {
+            "description": "When the snapshot was written by the fleet-status order.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "hosts": {
+            "description": "Per-host probe rows from the snapshot.",
+            "items": {
+              "$ref": "#/components/schemas/FleetHost"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "stale": {
+            "description": "True when the snapshot is older than the freshness window (30 minutes). The data is still returned so the dashboard can render an honest \"last seen\" rather than disappearing.",
+            "type": "boolean"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/FleetSummary",
+            "description": "Aggregated fleet summary from the snapshot."
+          }
+        },
+        "required": [
+          "generated_at",
+          "hosts",
+          "summary",
+          "stale",
+          "age_sec"
+        ],
+        "type": "object"
+      },
+      "FleetSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "event": {
+            "description": "Bus event name (e.g. \"fleet.summary\").",
+            "type": "string"
+          },
+          "generated_at": {
+            "description": "When the snapshot was written.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "reachable": {
+            "description": "Number of hosts the probe successfully reached.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "total": {
+            "description": "Total host count probed.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "unreachable": {
+            "description": "Number of hosts the probe could not reach.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event",
+          "total",
+          "reachable",
+          "unreachable",
+          "generated_at"
         ],
         "type": "object"
       },
@@ -6532,6 +6743,7 @@
             "city.unregister_failed": "#/components/schemas/TypedEventStreamEnvelopeCityUnregisterFailed",
             "city.unregister_requested": "#/components/schemas/TypedEventStreamEnvelopeCityUnregisterRequested",
             "city.unregistered": "#/components/schemas/TypedEventStreamEnvelopeCityUnregistered",
+            "controller.restart": "#/components/schemas/TypedEventStreamEnvelopeControllerRestart",
             "controller.started": "#/components/schemas/TypedEventStreamEnvelopeControllerStarted",
             "controller.stopped": "#/components/schemas/TypedEventStreamEnvelopeControllerStopped",
             "convoy.closed": "#/components/schemas/TypedEventStreamEnvelopeConvoyClosed",
@@ -6600,6 +6812,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeCityUnregistered"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeControllerRestart"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeControllerStarted"
@@ -7160,6 +7375,48 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope city.unregistered",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeControllerRestart": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/ControllerRestartPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "controller.restart",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope controller.restart",
         "type": "object"
       },
       "TypedEventStreamEnvelopeControllerStarted": {
@@ -8521,6 +8778,7 @@
             "city.unregister_failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityUnregisterFailed",
             "city.unregister_requested": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityUnregisterRequested",
             "city.unregistered": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityUnregistered",
+            "controller.restart": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerRestart",
             "controller.started": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerStarted",
             "controller.stopped": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerStopped",
             "convoy.closed": "#/components/schemas/TypedTaggedEventStreamEnvelopeConvoyClosed",
@@ -8589,6 +8847,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityUnregistered"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerRestart"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerStarted"
@@ -9193,6 +9454,52 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope city.unregistered",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeControllerRestart": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/ControllerRestartPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "controller.restart",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope controller.restart",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeControllerStarted": {
@@ -15938,6 +16245,58 @@
           }
         },
         "summary": "Post v0 city by city name extmsg unbind"
+      }
+    },
+    "/v0/city/{cityName}/fleet/status": {
+      "get": {
+        "operationId": "get-v0-city-by-city-name-fleet-status",
+        "parameters": [
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetStatusBody"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Get v0 city by city name fleet status"
       }
     },
     "/v0/city/{cityName}/formula/{name}": {
