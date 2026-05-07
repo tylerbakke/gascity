@@ -181,6 +181,30 @@ func TestNamedOnDemand_ExactNamedIdentityAssigneeWakes(t *testing.T) {
 	assertReason(t, result, "hello-world--refinery", "assigned-work")
 }
 
+func TestNamedOnDemand_NamedSessionDemandWakesExistingIdentity(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents:             []AwakeAgent{{QualifiedName: "hello-world/refinery"}},
+		NamedSessions:      []AwakeNamedSession{{Identity: "hello-world/refinery", Template: "hello-world/refinery", Mode: "on_demand"}},
+		SessionBeads:       []AwakeSessionBead{{ID: "mc-1", SessionName: "hello-world--refinery", Template: "hello-world/refinery", State: "asleep", NamedIdentity: "hello-world/refinery"}},
+		NamedSessionDemand: map[string]bool{"hello-world/refinery": true},
+		Now:                now,
+	})
+	assertAwake(t, result, "hello-world--refinery")
+	assertReason(t, result, "hello-world--refinery", "named-demand")
+}
+
+func TestNamedOnDemand_NamedSessionDemandWakesSingletonTemplateResolvedIdentity(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents:             []AwakeAgent{{QualifiedName: "worker"}},
+		NamedSessions:      []AwakeNamedSession{{Identity: "primary", Template: "worker", Mode: "on_demand"}},
+		SessionBeads:       []AwakeSessionBead{{ID: "mc-1", SessionName: "primary", Template: "worker", State: "asleep", NamedIdentity: "primary"}},
+		NamedSessionDemand: map[string]bool{"primary": true},
+		Now:                now,
+	})
+	assertAwake(t, result, "primary")
+	assertReason(t, result, "primary", "named-demand")
+}
+
 func TestNamedOnDemand_PendingCreateWakesWithoutDemand(t *testing.T) {
 	result := ComputeAwakeSet(AwakeInput{
 		Agents:        []AwakeAgent{{QualifiedName: "hello-world/refinery"}},
@@ -958,6 +982,24 @@ func TestRegression_AsleepEphemeralWithAssignedWork_WakesViaAssignedWork(t *test
 	if result["polecat-mc-sctve"].Reason != "assigned-work" {
 		t.Errorf("reason = %q, want assigned-work", result["polecat-mc-sctve"].Reason)
 	}
+}
+
+func TestRegression_ConcreteAssignedWorkSuppressesIdleSleep(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat", SleepAfterIdle: 2 * time.Hour}},
+		SessionBeads: []AwakeSessionBead{
+			{
+				ID: "mc-sctve", SessionName: "polecat-mc-sctve", Template: "hello-world/polecat", State: "active",
+				IdleSince: now.Add(-3 * time.Hour),
+			},
+		},
+		WorkBeads:        []AwakeWorkBead{{ID: "hw-8lb", Assignee: "polecat-mc-sctve", Status: "in_progress"}},
+		ScaleCheckCounts: map[string]int{"hello-world/polecat": 1},
+		RunningSessions:  map[string]bool{"polecat-mc-sctve": true},
+		Now:              now,
+	})
+	assertAwake(t, result, "polecat-mc-sctve")
+	assertReason(t, result, "polecat-mc-sctve", "assigned-work")
 }
 
 // ---------------------------------------------------------------------------

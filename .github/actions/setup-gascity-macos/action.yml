@@ -1,5 +1,5 @@
 name: Setup Gas City macOS CI
-description: Install the shared macOS dependencies for Gas City CI jobs on the self-hosted ARM64 runner
+description: Install the shared macOS dependencies for Gas City CI jobs on ARM64 macOS runners
 
 inputs:
   go-version:
@@ -25,7 +25,7 @@ inputs:
     required: false
     default: "2.1.123"
   install-system-deps:
-    description: Whether to run brew to install tmux, jq, and flock (set to false when the self-hosted runner already has them)
+    description: Whether to run brew to install tmux, jq, and flock
     required: false
     default: "true"
 
@@ -52,8 +52,7 @@ runs:
         # false "Mac-only" regressions. Track the same pin both
         # actions use today; bump them together.
         go-version: ${{ inputs.go-version }}
-        # self-hosted macstadium runners reuse the same GOPATH across jobs;
-        # actions/setup-go's cache layer is flaky on reused runners, so skip it.
+        # Keep macOS parity deterministic across hosted and reused runners.
         cache: false
 
     - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -128,9 +127,7 @@ runs:
       run: |
         set -euo pipefail
         # Dolt inherits its commit identity from the user's global git config
-        # (see cmd/gc/gc-beads-bd ensure_dolt_identity). The ubuntu-latest
-        # hosted runner ships with user.name/user.email baked in; the
-        # self-hosted macstadium runner does not.
+        # (see cmd/gc/gc-beads-bd ensure_dolt_identity).
         #
         # Force-set a deterministic CI identity unconditionally. Don't log
         # the resolved value — on a reused runner any preexisting identity

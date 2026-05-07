@@ -56,11 +56,7 @@ jobs:
 
   mac-inference:
     name: Mac / Tier B+C inference tests
-    runs-on:
-      - self-hosted
-      - macOS
-      - ARM64
-      - macstadium
+    runs-on: macos-15
     timeout-minutes: 180
     env:
       ANTHROPIC_BASE_URL: https://api.synthetic.new/anthropic

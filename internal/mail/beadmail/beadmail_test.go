@@ -23,6 +23,18 @@ func (s noListScanStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	return s.MemStore.List(query)
 }
 
+type noBroadSessionRouteStore struct {
+	*beads.MemStore
+	t *testing.T
+}
+
+func (s noBroadSessionRouteStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == session.LabelSession && len(query.Metadata) == 0 {
+		s.t.Fatalf("recipient routing used broad session scan: %+v", query)
+	}
+	return s.MemStore.List(query)
+}
+
 func TestInboxDoesNotCallBroadList(t *testing.T) {
 	base := beads.NewMemStore()
 	p := New(noListScanStore{MemStore: base})
@@ -1080,6 +1092,264 @@ func TestRecipientRoutesPreferLiveSessionOverClosedHistory(t *testing.T) {
 	}
 }
 
+func TestInboxByCurrentSessionAliasAvoidsBroadSessionScan(t *testing.T) {
+	store := noBroadSessionRouteStore{MemStore: beads.NewMemStore(), t: t}
+	p := New(store)
+
+	closed, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":         "old-worker",
+			"alias_history": "worker",
+			"session_name":  "workflows__codex-min-mc-old",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create closed session: %v", err)
+	}
+	if err := store.Close(closed.ID); err != nil {
+		t.Fatalf("Close session: %v", err)
+	}
+	live, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "worker",
+			"session_name": "workflows__codex-min-mc-live",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create live session: %v", err)
+	}
+	closedReply, err := store.Create(beads.Bead{
+		Title:    "old reply",
+		Type:     "message",
+		Assignee: closed.ID,
+		From:     "human",
+	})
+	if err != nil {
+		t.Fatalf("Create closed reply: %v", err)
+	}
+	liveMail, err := store.Create(beads.Bead{
+		Title:    "live mail",
+		Type:     "message",
+		Assignee: live.ID,
+		From:     "human",
+	})
+	if err != nil {
+		t.Fatalf("Create live mail: %v", err)
+	}
+
+	msgs, err := p.Inbox("worker")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("Inbox returned %d messages, want 1", len(msgs))
+	}
+	if msgs[0].ID != liveMail.ID {
+		t.Fatalf("Inbox returned %s, want live message %s; closed reply was %s", msgs[0].ID, liveMail.ID, closedReply.ID)
+	}
+}
+
+func TestInboxByClosedCurrentSessionAliasAvoidsBroadSessionScan(t *testing.T) {
+	store := noBroadSessionRouteStore{MemStore: beads.NewMemStore(), t: t}
+	p := New(store)
+
+	closed, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "worker",
+			"session_name": "workflows__codex-min-mc-closed",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create closed session: %v", err)
+	}
+	if err := store.Close(closed.ID); err != nil {
+		t.Fatalf("Close session: %v", err)
+	}
+	closedMail, err := store.Create(beads.Bead{
+		Title:    "closed mail",
+		Type:     "message",
+		Assignee: closed.ID,
+		From:     "human",
+	})
+	if err != nil {
+		t.Fatalf("Create closed mail: %v", err)
+	}
+
+	msgs, err := p.Inbox("worker")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("Inbox returned %d messages, want 1", len(msgs))
+	}
+	if msgs[0].ID != closedMail.ID {
+		t.Fatalf("Inbox returned %s, want closed mail %s", msgs[0].ID, closedMail.ID)
+	}
+}
+
+func TestInboxByHistoricalAliasFallsBackToSessionScan(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	live, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":         "new-worker",
+			"alias_history": "worker",
+			"session_name":  "workflows__codex-min-mc-live",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create live session: %v", err)
+	}
+	liveMail, err := store.Create(beads.Bead{
+		Title:    "live mail",
+		Type:     "message",
+		Assignee: live.ID,
+		From:     "human",
+	})
+	if err != nil {
+		t.Fatalf("Create live mail: %v", err)
+	}
+
+	msgs, err := p.Inbox("worker")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("Inbox returned %d messages, want 1", len(msgs))
+	}
+	if msgs[0].ID != liveMail.ID {
+		t.Fatalf("Inbox returned %s, want live message %s", msgs[0].ID, liveMail.ID)
+	}
+}
+
+func TestRecipientRoutesPreferCurrentAddressOverHistoricalAliasAmbiguity(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	historical, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":         "new-worker",
+			"alias_history": "worker",
+			"session_name":  "workflows__codex-min-mc-history",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create historical session: %v", err)
+	}
+	current, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "worker",
+			"session_name": "workflows__codex-min-mc-current",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create current session: %v", err)
+	}
+	historicalMail, err := store.Create(beads.Bead{
+		Title:    "historical mail",
+		Type:     "message",
+		Assignee: historical.ID,
+		From:     "human",
+	})
+	if err != nil {
+		t.Fatalf("Create historical mail: %v", err)
+	}
+	currentMail, err := store.Create(beads.Bead{
+		Title:    "current mail",
+		Type:     "message",
+		Assignee: current.ID,
+		From:     "human",
+	})
+	if err != nil {
+		t.Fatalf("Create current mail: %v", err)
+	}
+
+	msgs, err := p.Inbox("worker")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("Inbox returned %d messages, want 1", len(msgs))
+	}
+	if msgs[0].ID != currentMail.ID {
+		t.Fatalf("Inbox returned %s, want current mail %s; historical mail was %s", msgs[0].ID, currentMail.ID, historicalMail.ID)
+	}
+}
+
+func TestRecipientRoutesPreferClosedCurrentAddressOverLiveHistoricalAlias(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	liveHistorical, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":         "new-worker",
+			"alias_history": "worker",
+			"session_name":  "workflows__codex-min-mc-live",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create live historical session: %v", err)
+	}
+	closedCurrent, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "worker",
+			"session_name": "workflows__codex-min-mc-closed",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create closed current session: %v", err)
+	}
+	if err := store.Close(closedCurrent.ID); err != nil {
+		t.Fatalf("Close current session: %v", err)
+	}
+	liveMail, err := store.Create(beads.Bead{
+		Title:    "live historical mail",
+		Type:     "message",
+		Assignee: liveHistorical.ID,
+		From:     "human",
+	})
+	if err != nil {
+		t.Fatalf("Create live mail: %v", err)
+	}
+	closedMail, err := store.Create(beads.Bead{
+		Title:    "closed current mail",
+		Type:     "message",
+		Assignee: closedCurrent.ID,
+		From:     "human",
+	})
+	if err != nil {
+		t.Fatalf("Create closed mail: %v", err)
+	}
+
+	msgs, err := p.Inbox("worker")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("Inbox returned %d messages, want 1", len(msgs))
+	}
+	if msgs[0].ID != closedMail.ID {
+		t.Fatalf("Inbox returned %s, want closed current mail %s; live historical mail was %s", msgs[0].ID, closedMail.ID, liveMail.ID)
+	}
+}
+
 // --- Thread ---
 
 func TestThread(t *testing.T) {
@@ -1205,6 +1475,111 @@ func TestCheck(t *testing.T) {
 	}
 	if hasLabel(b.Labels, "read") {
 		t.Error("Check should not add read label")
+	}
+}
+
+// --- Provider session-list cache (ga-q6ct) ---
+
+// countingSessionListStore counts broad gc:session List calls and forwards
+// the rest. Used to pin that Provider memoizes the gc:session enumeration
+// across multiple Inbox calls in a single command invocation.
+type countingSessionListStore struct {
+	*beads.MemStore
+	sessionListCalls int
+}
+
+func (s *countingSessionListStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == session.LabelSession && len(query.Metadata) == 0 {
+		s.sessionListCalls++
+	}
+	return s.MemStore.List(query)
+}
+
+func TestProvider_DefaultProviderSeesNewHistoricalAliasSessionAcrossCalls(t *testing.T) {
+	// Pin: the default Provider is safe for long-lived shared use. If a lookup
+	// runs before the matching session exists, later lookups must see newly
+	// created sessions instead of reusing a stale provider-lifetime snapshot.
+	store := &countingSessionListStore{MemStore: beads.NewMemStore()}
+	p := New(store)
+
+	if _, err := p.Inbox("old-route"); err != nil {
+		t.Fatalf("initial Inbox(old-route): %v", err)
+	}
+
+	sessionBead, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":         "worker-a",
+			"alias_history": "old-route",
+			"session_name":  "wf__a",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	if _, err := p.Send("human", sessionBead.Metadata["alias"], "", "for old route"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	msgs, err := p.Inbox("old-route")
+	if err != nil {
+		t.Fatalf("second Inbox(old-route): %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("Inbox(old-route) = %d messages, want 1", len(msgs))
+	}
+	if msgs[0].Body != "for old route" {
+		t.Fatalf("Inbox(old-route) body = %q, want %q", msgs[0].Body, "for old route")
+	}
+	if store.sessionListCalls != 2 {
+		t.Errorf("broad gc:session List calls = %d, want 2 (default provider must refetch per call to avoid stale shared state)", store.sessionListCalls)
+	}
+}
+
+func TestProviderCached_BroadSessionListCachedAcrossInboxCalls(t *testing.T) {
+	// Pin: the command-scoped cached Provider still dedupes the broad
+	// historical-alias session scan within one provider lifetime.
+	store := &countingSessionListStore{MemStore: beads.NewMemStore()}
+
+	// Two live sessions with alias_history that includes the route we'll
+	// search for. AliasHistory lookup is the path that does the broad scan.
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":         "worker-a",
+			"alias_history": "old-route",
+			"session_name":  "wf__a",
+		},
+	}); err != nil {
+		t.Fatalf("Create session A: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":         "worker-b",
+			"alias_history": "old-route-2",
+			"session_name":  "wf__b",
+		},
+	}); err != nil {
+		t.Fatalf("Create session B: %v", err)
+	}
+
+	p := NewCached(store)
+
+	// Exercise three independent Inbox calls that each force the
+	// alias-history fallback (no current alias matches "old-route" or
+	// "old-route-2"). Without the cache: 3 broad scans. With cache: 1.
+	for _, recipient := range []string{"old-route", "old-route-2", "old-route"} {
+		if _, err := p.Inbox(recipient); err != nil {
+			t.Fatalf("Inbox(%q): %v", recipient, err)
+		}
+	}
+
+	if store.sessionListCalls != 1 {
+		t.Errorf("broad gc:session List calls = %d, want 1 (Provider must cache the enumeration)", store.sessionListCalls)
 	}
 }
 

@@ -229,7 +229,10 @@ export interface paths {
         /** Get v0 city by city name agents */
         get: operations["get-v0-city-by-city-name-agents"];
         put?: never;
-        /** Create an agent */
+        /**
+         * Create an agent
+         * @description Creates an agent and waits until it is visible to immediate follow-up operations. If the agent is durably created but visibility confirmation is canceled or times out, the retryable 503/504 response includes a Retry-After header.
+         */
         post: operations["create-agent"];
         delete?: never;
         options?: never;
@@ -575,7 +578,7 @@ export interface paths {
         };
         /**
          * Stream city events in real time
-         * @description Server-Sent Events stream of city events with optional workflow projections. Supports reconnection via Last-Event-ID header or after_seq query param.
+         * @description Server-Sent Events stream of city events with optional workflow projections. Supports reconnection via Last-Event-ID header or after_seq query param; omitting both starts at the current city event head.
          */
         get: operations["stream-events"];
         put?: never;
@@ -754,23 +757,6 @@ export interface paths {
         put?: never;
         /** Post v0 city by city name extmsg unbind */
         post: operations["post-v0-city-by-city-name-extmsg-unbind"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v0/city/{cityName}/fleet/status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get v0 city by city name fleet status */
-        get: operations["get-v0-city-by-city-name-fleet-status"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1876,7 +1862,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Stream tagged events from all running cities. */
+        /**
+         * Stream tagged events from all running cities.
+         * @description Server-Sent Events stream of supervisor-tagged events. Supports reconnection via Last-Event-ID header or after_cursor query param; omitting both starts at the current supervisor event head.
+         */
         get: operations["stream-supervisor-events"];
         put?: never;
         post?: never;
@@ -2100,6 +2089,23 @@ export interface components {
             /** Format: int64 */
             ready_delay_ms?: number;
         };
+        AsyncAcceptedBody: {
+            /** @description City event-stream sequence captured before the async request was accepted. Pass this value as after_seq to /v0/city/{cityName}/events/stream to receive the request result without replaying unrelated historical backlog. A value of 0 can also mean no event provider is configured or the event log is empty. */
+            event_cursor: string;
+            /** @description Correlation ID. Watch the city event stream for request.result.session.create, request.result.session.message, request.result.session.submit, or request.failed with this request_id. */
+            request_id: string;
+            /**
+             * @description Async request status.
+             * @example accepted
+             */
+            status: string;
+        };
+        AsyncAcceptedResponse: {
+            /** @description Supervisor event-stream cursor captured before the async request was accepted. Pass this value as after_cursor to /v0/events/stream to receive the request result without replaying unrelated historical backlog. A value of 0 can also mean no event provider is configured or every event log is empty. */
+            event_cursor: string;
+            /** @description Correlation ID. Watch /v0/events/stream for request.result.city.create, request.result.city.unregister, or request.failed with this request_id. */
+            request_id: string;
+        };
         Bead: {
             assignee?: string;
             /** Format: date-time */
@@ -2206,16 +2212,18 @@ export interface components {
             bootstrap_profile?: "k8s-cell" | "kubernetes" | "kubernetes-cell" | "single-host-compat";
             /** @description Directory to create the city in. Absolute or relative to $HOME. */
             dir: string;
-            /** @description Provider name for the city's default session template. */
-            provider: string;
+            /** @description Provider name for the city's default session template. Mutually exclusive with start_command. */
+            provider?: string;
+            /** @description Custom workspace start command for the city's default session template. Mutually exclusive with provider. */
+            start_command?: string;
         };
-        CityCreateResponse: {
-            /** @description Resolved city name as persisted in city.toml. Use this to filter the event stream for completion. */
+        CityCreateSucceededPayload: {
+            /** @description Resolved city name. */
             name: string;
-            /** @description True when scaffolding + registration succeeded. Does not imply the city is ready yet; watch /v0/events/stream for city.ready. */
-            ok: boolean;
-            /** @description Resolved absolute path of the created city directory. */
+            /** @description Resolved absolute city directory path. */
             path: string;
+            /** @description Correlation ID from the 202 response. */
+            request_id: string;
         };
         CityGetResponse: {
             /** Format: int64 */
@@ -2240,22 +2248,20 @@ export interface components {
             status?: string;
         };
         CityLifecyclePayload: {
-            error?: string;
             name: string;
             path: string;
-            phases_completed?: string[] | null;
         };
         CityPatchInputBody: {
             /** @description Whether the city is suspended. */
             suspended?: boolean;
         };
-        CityUnregisterResponse: {
-            /** @description Resolved registry name. Filter the event stream by this to observe completion. */
+        CityUnregisterSucceededPayload: {
+            /** @description City name that was unregistered. */
             name: string;
-            /** @description True when the registry entry was removed and the supervisor was signaled. Does not imply the city's controller has stopped yet; watch /v0/events/stream for city.unregistered. */
-            ok: boolean;
-            /** @description Resolved absolute city directory. The directory itself is not modified; unregister only affects the supervisor's registry. */
+            /** @description Absolute city directory path. */
             path: string;
+            /** @description Correlation ID from the 202 response. */
+            request_id: string;
         };
         ConfigAgentResponse: {
             dir?: string;
@@ -2310,14 +2316,6 @@ export interface components {
             valid: boolean;
             /** @description Validation warnings. */
             warnings: string[] | null;
-        };
-        ControllerRestartPayload: {
-            city: string;
-            /** Format: int64 */
-            drain_duration_ms: number;
-            forced: boolean;
-            new_binary_sha?: string;
-            old_binary_sha?: string;
         };
         ConversationGroupParticipant: {
             GroupID: string;
@@ -2510,7 +2508,7 @@ export interface components {
             /** @description Event type. */
             type: string;
         };
-        EventPayload: components["schemas"]["AdapterEventPayload"] | components["schemas"]["BeadEventPayload"] | components["schemas"]["BoundEventPayload"] | components["schemas"]["CityLifecyclePayload"] | components["schemas"]["ControllerRestartPayload"] | components["schemas"]["GroupCreatedEventPayload"] | components["schemas"]["InboundEventPayload"] | components["schemas"]["MailEventPayload"] | components["schemas"]["NoPayload"] | components["schemas"]["OutboundEventPayload"] | components["schemas"]["UnboundEventPayload"] | components["schemas"]["WorkerOperationEventPayload"];
+        EventPayload: components["schemas"]["AdapterEventPayload"] | components["schemas"]["BeadEventPayload"] | components["schemas"]["BoundEventPayload"] | components["schemas"]["CityCreateSucceededPayload"] | components["schemas"]["CityLifecyclePayload"] | components["schemas"]["CityUnregisterSucceededPayload"] | components["schemas"]["GroupCreatedEventPayload"] | components["schemas"]["InboundEventPayload"] | components["schemas"]["MailEventPayload"] | components["schemas"]["NoPayload"] | components["schemas"]["OutboundEventPayload"] | components["schemas"]["RequestFailedPayload"] | components["schemas"]["SessionCreateSucceededPayload"] | components["schemas"]["SessionMessageSucceededPayload"] | components["schemas"]["SessionSubmitSucceededPayload"] | components["schemas"]["UnboundEventPayload"] | components["schemas"]["WorkerOperationEventPayload"];
         EventStreamEnvelope: {
             actor: string;
             message?: string;
@@ -2677,90 +2675,6 @@ export interface components {
             /** Format: int64 */
             MaxTotalPeerDeliveries: number;
         };
-        FleetHost: {
-            /** @description Configured primary address (Tailscale, LAN, or DNS). */
-            address: string;
-            /** @description Address the probe actually reached (may differ from address when public-fallback fired). */
-            address_used: string;
-            /**
-             * Format: double
-             * @description Free disk space in GiB on the host. Null when unreachable.
-             */
-            disk_free_gb: number | null;
-            /**
-             * Format: int64
-             * @description Running dolt server count on the host. Null when unreachable.
-             */
-            dolt_servers: number | null;
-            /** @description Probe error string for unreachable hosts. Null on success. */
-            error: string | null;
-            /** @description Bus event name the snapshot row came from (e.g. "fleet.host"). */
-            event: string;
-            /** @description gc binary version reported by the host. Null when unreachable or not installed. */
-            gc_version: string | null;
-            /** @description Logical host name (matches the fleet inventory). */
-            host: string;
-            /**
-             * Format: double
-             * @description Free memory in GiB on the host. Null when unreachable.
-             */
-            mem_free_gb: number | null;
-            /** @description True when the probe successfully completed. */
-            reachable: boolean;
-            /** @description Host role label (e.g. primary-control-plane, worker, dr-target). */
-            role: string;
-            /**
-             * Format: int64
-             * @description Active session count on the host. Null when unreachable.
-             */
-            sessions_active: number | null;
-            /** @description True when a gc supervisor is running on the host. Null when unreachable. */
-            supervisor_running: boolean | null;
-            /** @description Transport the probe used (local, tailscale, public-fallback, unreachable). */
-            via: string;
-        };
-        FleetStatusBody: {
-            /**
-             * Format: int64
-             * @description Age of the snapshot in seconds, computed from generated_at.
-             */
-            age_sec: number;
-            /**
-             * Format: date-time
-             * @description When the snapshot was written by the fleet-status order.
-             */
-            generated_at: string;
-            /** @description Per-host probe rows from the snapshot. */
-            hosts: components["schemas"]["FleetHost"][] | null;
-            /** @description True when the snapshot is older than the freshness window (30 minutes). The data is still returned so the dashboard can render an honest "last seen" rather than disappearing. */
-            stale: boolean;
-            /** @description Aggregated fleet summary from the snapshot. */
-            summary: components["schemas"]["FleetSummary"];
-        };
-        FleetSummary: {
-            /** @description Bus event name (e.g. "fleet.summary"). */
-            event: string;
-            /**
-             * Format: date-time
-             * @description When the snapshot was written.
-             */
-            generated_at: string;
-            /**
-             * Format: int64
-             * @description Number of hosts the probe successfully reached.
-             */
-            reachable: number;
-            /**
-             * Format: int64
-             * @description Total host count probed.
-             */
-            total: number;
-            /**
-             * Format: int64
-             * @description Number of hosts the probe could not reach.
-             */
-            unreachable: number;
-        };
         FormulaDetailResponse: {
             deps: components["schemas"]["FormulaPreviewEdgeResponse"][] | null;
             description: string;
@@ -2780,6 +2694,11 @@ export interface components {
             items: components["schemas"]["FormulaSummaryResponse"][] | null;
             /** @description Whether the list is partial. */
             partial: boolean;
+            /**
+             * Format: int64
+             * @description Total number of formulas in the list.
+             */
+            total: number;
         };
         FormulaPreviewBody: {
             /** @description Scope kind (city or rig). */
@@ -3087,7 +3006,7 @@ export interface components {
         };
         ListBodyWireEvent: {
             /** @description The list of items. */
-            items: components["schemas"]["WireEvent"][] | null;
+            items: components["schemas"]["TypedEventStreamEnvelope"][] | null;
             /** @description Cursor for the next page of results. */
             next_cursor?: string;
             /** @description True when one or more backends failed and the list is incomplete. */
@@ -3574,6 +3493,19 @@ export interface components {
                 [key: string]: components["schemas"]["ReadinessItem"];
             };
         };
+        RequestFailedPayload: {
+            /** @description Machine-readable error code. */
+            error_code: string;
+            /** @description Human-readable error description. */
+            error_message: string;
+            /**
+             * @description Which operation failed.
+             * @enum {string}
+             */
+            operation: "city.create" | "city.unregister" | "session.create" | "session.message" | "session.submit";
+            /** @description Correlation ID from the 202 response. */
+            request_id: string;
+        };
         RigActionBody: {
             /** @description Action that was performed. */
             action: string;
@@ -3711,6 +3643,12 @@ export interface components {
             /** @description Session title. */
             title?: string;
         };
+        SessionCreateSucceededPayload: {
+            /** @description Correlation ID from the 202 response. */
+            request_id: string;
+            /** @description Full session state as returned by GET /session/{id}. For session.create, this result is emitted only after the session has left creating and can accept normal metadata and lifecycle commands. */
+            session: components["schemas"]["SessionResponse"];
+        };
         SessionInfo: {
             attached: boolean;
             /** Format: date-time */
@@ -3721,14 +3659,11 @@ export interface components {
             /** @description Message text to send. */
             message: string;
         };
-        SessionMessageOutputBody: {
-            /** @description Session ID. */
-            id: string;
-            /**
-             * @description Operation result.
-             * @example accepted
-             */
-            status: string;
+        SessionMessageSucceededPayload: {
+            /** @description Correlation ID from the 202 response. */
+            request_id: string;
+            /** @description Session ID that received the message. */
+            session_id: string;
         };
         SessionPatchBody: {
             /** @description Session alias. Empty string clears the alias. */
@@ -3837,18 +3772,15 @@ export interface components {
             /** @description Message text to submit. */
             message: string;
         };
-        SessionSubmitOutputBody: {
-            /** @description Session ID. */
-            id: string;
-            /** @description Resolved submit intent. */
+        SessionSubmitSucceededPayload: {
+            /** @description Resolved submit intent (default, follow_up, interrupt_now). */
             intent: string;
-            /** @description Whether the message was queued. */
+            /** @description Whether the message was queued for later delivery. */
             queued: boolean;
-            /**
-             * @description Operation result.
-             * @example accepted
-             */
-            status: string;
+            /** @description Correlation ID from the 202 response. */
+            request_id: string;
+            /** @description Session ID that received the submission. */
+            session_id: string;
         };
         SessionTranscriptGetResponse: {
             /** @description conversation, text, or raw. */
@@ -3950,6 +3882,10 @@ export interface components {
             mail: components["schemas"]["StatusMailCounts"];
             /** @description City name. */
             name: string;
+            /** @description True when one or more status backing reads returned incomplete data. */
+            partial?: boolean;
+            /** @description Human-readable errors from incomplete status backing reads. */
+            partial_errors?: string[] | null;
             /** @description City directory path. */
             path: string;
             /**
@@ -4036,7 +3972,7 @@ export interface components {
             total: number;
         };
         SupervisorEventListOutputBody: {
-            items: components["schemas"]["WireTaggedEvent"][] | null;
+            items: components["schemas"]["TypedTaggedEventStreamEnvelope"][] | null;
             /** Format: int64 */
             total: number;
         };
@@ -4098,7 +4034,7 @@ export interface components {
          * Typed city event stream envelope
          * @description Discriminated union of city event stream envelopes. Each variant constrains the envelope type and payload schema together.
          */
-        TypedEventStreamEnvelope: components["schemas"]["TypedEventStreamEnvelopeBeadClosed"] | components["schemas"]["TypedEventStreamEnvelopeBeadCreated"] | components["schemas"]["TypedEventStreamEnvelopeBeadUpdated"] | components["schemas"]["TypedEventStreamEnvelopeCityCreated"] | components["schemas"]["TypedEventStreamEnvelopeCityInitFailed"] | components["schemas"]["TypedEventStreamEnvelopeCityReady"] | components["schemas"]["TypedEventStreamEnvelopeCityResumed"] | components["schemas"]["TypedEventStreamEnvelopeCitySuspended"] | components["schemas"]["TypedEventStreamEnvelopeCityUnregisterFailed"] | components["schemas"]["TypedEventStreamEnvelopeCityUnregisterRequested"] | components["schemas"]["TypedEventStreamEnvelopeCityUnregistered"] | components["schemas"]["TypedEventStreamEnvelopeControllerRestart"] | components["schemas"]["TypedEventStreamEnvelopeControllerStarted"] | components["schemas"]["TypedEventStreamEnvelopeControllerStopped"] | components["schemas"]["TypedEventStreamEnvelopeConvoyClosed"] | components["schemas"]["TypedEventStreamEnvelopeConvoyCreated"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgAdapterAdded"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgAdapterRemoved"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgBound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgGroupCreated"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgInbound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgOutbound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgUnbound"] | components["schemas"]["TypedEventStreamEnvelopeMailArchived"] | components["schemas"]["TypedEventStreamEnvelopeMailDeleted"] | components["schemas"]["TypedEventStreamEnvelopeMailMarkedRead"] | components["schemas"]["TypedEventStreamEnvelopeMailMarkedUnread"] | components["schemas"]["TypedEventStreamEnvelopeMailRead"] | components["schemas"]["TypedEventStreamEnvelopeMailReplied"] | components["schemas"]["TypedEventStreamEnvelopeMailSent"] | components["schemas"]["TypedEventStreamEnvelopeOrderCompleted"] | components["schemas"]["TypedEventStreamEnvelopeOrderFailed"] | components["schemas"]["TypedEventStreamEnvelopeOrderFired"] | components["schemas"]["TypedEventStreamEnvelopeProviderSwapped"] | components["schemas"]["TypedEventStreamEnvelopeSessionCrashed"] | components["schemas"]["TypedEventStreamEnvelopeSessionDraining"] | components["schemas"]["TypedEventStreamEnvelopeSessionIdleKilled"] | components["schemas"]["TypedEventStreamEnvelopeSessionQuarantined"] | components["schemas"]["TypedEventStreamEnvelopeSessionStopped"] | components["schemas"]["TypedEventStreamEnvelopeSessionSuspended"] | components["schemas"]["TypedEventStreamEnvelopeSessionUndrained"] | components["schemas"]["TypedEventStreamEnvelopeSessionUpdated"] | components["schemas"]["TypedEventStreamEnvelopeSessionWoke"] | components["schemas"]["TypedEventStreamEnvelopeWorkerOperation"];
+        TypedEventStreamEnvelope: components["schemas"]["TypedEventStreamEnvelopeBeadClosed"] | components["schemas"]["TypedEventStreamEnvelopeBeadCreated"] | components["schemas"]["TypedEventStreamEnvelopeBeadUpdated"] | components["schemas"]["TypedEventStreamEnvelopeCityCreated"] | components["schemas"]["TypedEventStreamEnvelopeCityResumed"] | components["schemas"]["TypedEventStreamEnvelopeCitySuspended"] | components["schemas"]["TypedEventStreamEnvelopeCityUnregisterRequested"] | components["schemas"]["TypedEventStreamEnvelopeControllerStarted"] | components["schemas"]["TypedEventStreamEnvelopeControllerStopped"] | components["schemas"]["TypedEventStreamEnvelopeConvoyClosed"] | components["schemas"]["TypedEventStreamEnvelopeConvoyCreated"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgAdapterAdded"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgAdapterRemoved"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgBound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgGroupCreated"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgInbound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgOutbound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgUnbound"] | components["schemas"]["TypedEventStreamEnvelopeMailArchived"] | components["schemas"]["TypedEventStreamEnvelopeMailDeleted"] | components["schemas"]["TypedEventStreamEnvelopeMailMarkedRead"] | components["schemas"]["TypedEventStreamEnvelopeMailMarkedUnread"] | components["schemas"]["TypedEventStreamEnvelopeMailRead"] | components["schemas"]["TypedEventStreamEnvelopeMailReplied"] | components["schemas"]["TypedEventStreamEnvelopeMailSent"] | components["schemas"]["TypedEventStreamEnvelopeOrderCompleted"] | components["schemas"]["TypedEventStreamEnvelopeOrderFailed"] | components["schemas"]["TypedEventStreamEnvelopeOrderFired"] | components["schemas"]["TypedEventStreamEnvelopeProviderSwapped"] | components["schemas"]["TypedEventStreamEnvelopeRequestFailed"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultCityCreate"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultCityUnregister"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultSessionCreate"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultSessionMessage"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultSessionSubmit"] | components["schemas"]["TypedEventStreamEnvelopeSessionCrashed"] | components["schemas"]["TypedEventStreamEnvelopeSessionDraining"] | components["schemas"]["TypedEventStreamEnvelopeSessionIdleKilled"] | components["schemas"]["TypedEventStreamEnvelopeSessionQuarantined"] | components["schemas"]["TypedEventStreamEnvelopeSessionStopped"] | components["schemas"]["TypedEventStreamEnvelopeSessionSuspended"] | components["schemas"]["TypedEventStreamEnvelopeSessionUndrained"] | components["schemas"]["TypedEventStreamEnvelopeSessionUpdated"] | components["schemas"]["TypedEventStreamEnvelopeSessionWoke"] | components["schemas"]["TypedEventStreamEnvelopeWorkerOperation"] | components["schemas"]["TypedEventStreamEnvelopeCustom"];
         /** TypedEventStreamEnvelope bead.closed */
         TypedEventStreamEnvelopeBeadClosed: {
             actor: string;
@@ -4167,40 +4103,6 @@ export interface components {
             type: "city.created";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
-        /** TypedEventStreamEnvelope city.init_failed */
-        TypedEventStreamEnvelopeCityInitFailed: {
-            actor: string;
-            message?: string;
-            payload: components["schemas"]["CityLifecyclePayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "city.init_failed";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
-        /** TypedEventStreamEnvelope city.ready */
-        TypedEventStreamEnvelopeCityReady: {
-            actor: string;
-            message?: string;
-            payload: components["schemas"]["CityLifecyclePayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "city.ready";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
         /** TypedEventStreamEnvelope city.resumed */
         TypedEventStreamEnvelopeCityResumed: {
             actor: string;
@@ -4235,23 +4137,6 @@ export interface components {
             type: "city.suspended";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
-        /** TypedEventStreamEnvelope city.unregister_failed */
-        TypedEventStreamEnvelopeCityUnregisterFailed: {
-            actor: string;
-            message?: string;
-            payload: components["schemas"]["CityLifecyclePayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "city.unregister_failed";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
         /** TypedEventStreamEnvelope city.unregister_requested */
         TypedEventStreamEnvelopeCityUnregisterRequested: {
             actor: string;
@@ -4267,40 +4152,6 @@ export interface components {
              * @enum {string}
              */
             type: "city.unregister_requested";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
-        /** TypedEventStreamEnvelope city.unregistered */
-        TypedEventStreamEnvelopeCityUnregistered: {
-            actor: string;
-            message?: string;
-            payload: components["schemas"]["CityLifecyclePayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "city.unregistered";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
-        /** TypedEventStreamEnvelope controller.restart */
-        TypedEventStreamEnvelopeControllerRestart: {
-            actor: string;
-            message?: string;
-            payload: components["schemas"]["ControllerRestartPayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "controller.restart";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
         /** TypedEventStreamEnvelope controller.started */
@@ -4369,6 +4220,23 @@ export interface components {
              * @enum {string}
              */
             type: "convoy.created";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedEventStreamEnvelope custom */
+        TypedEventStreamEnvelopeCustom: {
+            actor: string;
+            message?: string;
+            payload: unknown;
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "TypedEventStreamEnvelopeCustom";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
         /** TypedEventStreamEnvelope extmsg.adapter_added */
@@ -4677,6 +4545,108 @@ export interface components {
             type: "provider.swapped";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
+        /** TypedEventStreamEnvelope request.failed */
+        TypedEventStreamEnvelopeRequestFailed: {
+            actor: string;
+            message?: string;
+            payload: components["schemas"]["RequestFailedPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.failed";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedEventStreamEnvelope request.result.city.create */
+        TypedEventStreamEnvelopeRequestResultCityCreate: {
+            actor: string;
+            message?: string;
+            payload: components["schemas"]["CityCreateSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.city.create";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedEventStreamEnvelope request.result.city.unregister */
+        TypedEventStreamEnvelopeRequestResultCityUnregister: {
+            actor: string;
+            message?: string;
+            payload: components["schemas"]["CityUnregisterSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.city.unregister";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedEventStreamEnvelope request.result.session.create */
+        TypedEventStreamEnvelopeRequestResultSessionCreate: {
+            actor: string;
+            message?: string;
+            payload: components["schemas"]["SessionCreateSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.session.create";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedEventStreamEnvelope request.result.session.message */
+        TypedEventStreamEnvelopeRequestResultSessionMessage: {
+            actor: string;
+            message?: string;
+            payload: components["schemas"]["SessionMessageSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.session.message";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedEventStreamEnvelope request.result.session.submit */
+        TypedEventStreamEnvelopeRequestResultSessionSubmit: {
+            actor: string;
+            message?: string;
+            payload: components["schemas"]["SessionSubmitSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.session.submit";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
         /** TypedEventStreamEnvelope session.crashed */
         TypedEventStreamEnvelopeSessionCrashed: {
             actor: string;
@@ -4851,7 +4821,7 @@ export interface components {
          * Typed supervisor event stream envelope
          * @description Discriminated union of supervisor event stream envelopes. Each variant constrains the envelope type and payload schema together and includes the source city.
          */
-        TypedTaggedEventStreamEnvelope: components["schemas"]["TypedTaggedEventStreamEnvelopeBeadClosed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadUpdated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityInitFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityReady"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityResumed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCitySuspended"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityUnregisterFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityUnregisterRequested"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityUnregistered"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerRestart"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerStarted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerStopped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeConvoyClosed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeConvoyCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgAdapterAdded"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgAdapterRemoved"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgBound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgGroupCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgInbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgOutbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgUnbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailArchived"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailDeleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailMarkedRead"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailMarkedUnread"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailRead"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailReplied"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailSent"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderCompleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderFired"] | components["schemas"]["TypedTaggedEventStreamEnvelopeProviderSwapped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionCrashed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionDraining"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionIdleKilled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionQuarantined"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionStopped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionSuspended"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionUndrained"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionUpdated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionWoke"] | components["schemas"]["TypedTaggedEventStreamEnvelopeWorkerOperation"];
+        TypedTaggedEventStreamEnvelope: components["schemas"]["TypedTaggedEventStreamEnvelopeBeadClosed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadUpdated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityResumed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCitySuspended"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityUnregisterRequested"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerStarted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerStopped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeConvoyClosed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeConvoyCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgAdapterAdded"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgAdapterRemoved"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgBound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgGroupCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgInbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgOutbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgUnbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailArchived"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailDeleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailMarkedRead"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailMarkedUnread"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailRead"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailReplied"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailSent"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderCompleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderFired"] | components["schemas"]["TypedTaggedEventStreamEnvelopeProviderSwapped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultCityCreate"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultCityUnregister"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultSessionCreate"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultSessionMessage"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionCrashed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionDraining"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionIdleKilled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionQuarantined"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionStopped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionSuspended"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionUndrained"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionUpdated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionWoke"] | components["schemas"]["TypedTaggedEventStreamEnvelopeWorkerOperation"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCustom"];
         /** TypedTaggedEventStreamEnvelope bead.closed */
         TypedTaggedEventStreamEnvelopeBeadClosed: {
             actor: string;
@@ -4924,42 +4894,6 @@ export interface components {
             type: "city.created";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
-        /** TypedTaggedEventStreamEnvelope city.init_failed */
-        TypedTaggedEventStreamEnvelopeCityInitFailed: {
-            actor: string;
-            city: string;
-            message?: string;
-            payload: components["schemas"]["CityLifecyclePayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "city.init_failed";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
-        /** TypedTaggedEventStreamEnvelope city.ready */
-        TypedTaggedEventStreamEnvelopeCityReady: {
-            actor: string;
-            city: string;
-            message?: string;
-            payload: components["schemas"]["CityLifecyclePayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "city.ready";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
         /** TypedTaggedEventStreamEnvelope city.resumed */
         TypedTaggedEventStreamEnvelopeCityResumed: {
             actor: string;
@@ -4996,24 +4930,6 @@ export interface components {
             type: "city.suspended";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
-        /** TypedTaggedEventStreamEnvelope city.unregister_failed */
-        TypedTaggedEventStreamEnvelopeCityUnregisterFailed: {
-            actor: string;
-            city: string;
-            message?: string;
-            payload: components["schemas"]["CityLifecyclePayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "city.unregister_failed";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
         /** TypedTaggedEventStreamEnvelope city.unregister_requested */
         TypedTaggedEventStreamEnvelopeCityUnregisterRequested: {
             actor: string;
@@ -5030,42 +4946,6 @@ export interface components {
              * @enum {string}
              */
             type: "city.unregister_requested";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
-        /** TypedTaggedEventStreamEnvelope city.unregistered */
-        TypedTaggedEventStreamEnvelopeCityUnregistered: {
-            actor: string;
-            city: string;
-            message?: string;
-            payload: components["schemas"]["CityLifecyclePayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "city.unregistered";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
-        /** TypedTaggedEventStreamEnvelope controller.restart */
-        TypedTaggedEventStreamEnvelopeControllerRestart: {
-            actor: string;
-            city: string;
-            message?: string;
-            payload: components["schemas"]["ControllerRestartPayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "controller.restart";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
         /** TypedTaggedEventStreamEnvelope controller.started */
@@ -5138,6 +5018,24 @@ export interface components {
              * @enum {string}
              */
             type: "convoy.created";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedTaggedEventStreamEnvelope custom */
+        TypedTaggedEventStreamEnvelopeCustom: {
+            actor: string;
+            city: string;
+            message?: string;
+            payload: unknown;
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "TypedTaggedEventStreamEnvelopeCustom";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
         /** TypedTaggedEventStreamEnvelope extmsg.adapter_added */
@@ -5464,6 +5362,114 @@ export interface components {
             type: "provider.swapped";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
+        /** TypedTaggedEventStreamEnvelope request.failed */
+        TypedTaggedEventStreamEnvelopeRequestFailed: {
+            actor: string;
+            city: string;
+            message?: string;
+            payload: components["schemas"]["RequestFailedPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.failed";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedTaggedEventStreamEnvelope request.result.city.create */
+        TypedTaggedEventStreamEnvelopeRequestResultCityCreate: {
+            actor: string;
+            city: string;
+            message?: string;
+            payload: components["schemas"]["CityCreateSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.city.create";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedTaggedEventStreamEnvelope request.result.city.unregister */
+        TypedTaggedEventStreamEnvelopeRequestResultCityUnregister: {
+            actor: string;
+            city: string;
+            message?: string;
+            payload: components["schemas"]["CityUnregisterSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.city.unregister";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedTaggedEventStreamEnvelope request.result.session.create */
+        TypedTaggedEventStreamEnvelopeRequestResultSessionCreate: {
+            actor: string;
+            city: string;
+            message?: string;
+            payload: components["schemas"]["SessionCreateSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.session.create";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedTaggedEventStreamEnvelope request.result.session.message */
+        TypedTaggedEventStreamEnvelopeRequestResultSessionMessage: {
+            actor: string;
+            city: string;
+            message?: string;
+            payload: components["schemas"]["SessionMessageSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.session.message";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedTaggedEventStreamEnvelope request.result.session.submit */
+        TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit: {
+            actor: string;
+            city: string;
+            message?: string;
+            payload: components["schemas"]["SessionSubmitSucceededPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "request.result.session.submit";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
         /** TypedTaggedEventStreamEnvelope session.crashed */
         TypedTaggedEventStreamEnvelopeSessionCrashed: {
             actor: string;
@@ -5648,29 +5654,6 @@ export interface components {
             /** Format: int64 */
             count: number;
             session_id: string;
-        };
-        WireEvent: {
-            actor: string;
-            message?: string;
-            payload?: components["schemas"]["EventPayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            type: string;
-        };
-        WireTaggedEvent: {
-            actor: string;
-            city: string;
-            message?: string;
-            payload?: components["schemas"]["EventPayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            type: string;
         };
         WorkerOperationEventPayload: {
             delivered?: boolean;
@@ -5882,7 +5865,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CityCreateResponse"];
+                    "application/json": components["schemas"]["AsyncAcceptedResponse"];
                 };
             };
             /** @description Error */
@@ -7615,11 +7598,11 @@ export interface operations {
     "stream-events": {
         parameters: {
             query?: {
-                /** @description Reconnect position: only deliver events after this sequence number. */
+                /** @description Reconnect position: only deliver events after this sequence number. Omit after_seq and Last-Event-ID to start at the current city event head. */
                 after_seq?: string;
             };
             header?: {
-                /** @description SSE reconnect position from the last received event ID. */
+                /** @description SSE reconnect position from the last received event ID. Omit Last-Event-ID and after_seq to start at the current city event head. */
                 "Last-Event-ID"?: string;
             };
             path: {
@@ -8236,40 +8219,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExtMsgUnbindBody"];
-                };
-            };
-            /** @description Error */
-            default: {
-                headers: {
-                    "X-GC-Request-Id": components["headers"]["X-GC-Request-Id"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ErrorModel"];
-                };
-            };
-        };
-    };
-    "get-v0-city-by-city-name-fleet-status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description City name. */
-                cityName: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    "X-GC-Request-Id": components["headers"]["X-GC-Request-Id"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["FleetStatusBody"];
                 };
             };
             /** @description Error */
@@ -10808,7 +10757,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SessionMessageOutputBody"];
+                    "application/json": components["schemas"]["AsyncAcceptedBody"];
                 };
             };
             /** @description Error */
@@ -11112,7 +11061,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SessionSubmitOutputBody"];
+                    "application/json": components["schemas"]["AsyncAcceptedBody"];
                 };
             };
             /** @description Error */
@@ -11175,6 +11124,8 @@ export interface operations {
                 format?: string;
                 /** @description Pagination cursor: return entries before this UUID. */
                 before?: string;
+                /** @description Pagination cursor: return entries after this UUID. */
+                after?: string;
             };
             header?: never;
             path: {
@@ -11321,7 +11272,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SessionResponse"];
+                    "application/json": components["schemas"]["AsyncAcceptedBody"];
                 };
             };
             /** @description Error */
@@ -11439,7 +11390,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CityUnregisterResponse"];
+                    "application/json": components["schemas"]["AsyncAcceptedResponse"];
                 };
             };
             /** @description Error */
@@ -11585,11 +11536,11 @@ export interface operations {
     "stream-supervisor-events": {
         parameters: {
             query?: {
-                /** @description Alternative to Last-Event-ID for browsers that can't set custom headers. */
+                /** @description Alternative to Last-Event-ID for browsers that can't set custom headers. Omit after_cursor and Last-Event-ID to start at the current supervisor event head. */
                 after_cursor?: string;
             };
             header?: {
-                /** @description Reconnect cursor (composite per-city cursor). */
+                /** @description Reconnect cursor (composite per-city cursor). Omit Last-Event-ID and after_cursor to start at the current supervisor event head. */
                 "Last-Event-ID"?: string;
             };
             path?: never;

@@ -86,6 +86,13 @@ var rigFlag string
 // run executes the gc CLI with the given args, writing output to stdout and
 // errors to stderr. Returns the exit code.
 func run(args []string, stdout, stderr io.Writer) int {
+	prevCityFlag, prevRigFlag := cityFlag, rigFlag
+	cityFlag, rigFlag = "", ""
+	defer func() {
+		cityFlag = prevCityFlag
+		rigFlag = prevRigFlag
+	}()
+
 	// Initialize OTel telemetry (opt-in via GC_OTEL_METRICS_URL / GC_OTEL_LOGS_URL).
 	provider, err := telemetry.Init(context.Background(), "gascity", version)
 	if err != nil {
@@ -143,6 +150,7 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		"path to the city directory (default: walk up from cwd)")
 	root.PersistentFlags().StringVar(&rigFlag, "rig", "",
 		"rig name or path (default: discover from cwd)")
+	_ = root.RegisterFlagCompletionFunc("rig", completeRigFlagNames)
 	root.AddCommand(
 		newStartCmd(stdout, stderr),
 		newInitCmd(stdout, stderr),
@@ -191,6 +199,7 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		newFormulaCmd(stdout, stderr),
 		newBdCmd(stdout, stderr),
 		newBdStoreBridgeCmd(stdout, stderr),
+		newDoltCleanupCmd(stdout, stderr),
 		newDoltConfigCmd(stdout, stderr),
 		newDoltStateCmd(stdout, stderr),
 		newShellCmd(stdout, stderr),
