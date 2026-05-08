@@ -1,0 +1,4 @@
+BeadRef-Audit: pre-trailer-discipline commit, primitive enabling restart-city orders
+Audited: 2026-05-08 during overseer trailer audit (E5)
+Downstream consumers in command-center: cc-k2fis (order:restart-city-rotation-tick) — relies on this primitive.
+Status: complete-on-overseer
