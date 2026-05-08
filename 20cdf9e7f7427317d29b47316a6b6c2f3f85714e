@@ -1,0 +1,4 @@
+BeadRef-Audit: pre-trailer-discipline commit, no bead linkage in command-center
+Audited: 2026-05-08 during overseer trailer audit (E5)
+Followups exist as cc-fleet-status-sse (poll→SSE migration), cc-fleet-registry, cc-ldoo4 (status-tick order)
+Status: complete-on-overseer
