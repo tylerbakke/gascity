@@ -1,0 +1,4 @@
+BeadRef-Audit: pre-trailer-discipline commit, infrastructural scaffold (no bead)
+Audited: 2026-05-08 during overseer trailer audit (E5)
+Adds NON-GOALS.md and .cycles/ as opt-in placeholder; no behavior change.
+Status: complete-on-overseer
