@@ -31,6 +31,27 @@ const (
 	orderTrackingSweepMetadataReason       = "stale-order-tracking"
 	orderTrackingSweepMetadataInitiator    = "order-tracking-sweep"
 	orderTrackingWatchdogMetadataInitiator = "controller-watchdog"
+
+	// orphanedOrderTrackingCloseReason is the canonical close_reason
+	// stamped on orphan-sweep closes. It satisfies bd's
+	// validation.on-close=error validator (which rejects closes without
+	// an explicit --reason of >=20 characters) and provides a meaningful
+	// audit trail in the closed bead's metadata. Without this, the close
+	// is rejected, the bead stays open, and the next sweep tick re-stamps
+	// identical metadata — generating one bead.updated event per tick per
+	// bead.
+	orphanedOrderTrackingCloseReason = "order-tracking sweep: orphaned by prior controller"
+
+	// staleOrderTrackingCloseReason is the canonical close_reason stamped
+	// on stale-sweep closes (both the periodic order-tracking-sweep order
+	// and the controller's runtime watchdog). Same rationale as
+	// orphanedOrderTrackingCloseReason — without an explicit reason of
+	// >=20 chars, validation.on-close=error rejects every close, the
+	// watchdog retries every 30s, and the order-firing pipeline silently
+	// wedges (no bead.created/closed events, only metadata churn).
+	staleOrderTrackingCloseReason = "order-tracking sweep: stale tracking bead exceeded retention window"
+
+	completedOrderTrackingCloseReason = "order dispatch completed: tracking bead lifecycle finished"
 )
 
 // orderDispatcher evaluates order trigger conditions and dispatches due
@@ -82,6 +103,28 @@ func logDispatchError(stderr io.Writer, format string, args ...any) {
 	}
 }
 
+// lockedWriter serializes Write calls so concurrent dispatchOne goroutines
+// logging via logDispatchError(m.stderr, ...) do not interleave bytes.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (lw *lockedWriter) Write(p []byte) (int, error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	return lw.w.Write(p)
+}
+
+// lockedStderr wraps w for storage on memoryOrderDispatcher.stderr. Returns
+// nil unchanged so logDispatchError's nil-guard keeps its original semantics.
+func lockedStderr(w io.Writer) io.Writer {
+	if w == nil {
+		return nil
+	}
+	return &lockedWriter{w: w}
+}
+
 type orderStoreFunc func(execStoreTarget) (beads.Store, error)
 
 // memoryOrderDispatcher is the production implementation.
@@ -91,6 +134,11 @@ type orderStoreFunc func(execStoreTarget) (beads.Store, error)
 // orphaned waiter goroutine. dispatch is only ever called from the tick
 // goroutine, so addInflight's check-and-create happens-before any
 // concurrent drain call on the same instance.
+//
+// dispatchCtx is the parent context for every dispatchOne goroutine. The
+// per-goroutine ctx is derived to cancel when EITHER the caller's tick
+// ctx OR dispatchCtx is done (see launchDispatchOne). cancel() cancels
+// dispatchCtx.
 type memoryOrderDispatcher struct {
 	aa           []orders.Order
 	storeFn      orderStoreFunc
@@ -103,6 +151,9 @@ type memoryOrderDispatcher struct {
 	cityName     string
 	cacheMu      sync.Mutex
 	lastRunCache map[string]time.Time
+
+	dispatchCtx    context.Context
+	dispatchCancel context.CancelFunc
 
 	inflightMu   sync.Mutex
 	inflightN    int
@@ -143,18 +194,21 @@ func buildOrderDispatcher(cityPath string, cfg *config.City, rec events.Recorder
 		ep = p
 	}
 
+	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
 	return &memoryOrderDispatcher{
 		aa: auto,
 		storeFn: func(target execStoreTarget) (beads.Store, error) {
 			return openStoreAtForCity(target.ScopeRoot, cityPath)
 		},
-		ep:         ep,
-		execRun:    shellExecRunner,
-		rec:        rec,
-		stderr:     stderr,
-		maxTimeout: cfg.Orders.MaxTimeoutDuration(),
-		cfg:        cfg,
-		cityName:   loadedCityName(cfg, cityPath),
+		ep:             ep,
+		execRun:        shellExecRunner,
+		rec:            rec,
+		stderr:         lockedStderr(stderr),
+		maxTimeout:     cfg.Orders.MaxTimeoutDuration(),
+		cfg:            cfg,
+		cityName:       loadedCityName(cfg, cityPath),
+		dispatchCtx:    dispatchCtx,
+		dispatchCancel: dispatchCancel,
 	}
 }
 
@@ -280,7 +334,37 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		// controller exit or config reload.
 		a := a // capture loop variable
 		m.addInflight()
-		go m.dispatchOne(ctx, store, target, a, cityPath, trackingBead.ID)
+		m.launchDispatchOne(ctx, store, target, a, cityPath, trackingBead.ID)
+	}
+}
+
+// launchDispatchOne spawns dispatchOne with a context that cancels when
+// EITHER the caller's tick ctx OR m.dispatchCtx is done — required so
+// cancel() reaches goroutines whose tick ctx was context.Background().
+// Falls back to the bare caller ctx when m.dispatchCtx is nil (test
+// sites that don't initialize the cancel fields).
+func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string) {
+	if m.dispatchCtx == nil {
+		go m.dispatchOne(ctx, store, target, a, cityPath, trackingID)
+		return
+	}
+	mergedCtx, cancelMerged := context.WithCancel(ctx)
+	stopAfter := context.AfterFunc(m.dispatchCtx, cancelMerged)
+	go func() {
+		defer stopAfter()
+		defer cancelMerged()
+		m.dispatchOne(mergedCtx, store, target, a, cityPath, trackingID)
+	}()
+}
+
+// cancel signals all in-flight dispatchOne goroutines to terminate. Safe
+// to call multiple times. Caller should follow with drain to wait for
+// goroutine completion (exec.CommandContext propagates the cancel as
+// SIGKILL; dispatchOne's deferred cleanup writes the tracking-bead
+// outcome before doneInflight signals drain).
+func (m *memoryOrderDispatcher) cancel() {
+	if m.dispatchCancel != nil {
+		m.dispatchCancel()
 	}
 }
 
@@ -400,7 +484,7 @@ func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Sto
 	// Defer order matters: doneInflight runs last, after Close makes the
 	// tracking bead outcome observable to a waiting drain.
 	defer m.doneInflight()
-	defer store.Close(trackingID) //nolint:errcheck // best-effort close
+	defer closeOrderTrackingBead(store, trackingID) //nolint:errcheck // best-effort close
 
 	timeout := effectiveTimeout(a, m.maxTimeout)
 	childCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -418,6 +502,13 @@ func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Sto
 	} else {
 		m.dispatchWisp(childCtx, store, a, cityPath, trackingID)
 	}
+}
+
+func closeOrderTrackingBead(store beads.Store, trackingID string) error {
+	_, err := store.CloseAll([]string{trackingID}, map[string]string{
+		"close_reason": completedOrderTrackingCloseReason,
+	})
+	return err
 }
 
 // dispatchExec runs an exec order's shell command.
@@ -738,7 +829,9 @@ func sweepOrphanedOrderTracking(store beads.Store) (int, error) {
 	for i, b := range all {
 		ids[i] = b.ID
 	}
-	n, err := store.CloseAll(ids, nil)
+	n, err := store.CloseAll(ids, map[string]string{
+		"close_reason": orphanedOrderTrackingCloseReason,
+	})
 	if err != nil {
 		return n, fmt.Errorf("closing orphaned order-tracking beads: %w", err)
 	}
@@ -779,6 +872,7 @@ func sweepStaleOrderTracking(store beads.Store, now time.Time, staleAfter time.D
 	}
 	metadata := map[string]string{
 		"order_tracking_sweep": orderTrackingSweepMetadataReason,
+		"close_reason":         staleOrderTrackingCloseReason,
 	}
 	if initiator != "" {
 		metadata["order_tracking_sweep_by"] = initiator

@@ -130,10 +130,10 @@ A long tool call is different from an infinite loop.
 for the dog pool:
 
 ```bash
-gc bd create --type=warrant \
+gc bd create --type=task \
   --title="Stuck: <agent>" \
   --metadata '{"target":"<session>","reason":"<reason>","requester":"witness"}' \
-  --label=pool:dog
+  --label=warrant,pool:dog
 ```
 
 The dog pool runs `mol-shutdown-dance` — a multi-stage interrogation
@@ -185,7 +185,7 @@ re-reads formula steps and resumes from context.
 gc mail send mayor/ -s "Subject" -m "Message"              # Escalate to mayor
 gc mail send {{ .RigName }}/refinery -s "Subject" -m "..."  # Refinery questions
 gc session nudge {{ .RigName }}/<polecat-name> "Run gc hook; it checks assigned work before routed pool work"
-gc session peek {{ .RigName }}/<polecat-name> 50             # View polecat output
+gc session peek {{ .RigName }}/<polecat-name> --lines 50     # View polecat output
 ```
 
 Use the concrete polecat name from `gc status` or `gc session list`;
@@ -253,7 +253,7 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
 | Salvage worktree work | `git add -A && git commit && git push origin HEAD` |
 | Delete worktree | `git worktree remove <path> --force` |
 | Set branch metadata | `gc bd update <id> --set-metadata branch=<name>` |
-| File stuck-agent warrant | `gc bd create --type=warrant --label=pool:dog --metadata '{...}'` |
+| File stuck-agent warrant | `gc bd create --type=task --label=warrant,pool:dog --metadata '{...}'` |
 
 Rig: {{ .RigName }}
 Working directory: {{ .WorkDir }}

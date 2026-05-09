@@ -1,12 +1,12 @@
 import { cityScope } from "./api";
 import { renderCityTabs } from "./panels/cities";
 import { renderStatus } from "./panels/status";
-import { renderCrew, installCrewInteractions, closeLogDrawerExternal } from "./panels/crew";
-import { renderIssues, installIssueInteractions } from "./panels/issues";
-import { renderMail, installMailInteractions } from "./panels/mail";
-import { renderConvoys, installConvoyInteractions } from "./panels/convoys";
-import { eventTypeFromMessage, loadActivityHistory, startActivityStream, stopActivityStream, installActivityInteractions } from "./panels/activity";
-import { renderAdminPanels, installAdminInteractions } from "./panels/admin";
+import { renderCrew, installCrewInteractions, closeLogDrawerExternal, resetCrewNoCity } from "./panels/crew";
+import { renderIssues, installIssueInteractions, resetIssuesNoCity } from "./panels/issues";
+import { renderMail, installMailInteractions, resetMailNoCity } from "./panels/mail";
+import { renderConvoys, installConvoyInteractions, resetConvoysNoCity } from "./panels/convoys";
+import { eventTypeFromMessage, loadActivityHistory, resetActivity, startActivityStream, stopActivityStream, installActivityInteractions } from "./panels/activity";
+import { renderAdminPanels, installAdminInteractions, renderAdminEmptyStates } from "./panels/admin";
 import { renderFleetStatus } from "./panels/fleet-status";
 import { invalidateOptions } from "./panels/options";
 import { installPanelAffordances, popPause, refreshPaused, reportUIError, setPopPauseListener } from "./ui";
@@ -14,10 +14,13 @@ import { installCommandPalette } from "./palette";
 import { installDashboardLogging, logInfo } from "./logger";
 import {
   consumeInvalidated,
+  canFetchCityScopedResources,
   currentCityStatus,
   invalidate,
   invalidateAll,
   invalidateForEventType,
+  isKnownUnavailableCity,
+  markCachedCitiesUnknown,
   syncCityScopeFromLocation,
   type DashboardResource,
 } from "./state";
@@ -68,7 +71,7 @@ function wireSSE(): void {
   // the supervisor with every backoff tick. Supervisor-scope streams
   // (kind === "supervisor") always open.
   const status = currentCityStatus();
-  if (status.kind === "not-running" || status.kind === "unknown") {
+  if (isKnownUnavailableCity(status)) {
     stopActivityStream();
     setConnectionBadge("connecting"); // visible "not wired" state; re-wires on next city switch
     return;
@@ -154,13 +157,12 @@ function byId(id: string): HTMLElement | null {
 
 void boot().catch((error) => reportUIError("Dashboard boot failed", error));
 
-function syncCityScopedControls(): void {
-  const hasCity = cityScope() !== "";
-  syncCityScopedPanels(hasCity);
-  setControlState("new-convoy-btn", hasCity, "Select a city to create a convoy");
-  setControlState("new-issue-btn", hasCity, "Select a city to create a bead");
-  setControlState("compose-mail-btn", hasCity, "Select a city to compose mail");
-  setControlState("open-assign-btn", hasCity, "Select a city to assign work");
+function syncCityScopedControls(enabled: boolean): void {
+  syncCityScopedPanels(enabled);
+  setControlState("new-convoy-btn", enabled, "Select a running city to create a convoy");
+  setControlState("new-issue-btn", enabled, "Select a running city to create a bead");
+  setControlState("compose-mail-btn", enabled, "Select a running city to compose mail");
+  setControlState("open-assign-btn", enabled, "Select a running city to assign work");
 }
 
 function setControlState(id: string, enabled: boolean, disabledTitle: string): void {
@@ -230,10 +232,12 @@ function syncCityScopedPanels(hasCity: boolean): void {
 }
 
 const REFRESH_DEBOUNCE_MS = 1_000;
+const REFRESH_MIN_INTERVAL_MS = 10_000;
 
 const refreshScheduler = createRefreshScheduler({
   delayMs: REFRESH_DEBOUNCE_MS,
   isPaused: refreshPaused,
+  minIntervalMs: REFRESH_MIN_INTERVAL_MS,
   onError: (error) => reportUIError("Refresh failed", error),
   run: () => refreshVisibleResources(),
 });
@@ -244,7 +248,6 @@ function scheduleRefresh(): void {
 
 async function refreshVisibleResources(force = false): Promise<void> {
   syncCityScopeFromLocation();
-  syncCityScopedControls();
 
   const dirty = consumeInvalidated(force);
   if (dirty.size === 0) return;
@@ -253,20 +256,30 @@ async function refreshVisibleResources(force = false): Promise<void> {
   }
 
   if (dirty.has("cities")) {
-    await renderCityTabs().catch((error) => reportUIError("City tabs failed", error));
+    await renderCityTabs().catch((error) => {
+      markCachedCitiesUnknown();
+      reportUIError("City tabs failed", error);
+    });
   }
 
   const tasks: Array<Promise<void>> = [];
   const status = currentCityStatus();
-  const hasRunningCity = status.kind === "running";
+  const canFetchCity = canFetchCityScopedResources(status);
+  syncCityScopedControls(canFetchCity);
+  if (isKnownUnavailableCity(status)) {
+    resetCityScopedResourceViews();
+  }
 
   queueRefresh(tasks, dirty, "status", () => renderStatus());
-  queueRefresh(tasks, dirty, "activity", () => loadActivityHistory());
-  // Only fan out per-city fetches when the selected city is actually
-  // running. Stopped/unknown cities return 404 for every endpoint,
-  // which cascades into a console full of errors for the user. Let
-  // renderStatus surface the "city not running" banner instead.
-  if (hasRunningCity) {
+  if (status.kind === "supervisor" || canFetchCity) {
+    queueRefresh(tasks, dirty, "activity", () => loadActivityHistory());
+  } else {
+    resetActivity();
+  }
+  // Fan out city-scoped fetches for running cities and for selected
+  // cities whose availability is not known yet. Reset/hide only once
+  // the city list is known-good and proves the city is stopped or absent.
+  if (canFetchCity) {
     queueRefresh(tasks, dirty, "crew", () => renderCrew());
     queueRefresh(tasks, dirty, "issues", () => renderIssues());
     queueRefresh(tasks, dirty, "mail", () => renderMail());
@@ -291,6 +304,14 @@ async function refreshVisibleResources(force = false): Promise<void> {
     // session timeouts, which we don't want.
     void renderOversight().catch((error) => reportUIError("Oversight refresh failed", error));
   }
+}
+
+function resetCityScopedResourceViews(): void {
+  resetConvoysNoCity();
+  resetCrewNoCity();
+  resetIssuesNoCity();
+  resetMailNoCity();
+  renderAdminEmptyStates();
 }
 
 function queueRefresh(

@@ -116,6 +116,38 @@ start_command = "claude --dangerously-skip-permissions"
 	}
 }
 
+func TestParseRigDefaultBranch(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "lights"
+
+[[rigs]]
+name = "scamper"
+path = "/scamper"
+default_branch = "master"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Rigs) != 1 {
+		t.Fatalf("len(Rigs) = %d, want 1", len(cfg.Rigs))
+	}
+	if got := cfg.Rigs[0].DefaultBranch; got != "master" {
+		t.Errorf("DefaultBranch = %q, want %q", got, "master")
+	}
+	if got := cfg.Rigs[0].EffectiveDefaultBranch(); got != "master" {
+		t.Errorf("EffectiveDefaultBranch = %q, want %q", got, "master")
+	}
+}
+
+func TestEffectiveDefaultBranch_EmptyWhenUnset(t *testing.T) {
+	r := Rig{Name: "rig"}
+	if got := r.EffectiveDefaultBranch(); got != "" {
+		t.Errorf("EffectiveDefaultBranch() = %q, want empty", got)
+	}
+}
+
 func TestParseAgentSkillsAndMCP(t *testing.T) {
 	data := []byte(`
 [workspace]
@@ -1986,6 +2018,43 @@ name = "mayor"
 	got := cfg.Daemon.PatrolIntervalDuration()
 	if got != 30*time.Second {
 		t.Errorf("PatrolIntervalDuration() = %v, want 30s", got)
+	}
+}
+
+func TestParseDaemonNudgeDispatcher(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "test"
+
+[daemon]
+nudge_dispatcher = "supervisor"
+
+[[agent]]
+name = "mayor"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Daemon.NudgeDispatcher != "supervisor" {
+		t.Errorf("Daemon.NudgeDispatcher = %q, want %q", cfg.Daemon.NudgeDispatcher, "supervisor")
+	}
+	if got := cfg.Daemon.NudgeDispatcherMode(); got != "supervisor" {
+		t.Errorf("NudgeDispatcherMode() = %q, want %q", got, "supervisor")
+	}
+}
+
+func TestDaemonNudgeDispatcherDefault(t *testing.T) {
+	d := DaemonConfig{}
+	if got := d.NudgeDispatcherMode(); got != "legacy" {
+		t.Errorf("NudgeDispatcherMode() = %q, want %q", got, "legacy")
+	}
+}
+
+func TestDaemonNudgeDispatcherUnknownFallsBack(t *testing.T) {
+	d := DaemonConfig{NudgeDispatcher: "garbage"}
+	if got := d.NudgeDispatcherMode(); got != "legacy" {
+		t.Errorf("NudgeDispatcherMode() with unknown value = %q, want %q", got, "legacy")
 	}
 }
 
