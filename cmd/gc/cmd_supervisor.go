@@ -835,6 +835,13 @@ func runSupervisor(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc supervisor: workspace-service startup cleanup: %v\n", err) //nolint:errcheck
 		return 1
 	}
+	// Self-heal stale dolt.lock files from a prior supervisor crash so
+	// operators do not have to run `rm` by hand before `gc supervisor
+	// start`. Best-effort: log non-fatal so supervisor startup continues
+	// even when one city's cleanup fails.
+	if err := cleanupStaleManagedDoltLifecycleLocksForSupervisorStart(supervisor.DefaultHome()); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor: managed dolt lock startup cleanup: %v\n", err) //nolint:errcheck
+	}
 
 	// Track managed cities via atomic-snapshot registry. API reads are
 	// lock-free (atomic pointer load); mutations go through citiesMu.
