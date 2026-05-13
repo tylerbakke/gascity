@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -4636,22 +4637,46 @@ func TestStopSupervisorWithWaitBlocksUntilSocketStops(t *testing.T) {
 	}
 }
 
-// TestStopSupervisorWithoutWaitReturnsAfterAck confirms the default
-// (non-wait) path returns as soon as the supervisor ACKs the stop. The
-// fake socket keeps answering "ping" indefinitely; without --wait,
-// stopSupervisor must not block on the ping result.
-func TestStopSupervisorWithoutWaitReturnsAfterAck(t *testing.T) {
+// TestStopSupervisorWithoutWaitWaitsForProcessExit confirms the new
+// contract introduced by ci-lg52n: even without --wait, stop must
+// verify the supervisor process actually exited before returning 0.
+// The pre-fix code returned as soon as the supervisor ACK'd, which let
+// it lie about a hung supervisor.
+func TestStopSupervisorWithoutWaitWaitsForProcessExit(t *testing.T) {
 	gcHome := shortTempDir(t, "gc-home-")
 	runtimeDir := shortTempDir(t, "gc-run-")
 	t.Setenv("GC_HOME", gcHome)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 
+	var alive atomic.Bool
+	alive.Store(true)
+	stubSupervisorStopProcessHooks(t, func(pid int, sig syscall.Signal) error {
+		if sig == syscall.SIGKILL {
+			alive.Store(false)
+			return nil
+		}
+		if alive.Load() {
+			return nil
+		}
+		return syscall.ESRCH
+	})
+	shrinkSupervisorStopTimeouts(t, 2*time.Second, 500*time.Millisecond)
+
 	sockPath := filepath.Join(gcHome, "supervisor.sock")
 	startTestSupervisorSocket(t, sockPath, func(cmd string) string {
 		switch cmd {
 		case "ping":
-			return "4242\n"
+			if alive.Load() {
+				return "4242\n"
+			}
+			return ""
 		case "stop":
+			// Simulate prompt graceful exit so we don't pay the
+			// SIGKILL-escalation cost in the test.
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				alive.Store(false)
+			}()
 			return "ok\n"
 		}
 		return ""
@@ -4663,16 +4688,16 @@ func TestStopSupervisorWithoutWaitReturnsAfterAck(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if code != 0 {
-		t.Fatalf("stopSupervisor code = %d, want 0; stderr: %s", code, stderr.String())
+		t.Fatalf("stopSupervisor code = %d, want 0; stderr=%q", code, stderr.String())
 	}
 	if elapsed > 2*time.Second {
-		t.Fatalf("returned after %s, expected fast return (no wait) — waited anyway?", elapsed)
+		t.Fatalf("returned after %s, expected sub-second turnaround on graceful exit", elapsed)
 	}
 	if !strings.Contains(stdout.String(), "Supervisor stopping...") {
 		t.Fatalf("stdout = %q, want 'Supervisor stopping...' message", stdout.String())
 	}
-	if strings.Contains(stdout.String(), "Supervisor stopped.") {
-		t.Fatalf("stdout unexpectedly contains 'Supervisor stopped.' — wait flag was false")
+	if !strings.Contains(stdout.String(), "Supervisor stopped.") {
+		t.Fatalf("stdout = %q, want 'Supervisor stopped.' after the process exits", stdout.String())
 	}
 }
 
@@ -4739,14 +4764,22 @@ func TestStopSupervisorWithWaitPropagatesDoneErr(t *testing.T) {
 	}
 }
 
-// TestStopSupervisorWithWaitTimesOutWhenSocketKeepsAnswering guards the
-// wait-timeout path. The fake socket keeps answering ping forever; --wait
-// with a tiny timeout must return non-zero and mention the timeout.
-func TestStopSupervisorWithWaitTimesOutWhenSocketKeepsAnswering(t *testing.T) {
+// TestStopSupervisorWithWaitReturnsErrorWhenProcessNeverDies guards the
+// post-ci-lg52n hard-error path: a wedged supervisor that keeps the
+// control socket open and survives even SIGKILL must produce exit 1
+// with a clear "still alive" message — not a silent exit 0.
+func TestStopSupervisorWithWaitReturnsErrorWhenProcessNeverDies(t *testing.T) {
 	gcHome := shortTempDir(t, "gc-home-")
 	runtimeDir := shortTempDir(t, "gc-run-")
 	t.Setenv("GC_HOME", gcHome)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+
+	stubSupervisorStopProcessHooks(t, func(pid int, sig syscall.Signal) error {
+		// Pretend the process is wedged: every probe and every signal
+		// is a no-op; kill(pid, 0) returns nil so liveness reports true.
+		return nil
+	})
+	shrinkSupervisorStopTimeouts(t, 100*time.Millisecond, 100*time.Millisecond)
 
 	sockPath := filepath.Join(gcHome, "supervisor.sock")
 	startTestSupervisorSocket(t, sockPath, func(cmd string) string {
@@ -4760,13 +4793,208 @@ func TestStopSupervisorWithWaitTimesOutWhenSocketKeepsAnswering(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := stopSupervisorWithWait(&stdout, &stderr, true, 300*time.Millisecond)
+	code := stopSupervisorWithWait(&stdout, &stderr, true, 200*time.Millisecond)
 
 	if code != 1 {
-		t.Fatalf("stopSupervisorWithWait code = %d, want 1 (timeout)", code)
+		t.Fatalf("stopSupervisorWithWait code = %d, want 1 when SIGKILL fails to kill the process", code)
 	}
-	if !strings.Contains(stderr.String(), "timed out") {
-		t.Fatalf("stderr = %q, want timeout message", stderr.String())
+	if !strings.Contains(stderr.String(), "still alive") {
+		t.Fatalf("stderr = %q, want 'still alive' message", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Supervisor stopped.") {
+		t.Fatalf("stdout = %q, must NOT claim 'Supervisor stopped.' when the process is wedged", stdout.String())
+	}
+}
+
+// stubSupervisorStopProcessHooks installs test stubs for the supervisor
+// stop's kill / liveness hooks so tests can simulate a hung supervisor
+// without sending real signals to PIDs on the host machine.
+//
+// killFn is invoked for every signal — including the liveness probe
+// sig=0 — and must return nil/ESRCH to influence the polling logic the
+// same way the kernel would. The original implementations are restored
+// via t.Cleanup.
+func stubSupervisorStopProcessHooks(t *testing.T, killFn func(pid int, sig syscall.Signal) error) {
+	t.Helper()
+	orig := supervisorStopKillProcess
+	supervisorStopKillProcess = killFn
+	t.Cleanup(func() { supervisorStopKillProcess = orig })
+}
+
+// shrinkSupervisorStopTimeouts shrinks the SIGKILL escalation budgets
+// so tests run in well under a second. Restored on cleanup.
+func shrinkSupervisorStopTimeouts(t *testing.T, killTimeout, killGrace time.Duration) {
+	t.Helper()
+	origTO := supervisorStopKillTimeout
+	origGrace := supervisorStopKillGrace
+	supervisorStopKillTimeout = killTimeout
+	supervisorStopKillGrace = killGrace
+	t.Cleanup(func() {
+		supervisorStopKillTimeout = origTO
+		supervisorStopKillGrace = origGrace
+	})
+}
+
+// TestStopSupervisorEscalatesToSIGKILLWhenGracefulDrainHangs guards
+// ci-lg52n: production saw `gc supervisor stop` return exit 0 in 11s
+// even though the supervisor process was still alive (manual `kill -9`
+// was required). The fix must (a) escalate to SIGKILL when graceful
+// drain exceeds the configured budget and (b) only report success
+// after the process actually exits.
+func TestStopSupervisorEscalatesToSIGKILLWhenGracefulDrainHangs(t *testing.T) {
+	gcHome := shortTempDir(t, "gc-home-")
+	runtimeDir := shortTempDir(t, "gc-run-")
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+
+	var alive atomic.Bool
+	alive.Store(true)
+	var killedPID atomic.Int32
+	var sigkillCount atomic.Int32
+
+	stubSupervisorStopProcessHooks(t, func(pid int, sig syscall.Signal) error {
+		if sig == syscall.SIGKILL {
+			sigkillCount.Add(1)
+			killedPID.Store(int32(pid))
+			alive.Store(false)
+			return nil
+		}
+		if alive.Load() {
+			return nil
+		}
+		return syscall.ESRCH
+	})
+	shrinkSupervisorStopTimeouts(t, 200*time.Millisecond, 500*time.Millisecond)
+
+	sockPath := filepath.Join(gcHome, "supervisor.sock")
+	startTestSupervisorSocket(t, sockPath, func(cmd string) string {
+		switch cmd {
+		case "ping":
+			return "4242\n"
+		case "stop":
+			return "ok\n"
+		}
+		return ""
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := stopSupervisor(&stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("stopSupervisor code = %d, want 0 after successful SIGKILL; stderr=%q", code, stderr.String())
+	}
+	if sigkillCount.Load() != 1 {
+		t.Fatalf("SIGKILL count = %d, want 1", sigkillCount.Load())
+	}
+	if killedPID.Load() != 4242 {
+		t.Fatalf("killed PID = %d, want 4242 (the ping-reported supervisor pid)", killedPID.Load())
+	}
+	if !strings.Contains(stderr.String(), "SIGKILL") {
+		t.Fatalf("stderr = %q, want operator-visible SIGKILL notice", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Supervisor stopped.") {
+		t.Fatalf("stdout = %q, want 'Supervisor stopped.' after successful SIGKILL", stdout.String())
+	}
+}
+
+// TestStopSupervisorReturnsErrorWhenSIGKILLFails covers the worst case:
+// even SIGKILL can't tear the process down. ci-lg52n acceptance says
+// stop must return non-zero with a clear error in that scenario instead
+// of silently lying about success.
+func TestStopSupervisorReturnsErrorWhenSIGKILLFails(t *testing.T) {
+	gcHome := shortTempDir(t, "gc-home-")
+	runtimeDir := shortTempDir(t, "gc-run-")
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+
+	stubSupervisorStopProcessHooks(t, func(pid int, sig syscall.Signal) error {
+		return nil
+	})
+	shrinkSupervisorStopTimeouts(t, 100*time.Millisecond, 100*time.Millisecond)
+
+	sockPath := filepath.Join(gcHome, "supervisor.sock")
+	startTestSupervisorSocket(t, sockPath, func(cmd string) string {
+		switch cmd {
+		case "ping":
+			return "4242\n"
+		case "stop":
+			return "ok\n"
+		}
+		return ""
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := stopSupervisor(&stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("stopSupervisor code = 0, want non-zero when SIGKILL did not kill the process; stderr=%q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "still alive") {
+		t.Fatalf("stderr = %q, want a 'still alive' notice after SIGKILL failure", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Supervisor stopped.") {
+		t.Fatalf("stdout = %q, must NOT claim 'Supervisor stopped.' when the process is still alive", stdout.String())
+	}
+}
+
+// TestStopSupervisorReturnsAfterGracefulExitWithoutSIGKILL confirms the
+// happy path: when the supervisor exits promptly after ack'ing the stop
+// command, stop returns 0 without ever escalating to SIGKILL.
+func TestStopSupervisorReturnsAfterGracefulExitWithoutSIGKILL(t *testing.T) {
+	gcHome := shortTempDir(t, "gc-home-")
+	runtimeDir := shortTempDir(t, "gc-run-")
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+
+	var alive atomic.Bool
+	alive.Store(true)
+	var sigkillCount atomic.Int32
+
+	stubSupervisorStopProcessHooks(t, func(pid int, sig syscall.Signal) error {
+		if sig == syscall.SIGKILL {
+			sigkillCount.Add(1)
+			alive.Store(false)
+			return nil
+		}
+		if alive.Load() {
+			return nil
+		}
+		return syscall.ESRCH
+	})
+	shrinkSupervisorStopTimeouts(t, 5*time.Second, 500*time.Millisecond)
+
+	sockPath := filepath.Join(gcHome, "supervisor.sock")
+	startTestSupervisorSocket(t, sockPath, func(cmd string) string {
+		switch cmd {
+		case "ping":
+			if alive.Load() {
+				return "4242\n"
+			}
+			return ""
+		case "stop":
+			// Graceful shutdown after a short delay.
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				alive.Store(false)
+			}()
+			return "ok\n"
+		}
+		return ""
+	})
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := stopSupervisor(&stdout, &stderr)
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("stopSupervisor code = %d, want 0 on graceful exit; stderr=%q", code, stderr.String())
+	}
+	if sigkillCount.Load() != 0 {
+		t.Fatalf("SIGKILL count = %d, want 0 (process exited gracefully)", sigkillCount.Load())
+	}
+	if !strings.Contains(stdout.String(), "Supervisor stopped.") {
+		t.Fatalf("stdout = %q, want 'Supervisor stopped.' on clean exit", stdout.String())
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("graceful exit took %s, expected sub-second turnaround", elapsed)
 	}
 }
 
