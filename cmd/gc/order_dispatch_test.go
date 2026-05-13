@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -345,7 +346,7 @@ func TestOrderDispatchRejectsAmbiguousPackPool(t *testing.T) {
 	}
 
 	m.dispatch(context.Background(), t.TempDir(), time.Now())
-	time.Sleep(50 * time.Millisecond)
+	m.drain(context.Background())
 
 	if !rec.hasType(events.OrderFailed) {
 		t.Fatal("missing order.failed event for ambiguous pool")
@@ -381,7 +382,7 @@ func TestOrderDispatchRejectsAmbiguousPackPool(t *testing.T) {
 	}
 
 	m.dispatch(context.Background(), t.TempDir(), time.Now().Add(10*time.Second))
-	time.Sleep(50 * time.Millisecond)
+	m.drain(context.Background())
 
 	all = trackingBeads(t, store, "order-run:mol-dog-doctor")
 	if len(all) != 1 {
@@ -439,7 +440,7 @@ func TestOrderDispatchRejectsAmbiguousEventPoolOncePerEvent(t *testing.T) {
 	}
 
 	m.dispatch(context.Background(), t.TempDir(), time.Now())
-	time.Sleep(50 * time.Millisecond)
+	m.drain(context.Background())
 
 	all := trackingBeads(t, store, "order-run:release-watch")
 	if len(all) != 1 {
@@ -463,7 +464,7 @@ func TestOrderDispatchRejectsAmbiguousEventPoolOncePerEvent(t *testing.T) {
 	}
 
 	m.dispatch(context.Background(), t.TempDir(), time.Now().Add(10*time.Second))
-	time.Sleep(50 * time.Millisecond)
+	m.drain(context.Background())
 
 	all = trackingBeads(t, store, "order-run:release-watch")
 	if len(all) != 1 {
@@ -824,20 +825,43 @@ func TestOrderDispatchResolvesImportedPackPoolAgainstCityShadow(t *testing.T) {
 	writeImportedDogOrderFixture(t, cityDir, true)
 	cfg, aa := loadImportedDogOrders(t, cityDir)
 	store := beads.NewMemStore()
+	digest := orders.Order{}
+	for _, order := range aa {
+		if order.Name == "digest" {
+			digest = order
+			break
+		}
+	}
+	if digest.Name == "" {
+		t.Fatal("missing digest order")
+	}
+	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
 
 	m := &memoryOrderDispatcher{
-		aa: aa,
+		aa: []orders.Order{digest},
 		storeFn: func(_ execStoreTarget) (beads.Store, error) {
 			return store, nil
 		},
-		execRun: shellExecRunner,
-		rec:     events.Discard,
-		stderr:  &bytes.Buffer{},
-		cfg:     cfg,
+		execRun:        successfulExec,
+		rec:            events.Discard,
+		stderr:         &bytes.Buffer{},
+		cfg:            cfg,
+		dispatchCtx:    dispatchCtx,
+		dispatchCancel: dispatchCancel,
 	}
+	t.Cleanup(func() {
+		m.cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		m.drain(ctx)
+	})
 
 	m.dispatch(context.Background(), cityDir, time.Now())
-	time.Sleep(50 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if !m.drain(ctx) {
+		t.Fatal("drain timed out waiting for imported-pack dispatch to finish")
+	}
 
 	work := workBeadByOrderLabel(t, store, "order-run:digest")
 	if got := work.Metadata["gc.routed_to"]; got != "maintenance.dog" {
@@ -850,20 +874,43 @@ func TestOrderDispatchResolvesImportedPackPoolAgainstSiblingImportCollision(t *t
 	writeImportedDogOrderFixture(t, cityDir, false, "gastown")
 	cfg, aa := loadImportedDogOrders(t, cityDir)
 	store := beads.NewMemStore()
+	digest := orders.Order{}
+	for _, order := range aa {
+		if order.Name == "digest" {
+			digest = order
+			break
+		}
+	}
+	if digest.Name == "" {
+		t.Fatal("missing digest order")
+	}
+	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
 
 	m := &memoryOrderDispatcher{
-		aa: aa,
+		aa: []orders.Order{digest},
 		storeFn: func(_ execStoreTarget) (beads.Store, error) {
 			return store, nil
 		},
-		execRun: shellExecRunner,
-		rec:     events.Discard,
-		stderr:  &bytes.Buffer{},
-		cfg:     cfg,
+		execRun:        successfulExec,
+		rec:            events.Discard,
+		stderr:         &bytes.Buffer{},
+		cfg:            cfg,
+		dispatchCtx:    dispatchCtx,
+		dispatchCancel: dispatchCancel,
 	}
+	t.Cleanup(func() {
+		m.cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		m.drain(ctx)
+	})
 
 	m.dispatch(context.Background(), cityDir, time.Now())
-	time.Sleep(50 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if !m.drain(ctx) {
+		t.Fatal("drain timed out waiting for imported-pack dispatch to finish")
+	}
 
 	work := workBeadByOrderLabel(t, store, "order-run:digest")
 	if got := work.Metadata["gc.routed_to"]; got != "maintenance.dog" {
@@ -916,13 +963,52 @@ source = "`+doltDir+`"
 		t.Fatalf("scanAllOrders: %v; stderr: %s", err, stderr.String())
 	}
 
-	const wantDogOrders = 5
-	var gotDogOrders int
+	wantExecDogOrders := map[string]string{
+		"mol-dog-backup":     "$PACK_DIR/assets/scripts/mol-dog-backup.sh",
+		"mol-dog-compactor":  "gc dolt compact",
+		"mol-dog-doctor":     "$PACK_DIR/assets/scripts/mol-dog-doctor.sh",
+		"mol-dog-jsonl":      "$PACK_DIR/assets/scripts/jsonl-export.sh",
+		"mol-dog-phantom-db": "$PACK_DIR/assets/scripts/mol-dog-phantom-db.sh",
+		"mol-dog-reaper":     "$PACK_DIR/assets/scripts/reaper.sh",
+	}
+	gotExecDogOrders := map[string]bool{}
+	const wantFormulaDogOrders = 1
+	var gotFormulaDogOrders int
 	for _, a := range aa {
 		if !strings.HasPrefix(a.Name, "mol-dog-") {
 			continue
 		}
-		gotDogOrders++
+		if a.Exec != "" {
+			wantExec, ok := wantExecDogOrders[a.Name]
+			if !ok {
+				t.Fatalf("unexpected exec dog order %q", a.Name)
+			}
+			if a.Pool != "" {
+				t.Fatalf("%s exec order pool = %q, want empty", a.Name, a.Pool)
+			}
+			if a.Exec != wantExec {
+				t.Fatalf("%s exec = %q, want %q", a.Name, a.Exec, wantExec)
+			}
+			const packScriptPrefix = "$PACK_DIR/assets/scripts/"
+			if scriptName := strings.TrimPrefix(wantExec, packScriptPrefix); scriptName != wantExec {
+				packDir := orderPoolSourceDirHint(a)
+				if packDir == "" {
+					t.Fatalf("%s pack dir hint is empty for script-backed exec order", a.Name)
+				}
+				scriptPath := filepath.Join(packDir, "assets", "scripts", scriptName)
+				if _, err := os.Stat(scriptPath); err != nil {
+					t.Fatalf("%s exec script missing: %v", a.Name, err)
+				}
+				if _, err := exec.LookPath("bash"); err == nil {
+					if out, err := exec.Command("bash", "-n", scriptPath).CombinedOutput(); err != nil {
+						t.Fatalf("%s bash -n failed: %v\n%s", a.Name, err, out)
+					}
+				}
+			}
+			gotExecDogOrders[a.Name] = true
+			continue
+		}
+		gotFormulaDogOrders++
 		if a.Pool != "dog" {
 			t.Fatalf("%s pool = %q, want portable bare dog", a.Name, a.Pool)
 		}
@@ -930,12 +1016,15 @@ source = "`+doltDir+`"
 		if err != nil {
 			t.Fatalf("qualifyOrderPool(%s): %v", a.Name, err)
 		}
-		if got != "ops.dog" {
-			t.Fatalf("qualifyOrderPool(%s) = %q, want ops.dog", a.Name, got)
+		if got != "dog" {
+			t.Fatalf("qualifyOrderPool(%s) = %q, want local maintenance dog", a.Name, got)
 		}
 	}
-	if gotDogOrders != wantDogOrders {
-		t.Fatalf("Dolt dog order count = %d, want %d", gotDogOrders, wantDogOrders)
+	if gotFormulaDogOrders != wantFormulaDogOrders {
+		t.Fatalf("Dolt formula-based dog order count = %d, want %d", gotFormulaDogOrders, wantFormulaDogOrders)
+	}
+	if len(gotExecDogOrders) != len(wantExecDogOrders) {
+		t.Fatalf("Dolt exec dog orders = %v, want %v", gotExecDogOrders, wantExecDogOrders)
 	}
 }
 
@@ -1710,10 +1799,10 @@ provider = "bd"
 		return nil, nil
 	}
 	aa := []orders.Order{{
-		Name:     "dolt-gc-nudge",
+		Name:     "dolt-test-cooldown",
 		Trigger:  "cooldown",
 		Interval: "1m",
-		Exec:     "gc dolt gc-nudge",
+		Exec:     "echo test",
 	}}
 	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
 	ad.dispatch(context.Background(), cityDir, time.Now())
@@ -1782,10 +1871,10 @@ provider = "bd"
 		return nil, nil
 	}
 	aa := []orders.Order{{
-		Name:     "dolt-gc-nudge",
+		Name:     "dolt-test-cooldown",
 		Trigger:  "cooldown",
 		Interval: "1m",
-		Exec:     "gc dolt gc-nudge",
+		Exec:     "echo test",
 	}}
 	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
 	ad.dispatch(context.Background(), cityDir, time.Now())
@@ -1919,10 +2008,10 @@ func TestOrderDispatchExecMarksExternalDoltTargetForManagedLocalOnlyOrders(t *te
 		return nil, nil
 	}
 	aa := []orders.Order{{
-		Name:     "dolt-gc-nudge",
+		Name:     "dolt-test-cooldown",
 		Trigger:  "cooldown",
 		Interval: "1m",
-		Exec:     "gc dolt gc-nudge",
+		Exec:     "echo test",
 	}}
 	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
 	ad.dispatch(context.Background(), cityDir, time.Now())
@@ -1993,10 +2082,10 @@ func TestOrderDispatchExecPropagatesManagedDoltLayout(t *testing.T) {
 		return nil, nil
 	}
 	aa := []orders.Order{{
-		Name:     "dolt-gc-nudge",
+		Name:     "dolt-test-cooldown",
 		Trigger:  "cooldown",
 		Interval: "1m",
-		Exec:     "gc dolt gc-nudge",
+		Exec:     "echo test",
 	}}
 	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
 	ad.dispatch(context.Background(), cityDir, time.Now())
@@ -2059,10 +2148,10 @@ func TestOrderDispatchExecPropagatesLegacyManagedDoltDataDir(t *testing.T) {
 		return nil, nil
 	}
 	aa := []orders.Order{{
-		Name:     "dolt-gc-nudge",
+		Name:     "dolt-test-cooldown",
 		Trigger:  "cooldown",
 		Interval: "1m",
-		Exec:     "gc dolt gc-nudge",
+		Exec:     "echo test",
 	}}
 	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
 	ad.dispatch(context.Background(), cityDir, time.Now())
@@ -2123,10 +2212,10 @@ func TestOrderDispatchExecIgnoresPublishedRunningDataDirWithUnreachablePort(t *t
 		return nil, nil
 	}
 	aa := []orders.Order{{
-		Name:     "dolt-gc-nudge",
+		Name:     "dolt-test-cooldown",
 		Trigger:  "cooldown",
 		Interval: "1m",
-		Exec:     "gc dolt gc-nudge",
+		Exec:     "echo test",
 	}}
 	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
 	ad.dispatch(context.Background(), cityDir, time.Now())
@@ -3992,22 +4081,36 @@ func loadImportedDogOrders(t *testing.T, cityDir string) (*config.City, []orders
 	if err != nil {
 		t.Fatalf("scanAllOrders: %v; stderr: %s", err, stderr.String())
 	}
-	if len(aa) != 1 {
-		t.Fatalf("scanAllOrders() len = %d, want 1 (%#v)", len(aa), aa)
+	found := false
+	for _, order := range aa {
+		if order.Name == "digest" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("scanAllOrders() missing digest order (%#v)", aa)
 	}
 	return cfg, aa
 }
 
 // memRecorder records events in memory for test assertions.
+// mu guards events against concurrent Record/hasType/hasSubject calls from
+// dispatchOne goroutines and the test goroutine.
 type memRecorder struct {
+	mu     sync.Mutex
 	events []events.Event
 }
 
 func (r *memRecorder) Record(e events.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.events = append(r.events, e)
 }
 
 func (r *memRecorder) hasType(typ string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, e := range r.events {
 		if e.Type == typ {
 			return true
@@ -4017,6 +4120,8 @@ func (r *memRecorder) hasType(typ string) bool {
 }
 
 func (r *memRecorder) hasSubject(subject string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, e := range r.events {
 		if e.Subject == subject {
 			return true
@@ -4172,6 +4277,106 @@ func TestOrderDispatchFiresAfterWorkClosed(t *testing.T) {
 
 	if !ran {
 		t.Error("exec should have run — all previous work is closed")
+	}
+}
+
+// TestOrderDispatchOpenWispRootDoesNotBlockRedispatch reproduces the
+// formula+pool auto-dispatch failure tracked by ga-lo8c (continuation of
+// closed ga-jra). After a city restart, the wisp root bead from a previous
+// formula+pool dispatch persists in the store with status="open" and the
+// "order-run:<scoped>" label (stamped by dispatchWisp at order_dispatch.go:706).
+// Molecule roots are never auto-closed when their step beads complete, so
+// the leftover open root permanently tripped hasOpenWorkStrict and starved
+// the order's cooldown gate.
+//
+// In-flight dispatch is signaled by the tracking bead (carries both
+// "order-run:<scoped>" AND labelOrderTracking). Wisp roots carry only the
+// former — distinguishing the two is the fix.
+func TestOrderDispatchOpenWispRootDoesNotBlockRedispatch(t *testing.T) {
+	store := beads.NewMemStore()
+
+	// Simulate post-restart state: an open wisp root from the prior
+	// formula+pool dispatch. The tracking bead from that dispatch was
+	// already closed by dispatchOne's deferred Close, but the molecule
+	// root remains open because nothing in the dispatch path closes it.
+	wispRoot, err := store.Create(beads.Bead{
+		Title:  "mol-formula-pool-work",
+		Labels: []string{"order-run:my-pool-order"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wispRoot.Status == "closed" {
+		t.Fatalf("seed wisp root should be open, got status=%q", wispRoot.Status)
+	}
+
+	ran := false
+	fakeExec := func(_ context.Context, _, _ string, _ []string) ([]byte, error) {
+		ran = true
+		return nil, nil
+	}
+
+	aa := []orders.Order{{
+		Name:     "my-pool-order",
+		Trigger:  "cooldown",
+		Interval: "1s",
+		Exec:     "scripts/run.sh",
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
+
+	// Future "now" so cooldown evaluates Due=true (LastRun = wispRoot.CreatedAt).
+	ad.dispatch(context.Background(), t.TempDir(), time.Now().Add(5*time.Second))
+	ad.drain(context.Background())
+
+	if !ran {
+		t.Fatal("exec should have run — an open wisp root (no labelOrderTracking) " +
+			"is leftover state, not in-flight work, and must not block re-dispatch")
+	}
+}
+
+// listIncludingClosedStore forces List to include closed beads regardless of
+// the caller's IncludeClosed setting. Production stores honor IncludeClosed:
+// false, but hasOpenWorkStrict's defensive status check must still skip closed
+// beads if a store implementation (or a stale cache) returns them.
+type listIncludingClosedStore struct {
+	beads.Store
+}
+
+func (s listIncludingClosedStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	q.IncludeClosed = true
+	return s.Store.List(q)
+}
+
+// TestHasOpenWorkStrictSkipsClosedTrackingBead covers the defensive
+// status-closed branch in hasOpenWorkStrict (cmd/gc/order_dispatch.go:802-803).
+// The standard query passes IncludeClosed: false, so closed beads normally
+// don't reach the loop — but a misbehaving store (or a stale CachingStore
+// view) could leak one through. If hasOpenWorkStrict didn't skip closed
+// beads, a completed tracking bead would permanently block re-dispatch — the
+// same failure shape ga-lo8c hit with leftover wisp roots.
+func TestHasOpenWorkStrictSkipsClosedTrackingBead(t *testing.T) {
+	base := beads.NewMemStore()
+	store := listIncludingClosedStore{Store: base}
+
+	b, err := store.Create(beads.Bead{
+		Title:  "order:my-order",
+		Labels: []string{"order-run:my-order", labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatalf("seed bead: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("close seed bead: %v", err)
+	}
+
+	ad := &memoryOrderDispatcher{}
+	has, err := ad.hasOpenWorkStrict(store, "my-order")
+	if err != nil {
+		t.Fatalf("hasOpenWorkStrict: %v", err)
+	}
+	if has {
+		t.Fatal("closed tracking bead must not count as in-flight work; " +
+			"the defensive status filter at order_dispatch.go:802 should skip it")
 	}
 }
 
@@ -4436,6 +4641,58 @@ func TestLockedWriterSerializesConcurrentWrites(t *testing.T) {
 	for i, l := range bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte{'\n'}) {
 		if !bytes.Equal(l, wantLine) {
 			t.Fatalf("line %d: got %q, want %q (interleaved bytes)", i, l, wantLine)
+		}
+	}
+}
+
+// TestOrderExecEnvSetsBeadsActorToOrderName verifies that exec orders
+// spawned by the controller carry an order-scoped BEADS_ACTOR into their
+// subprocess env, so any bd shell-out from inside the order's command
+// (e.g., `gc order sweep-tracking` → `bd close`) is audit-logged as
+// "order:<name>" rather than an ambient identity. This is what gives
+// the dashboard fine-grained attribution per order.
+func TestOrderExecEnvSetsBeadsActorToOrderName(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+	_ = os.Unsetenv("BEADS_ACTOR")
+
+	cityDir := t.TempDir()
+	target := execStoreTarget{ScopeRoot: cityDir, ScopeKind: "city", Prefix: "pc"}
+	a := orders.Order{Name: "order-tracking-sweep", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+
+	envSlice := orderExecEnv(cityDir, nil, target, a)
+
+	want := "BEADS_ACTOR=order:order-tracking-sweep"
+	found := false
+	for _, entry := range envSlice {
+		if entry == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("orderExecEnv missing %q; env=%v", want, envSlice)
+	}
+}
+
+// TestOrderExecEnvSkipsBeadsActorForUnnamedOrder guards against accidentally
+// emitting "BEADS_ACTOR=order:" (empty suffix) when an order has no name.
+// The conditional in orderExecEnv prevents that — verified here so future
+// edits don't regress.
+func TestOrderExecEnvSkipsBeadsActorForUnnamedOrder(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+	_ = os.Unsetenv("BEADS_ACTOR")
+
+	cityDir := t.TempDir()
+	target := execStoreTarget{ScopeRoot: cityDir, ScopeKind: "city", Prefix: "pc"}
+	a := orders.Order{Trigger: "cooldown", Interval: "1m", Exec: "true"} // no Name
+
+	envSlice := orderExecEnv(cityDir, nil, target, a)
+
+	for _, entry := range envSlice {
+		if entry == "BEADS_ACTOR=order:" {
+			t.Fatalf("orderExecEnv emitted bare order: prefix for unnamed order; env=%v", envSlice)
 		}
 	}
 }

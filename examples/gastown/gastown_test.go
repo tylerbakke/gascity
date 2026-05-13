@@ -107,6 +107,13 @@ func TestCityPackTomlParses(t *testing.T) {
 	if gastownImp.Source != "packs/gastown" {
 		t.Errorf("pack.toml imports[\"gastown\"].Source = %q, want %q", gastownImp.Source, "packs/gastown")
 	}
+	gastownDefault, ok := tc.Defaults.Rig.Imports["gastown"]
+	if !ok {
+		t.Fatalf("pack.toml defaults.rig.imports = %v, want entry for \"gastown\"", tc.Defaults.Rig.Imports)
+	}
+	if gastownDefault.Source != "packs/gastown" {
+		t.Errorf("pack.toml defaults.rig.imports[\"gastown\"].Source = %q, want %q", gastownDefault.Source, "packs/gastown")
+	}
 }
 
 func TestCityTomlValidates(t *testing.T) {
@@ -176,6 +183,46 @@ func TestRefineryFormulaSupportsMergeStrategies(t *testing.T) {
 			t.Errorf("refinery formula missing %q", want)
 		}
 	}
+}
+
+// TestRefineryFormulaChainsMergeMetadataWithClose guards against the
+// regression observed during concurrent fan-out (3 polecats, 3 work
+// beads, one refinery): when the formula presented `gc bd update
+// --set-metadata` and `gc bd close` as two separate commands in the
+// same code block, the refinery agent skipped the metadata write and
+// jumped straight to the close, leaving `merged_sha` and
+// `merged_target` NULL on every closed bead. Forensic context tracing
+// a closed bead to its merge commit is then lost.
+//
+// The fix chains both commands with `&&` so a refinery agent cannot
+// honor `gc bd close` without also honoring the preceding metadata
+// write. Both the direct-merge path and the mr/pr handoff path use
+// the same chained shape.
+func TestRefineryFormulaChainsMergeMetadataWithClose(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-refinery-patrol.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading refinery formula: %v", err)
+	}
+	body := string(data)
+
+	// Direct-merge path: metadata write must be chained into the close.
+	assertContainsInOrder(t, body,
+		"--set-metadata merge_result=merged",
+		"--set-metadata merged_sha=$MERGED_SHA",
+		"--set-metadata merged_target=$TARGET &&",
+		`gc bd close $WORK --reason "Merged to $TARGET at $MERGED_SHORT"`,
+	)
+
+	// mr/pr handoff path: same chained shape, different metadata fields.
+	assertContainsInOrder(t, body,
+		"--set-metadata merge_result=pull_request",
+		`--set-metadata pr_url="$PR_URL"`,
+		`--set-metadata pr_number="$PR_NUMBER"`,
+		`--set-metadata merged_target="$TARGET" &&`,
+		`gc bd close $WORK --reason "Pull request ready: $PR_URL"`,
+	)
 }
 
 func TestPolecatFormulaTreatsMetadataBranchAsAuthoritative(t *testing.T) {
@@ -657,7 +704,11 @@ func TestGastownRoutedToTargetsUseBindingPrefix(t *testing.T) {
 		rel  string
 		want string
 	}{
-		{"packs/gastown/formulas/mol-deacon-patrol.toml", "gc.routed_to={{binding_prefix}}dog"},
+		{"packs/gastown/formulas/mol-deacon-patrol.toml", `"gc.routed_to":"{{binding_prefix}}dog"`},
+		{"packs/gastown/formulas/mol-witness-patrol.toml", `"gc.routed_to":"{{binding_prefix}}dog"`},
+		{"packs/gastown/agents/boot/prompt.template.md", `"gc.routed_to":"{{ .BindingPrefix }}dog"`},
+		{"packs/gastown/agents/deacon/prompt.template.md", `"gc.routed_to":"{{ .BindingPrefix }}dog"`},
+		{"packs/gastown/agents/witness/prompt.template.md", `"gc.routed_to":"{{ .BindingPrefix }}dog"`},
 		{"packs/gastown/formulas/mol-polecat-work.toml", `${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery`},
 		{"packs/gastown/formulas/mol-refinery-patrol.toml", `${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat`},
 		{"packs/gastown/formulas/mol-idea-to-plan.toml", "$GC_RIG/{{binding_prefix}}polecat"},
@@ -687,6 +738,39 @@ func TestGastownRoutedToTargetsUseBindingPrefix(t *testing.T) {
 		} {
 			if strings.Contains(body, bad) {
 				t.Errorf("%s still contains short-form route %q", check.rel, bad)
+			}
+		}
+	}
+}
+
+func TestGastownWarrantCreateCommandsUseCreateMetadata(t *testing.T) {
+	dir := exampleDir()
+	files := []string{
+		"packs/gastown/agents/boot/prompt.template.md",
+		"packs/gastown/agents/deacon/prompt.template.md",
+		"packs/gastown/agents/witness/prompt.template.md",
+		"packs/gastown/formulas/mol-deacon-patrol.toml",
+		"packs/gastown/formulas/mol-witness-patrol.toml",
+		"packs/maintenance/formulas/mol-shutdown-dance.toml",
+	}
+	for _, rel := range files {
+		data, err := os.ReadFile(filepath.Join(dir, rel))
+		if err != nil {
+			t.Fatalf("reading %s: %v", rel, err)
+		}
+		inCreate := false
+		for lineNo, line := range strings.Split(string(data), "\n") {
+			if strings.Contains(line, "bd create") {
+				inCreate = true
+			}
+			if !inCreate {
+				continue
+			}
+			if strings.Contains(line, "--set-metadata") {
+				t.Errorf("%s:%d bd create command uses update-only --set-metadata:\n%s", rel, lineNo+1, line)
+			}
+			if !strings.HasSuffix(strings.TrimSpace(line), "\\") {
+				inCreate = false
 			}
 		}
 	}
@@ -840,6 +924,16 @@ func TestGastownPatrolWispCommandsPropagateRoutingNamespace(t *testing.T) {
 			formula: "mol-refinery-patrol",
 			vars:    []string{"--var target_branch=", "--var rig_name=", "--var binding_prefix="},
 		},
+		{
+			rel:     "packs/gastown/agents/witness/prompt.template.md",
+			formula: "mol-witness-patrol",
+			vars:    []string{"--var binding_prefix="},
+		},
+		{
+			rel:     "packs/gastown/formulas/mol-witness-patrol.toml",
+			formula: "mol-witness-patrol",
+			vars:    []string{"--var binding_prefix="},
+		},
 	}
 	for _, check := range checks {
 		data, err := os.ReadFile(filepath.Join(dir, check.rel))
@@ -866,6 +960,7 @@ func TestGastownPatrolWispCommandsPropagateRoutingNamespace(t *testing.T) {
 	for _, rel := range []string{
 		"packs/gastown/formulas/mol-deacon-patrol.toml",
 		"packs/gastown/formulas/mol-refinery-patrol.toml",
+		"packs/gastown/formulas/mol-witness-patrol.toml",
 	} {
 		data, err := os.ReadFile(filepath.Join(dir, rel))
 		if err != nil {
@@ -1151,6 +1246,60 @@ func TestWitnessPatrolStateClassificationCoversSessionStates(t *testing.T) {
 	}
 }
 
+// TestWitnessPatrolAllStepsContinueNotExit guards against the regression
+// in upstream #1884: every intermediate step in mol-witness-patrol must
+// tell the agent to continue rather than exit the wisp. The burn
+// primitive only lives in `next-iteration`, so any step that reads as
+// terminal ("Exit criteria: no orphans found.") leaks wisps when an LLM
+// treats the early-exit as a terminal instruction.
+func TestWitnessPatrolAllStepsContinueNotExit(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-witness-patrol.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading witness patrol formula: %v", err)
+	}
+
+	var parsed struct {
+		Steps []struct {
+			ID          string `toml:"id"`
+			Description string `toml:"description"`
+		} `toml:"steps"`
+	}
+	if _, err := toml.Decode(string(data), &parsed); err != nil {
+		t.Fatalf("parsing witness patrol formula: %v", err)
+	}
+
+	byID := make(map[string]string, len(parsed.Steps))
+	for _, s := range parsed.Steps {
+		byID[s.ID] = s.Description
+	}
+
+	intermediate := []string{
+		"check-inbox",
+		"recover-orphaned-beads",
+		"check-refinery",
+		"check-polecat-health",
+	}
+	for _, id := range intermediate {
+		desc, ok := byID[id]
+		if !ok {
+			t.Errorf("witness patrol formula missing step %q", id)
+			continue
+		}
+		if !strings.Contains(desc, "do NOT exit") {
+			t.Errorf("step %q missing continuation reminder 'do NOT exit' so an LLM can treat the step as terminal and leak the wisp:\n%s", id, desc)
+		}
+		if !strings.Contains(desc, "next-iteration") {
+			t.Errorf("step %q missing reference to `next-iteration` as the sole burn site:\n%s", id, desc)
+		}
+	}
+
+	if _, ok := byID["next-iteration"]; !ok {
+		t.Fatal("witness patrol formula missing `next-iteration` step — continuation clauses point at a non-existent target")
+	}
+}
+
 func TestAllFormulasExist(t *testing.T) {
 	dir := exampleDir()
 	formulaDir := filepath.Join(dir, "packs", "gastown", "formulas")
@@ -1170,6 +1319,52 @@ func TestAllFormulasExist(t *testing.T) {
 
 	if count == 0 {
 		t.Error("no formula files found")
+	}
+}
+
+// TestAllPackTomlsParse decodes every *.toml file under
+// examples/gastown/packs/ to catch malformed formulas, agent manifests,
+// orders, and pack manifests at CI time. Without this, a description
+// string with an invalid TOML escape (e.g. "\<space>" inside a """..."""
+// block) silently fails formula registration at runtime — the agent
+// running that formula falls back to memory and skips load-bearing
+// steps. The remaining string-match formula tests in this file run
+// AFTER parse, so adding this gate up front keeps their failure
+// messages meaningful (they assume valid TOML).
+//
+// The walk includes pack.toml, formulas/*.toml, orders/*.toml, and
+// agents/*/agent.toml uniformly — they all share the same TOML
+// grammar, and we want any new TOML file added under packs/ to be
+// covered automatically without remembering to update this test.
+func TestAllPackTomlsParse(t *testing.T) {
+	dir := exampleDir()
+	packsRoot := filepath.Join(dir, "packs")
+
+	var count int
+	err := filepath.Walk(packsRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !strings.HasSuffix(info.Name(), ".toml") {
+			return nil
+		}
+		count++
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Errorf("reading %s: %v", path, readErr)
+			return nil
+		}
+		var into map[string]any
+		if _, err := toml.Decode(string(data), &into); err != nil {
+			t.Errorf("parsing %s: %v", path, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", packsRoot, err)
+	}
+	if count == 0 {
+		t.Fatalf("no .toml files found under %s — directory layout changed?", packsRoot)
 	}
 }
 
@@ -1304,8 +1499,13 @@ func TestDaemonConfig(t *testing.T) {
 
 // packFileConfig mirrors the pack.toml structure for test parsing.
 type packFileConfig struct {
-	Pack    config.PackMeta          `toml:"pack"`
-	Imports map[string]config.Import `toml:"imports"`
+	Pack     config.PackMeta          `toml:"pack"`
+	Imports  map[string]config.Import `toml:"imports"`
+	Defaults struct {
+		Rig struct {
+			Imports map[string]config.Import `toml:"imports"`
+		} `toml:"rig"`
+	} `toml:"defaults"`
 }
 
 func discoverPackAgents(t *testing.T, rel string) []config.Agent {
@@ -1565,4 +1765,43 @@ func TestDoltHealthFormulasExist(t *testing.T) {
 	if count == 0 {
 		t.Error("no formula files found")
 	}
+}
+
+// TestDeaconPatrolDetectsQueueStarvation verifies the deacon formula
+// cross-checks assigned open beads against visible work signal, so a
+// stuck self-polling refinery is flagged even when its patrol wisp is
+// cycling fresh. See upstream #1833.
+func TestDeaconPatrolDetectsQueueStarvation(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-deacon-patrol.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading deacon formula: %v", err)
+	}
+	body := string(data)
+
+	for _, want := range []string{
+		`id = "queue-starvation-check"`,
+		`needs = ["health-scan"]`,
+		"Cross-check assigned work against visible work signal",
+		"gc bd list --status=open --assignee=",
+		"bead.updated_at",
+		"30min",
+		`"gc.routed_to":"{{binding_prefix}}dog"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("deacon formula missing queue-starvation guidance %q", want)
+		}
+	}
+
+	// The new step must chain into the next one.
+	if !strings.Contains(body, `needs = ["queue-starvation-check"]`) {
+		t.Errorf("deacon formula step after queue-starvation-check must depend on it")
+	}
+
+	assertContainsInOrder(t, body,
+		`id = "health-scan"`,
+		`id = "queue-starvation-check"`,
+		`id = "utility-agent-health"`,
+	)
 }

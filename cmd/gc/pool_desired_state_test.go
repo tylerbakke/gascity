@@ -139,6 +139,80 @@ func TestComputePoolDesiredStates_ResumeBeatsNew(t *testing.T) {
 	}
 }
 
+func TestComputePoolDesiredStates_ResumeResolvesAssigneeByAlias(t *testing.T) {
+	// Regression: a polecat session bead has its human-readable alias in
+	// Metadata["alias"], and the work bead's assignee is typically the
+	// alias. The resume-tier lookup must resolve alias→session so the
+	// active session stays alive — otherwise the pool sees the work as
+	// unowned and spawns a second polecat for the same bead.
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "rig", intPtr(2), 0)},
+	}
+	work := []beads.Bead{
+		workBead("w1", "rig/claude", "nux", "in_progress", 5),
+	}
+	sessions := []beads.Bead{{
+		ID:     "sess-vi6hhp",
+		Status: "open",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":         "polecat-sess-vi6hhp",
+			"alias":                "nux",
+			"template":             "rig/claude",
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	}}
+
+	result := ComputePoolDesiredStates(cfg, work, sessions, nil)
+
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	reqs := result[0].Requests
+	if len(reqs) != 1 {
+		t.Fatalf("len(requests) = %d, want 1 resume for alias-assigned work", len(reqs))
+	}
+	if reqs[0].Tier != "resume" {
+		t.Errorf("tier = %q, want resume", reqs[0].Tier)
+	}
+	if reqs[0].SessionBeadID != "sess-vi6hhp" {
+		t.Errorf("SessionBeadID = %q, want sess-vi6hhp", reqs[0].SessionBeadID)
+	}
+}
+
+func TestComputePoolDesiredStates_ResumeResolvesAssigneeByAliasHistory(t *testing.T) {
+	// Regression: alias rotation preserves prior aliases in alias_history.
+	// Work assigned under a prior alias must still resolve to its owning
+	// session.
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "rig", intPtr(2), 0)},
+	}
+	work := []beads.Bead{
+		workBead("w1", "rig/claude", "nux", "in_progress", 5),
+	}
+	sessions := []beads.Bead{{
+		ID:     "sess-vi6hhp",
+		Status: "open",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":         "polecat-sess-vi6hhp",
+			"alias":                "rictus",
+			"alias_history":        "nux",
+			"template":             "rig/claude",
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	}}
+
+	result := ComputePoolDesiredStates(cfg, work, sessions, nil)
+
+	reqs := result[0].Requests
+	if len(reqs) != 1 || reqs[0].SessionBeadID != "sess-vi6hhp" {
+		t.Fatalf("requests = %+v, want 1 resume for sess-vi6hhp", reqs)
+	}
+}
+
 func TestComputePoolDesiredStates_MaxCapsTotal(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "rig", intPtr(2), 0)},

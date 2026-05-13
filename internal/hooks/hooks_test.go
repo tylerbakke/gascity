@@ -43,7 +43,7 @@ func claudeHookEntries(t *testing.T, data []byte, event string) []claudeHookEntr
 func TestSupportedProviders(t *testing.T) {
 	got := SupportedProviders()
 	want := map[string]bool{
-		"claude": true, "codex": true, "gemini": true, "opencode": true,
+		"claude": true, "codex": true, "gemini": true, "kiro": true, "opencode": true,
 		"copilot": true, "cursor": true, "pi": true, "omp": true,
 	}
 	if len(got) != len(want) {
@@ -67,11 +67,19 @@ func TestValidateRejectsUnsupported(t *testing.T) {
 	if err == nil {
 		t.Fatal("Validate should reject amp, auggie, and bogus")
 	}
-	if !strings.Contains(err.Error(), "amp (no hook mechanism)") {
-		t.Errorf("error should mention amp: %v", err)
+	// Amp and Auggie CLIs both DO expose hook mechanisms in their own
+	// docs; Gas Town just has not wired hook installation for them yet.
+	// The error message must reflect that accurately so users know to
+	// track gap 4 of #672 instead of believing the providers themselves
+	// are hookless.
+	if !strings.Contains(err.Error(), "amp (hooks not yet wired") {
+		t.Errorf("error should mention amp is unwired: %v", err)
 	}
-	if !strings.Contains(err.Error(), "auggie (no hook mechanism)") {
-		t.Errorf("error should mention auggie: %v", err)
+	if !strings.Contains(err.Error(), "auggie (hooks not yet wired") {
+		t.Errorf("error should mention auggie is unwired: %v", err)
+	}
+	if !strings.Contains(err.Error(), "#672") {
+		t.Errorf("error should reference the tracking audit issue: %v", err)
 	}
 	if !strings.Contains(err.Error(), "bogus (unknown)") {
 		t.Errorf("error should mention bogus: %v", err)
@@ -136,6 +144,9 @@ func TestInstallClaude(t *testing.T) {
 	}
 	if !strings.Contains(s, `"editorMode": "normal"`) {
 		t.Error("claude settings should contain editorMode")
+	}
+	if !strings.Contains(s, `"awaySummaryEnabled": false`) {
+		t.Error("claude settings should disable awaySummaryEnabled to prevent idle stalls (gh-1962)")
 	}
 	if !strings.Contains(s, `$HOME/go/bin`) {
 		t.Error("claude hook commands should include PATH export")
@@ -952,7 +963,7 @@ func TestInstallClaudeSurfacesMalformedOverride(t *testing.T) {
 // are materialized from the embedded core pack overlay into the workdir.
 func TestInstallOverlayManagedProviders(t *testing.T) {
 	fs := fsys.NewFake()
-	providers := []string{"codex", "gemini", "opencode", "copilot", "cursor", "pi", "omp"}
+	providers := []string{"codex", "gemini", "opencode", "copilot", "cursor", "kiro", "pi", "omp"}
 	if err := Install(fs, "/city", "/work", providers); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -963,6 +974,8 @@ func TestInstallOverlayManagedProviders(t *testing.T) {
 		"/work/.github/hooks/gascity.json",
 		"/work/.github/copilot-instructions.md",
 		"/work/.cursor/hooks.json",
+		"/work/.kiro/agents/gascity.json",
+		"/work/AGENTS.md",
 		"/work/.pi/extensions/gc-hooks.js",
 		"/work/.omp/hooks/gc-hook.ts",
 	} {
@@ -980,18 +993,74 @@ func TestInstallOverlayManagedProviders(t *testing.T) {
 	if !strings.Contains(codexHooks, `gc handoff --auto --hook-format codex \"context cycle\"`) {
 		t.Error("codex PreCompact should use auto handoff with Codex hook output format")
 	}
+	// Copilot CLI documents preCompact (camelCase). The hook fires before
+	// context compaction starts so handoff can capture state; without it,
+	// long Copilot sessions silently lose context at compact boundaries.
+	// See gastownhall/gascity#672 gap 3.
+	copilotHooks := string(fs.Files["/work/.github/hooks/gascity.json"])
+	if !strings.Contains(copilotHooks, `"preCompact"`) {
+		t.Error("copilot hooks should include preCompact (closes #672 gap 3)")
+	}
+	if !strings.Contains(copilotHooks, `gc handoff --auto \"context cycle\"`) {
+		t.Error("copilot preCompact should use auto handoff")
+	}
 	for _, rel := range []string{
 		"/work/.codex/hooks.json",
 		"/work/.gemini/settings.json",
 		"/work/.opencode/plugins/gascity.js",
 		"/work/.github/hooks/gascity.json",
 		"/work/.cursor/hooks.json",
+		"/work/.kiro/agents/gascity.json",
+		"/work/AGENTS.md",
 		"/work/.pi/extensions/gc-hooks.js",
 		"/work/.omp/hooks/gc-hook.ts",
 	} {
 		if strings.Contains(string(fs.Files[rel]), "gc hook --inject") {
 			t.Errorf("fresh overlay-managed provider file %s should not install no-op gc hook --inject", rel)
 		}
+	}
+	var kiroAgent struct {
+		Name   string `json:"name"`
+		Prompt string `json:"prompt"`
+		Hooks  map[string][]struct {
+			Command string `json:"command"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(fs.Files["/work/.kiro/agents/gascity.json"], &kiroAgent); err != nil {
+		t.Fatalf("unmarshal Kiro agent config: %v", err)
+	}
+	if kiroAgent.Name != "gascity" {
+		t.Errorf("Kiro agent name = %q, want gascity", kiroAgent.Name)
+	}
+	switch {
+	case kiroAgent.Prompt == "":
+		t.Error("Kiro agent config missing prompt")
+	case !strings.HasPrefix(kiroAgent.Prompt, "file://"):
+		t.Errorf("Kiro prompt = %q, want file:// URI", kiroAgent.Prompt)
+	default:
+		promptRel := strings.TrimPrefix(kiroAgent.Prompt, "file://")
+		promptPath := filepath.Clean(filepath.Join(filepath.Dir("/work/.kiro/agents/gascity.json"), promptRel))
+		if promptPath != "/work/AGENTS.md" {
+			t.Errorf("Kiro prompt resolves to %q, want /work/AGENTS.md", promptPath)
+		}
+		if _, ok := fs.Files[promptPath]; !ok {
+			t.Errorf("Kiro prompt target %s was not installed", promptPath)
+		}
+	}
+	for _, trigger := range []string{"agentSpawn", "userPromptSubmit"} {
+		if len(kiroAgent.Hooks[trigger]) == 0 {
+			t.Errorf("Kiro agent config missing documented %s hook", trigger)
+		}
+	}
+	for trigger := range kiroAgent.Hooks {
+		switch trigger {
+		case "agentSpawn", "userPromptSubmit", "preToolUse", "postToolUse", "stop":
+		default:
+			t.Errorf("Kiro agent config uses undocumented hook trigger %q", trigger)
+		}
+	}
+	if strings.Contains(string(fs.Files["/work/.kiro/agents/gascity.json"]), "gc handoff") {
+		t.Error("Kiro agent config should not install unsupported compaction handoff hooks")
 	}
 }
 

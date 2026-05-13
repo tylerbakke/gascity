@@ -203,6 +203,85 @@ func TestProviderLifecycleProcessEnvOmitsArchiveLevelWhenNil(t *testing.T) {
 	}
 }
 
+func TestProviderLifecycleProcessEnvFallsBackToLaunchctlGetenvForLoglevel(t *testing.T) {
+	// `gc start` runs in the user's shell, which doesn't see `launchctl
+	// setenv` values. Without the fallback, GC_DOLT_LOGLEVEL set only via
+	// launchctl is silently dropped between the shell and gc-beads-bd.sh,
+	// so the managed dolt config gets written with `log_level: warning`.
+	t.Setenv("GC_DOLT_LOGLEVEL", "")
+	_ = os.Unsetenv("GC_DOLT_LOGLEVEL")
+
+	prev := providerLifecycleLaunchctlGetenv
+	providerLifecycleLaunchctlGetenv = func(key string) string {
+		if key == "GC_DOLT_LOGLEVEL" {
+			return "debug"
+		}
+		return ""
+	}
+	t.Cleanup(func() { providerLifecycleLaunchctlGetenv = prev })
+
+	cityPath := t.TempDir()
+	envEntries := providerLifecycleProcessEnv(cityPath, "exec:"+gcBeadsBdScriptPath(cityPath))
+	got := ""
+	for _, entry := range envEntries {
+		if strings.HasPrefix(entry, "GC_DOLT_LOGLEVEL=") {
+			got = strings.TrimPrefix(entry, "GC_DOLT_LOGLEVEL=")
+			break
+		}
+	}
+	if got != "debug" {
+		t.Fatalf("GC_DOLT_LOGLEVEL = %q, want %q (launchctl fallback should fire when os.Environ lacks it)", got, "debug")
+	}
+}
+
+func TestProviderLifecycleProcessEnvPrefersOSEnvOverLaunchctlForLoglevel(t *testing.T) {
+	// When a user explicitly exports GC_DOLT_LOGLEVEL in the shell, that
+	// value must win over any stale launchctl-domain value.
+	t.Setenv("GC_DOLT_LOGLEVEL", "trace")
+
+	prev := providerLifecycleLaunchctlGetenv
+	providerLifecycleLaunchctlGetenv = func(key string) string {
+		if key == "GC_DOLT_LOGLEVEL" {
+			return "debug"
+		}
+		return ""
+	}
+	t.Cleanup(func() { providerLifecycleLaunchctlGetenv = prev })
+
+	cityPath := t.TempDir()
+	envEntries := providerLifecycleProcessEnv(cityPath, "exec:"+gcBeadsBdScriptPath(cityPath))
+	got := ""
+	for _, entry := range envEntries {
+		if strings.HasPrefix(entry, "GC_DOLT_LOGLEVEL=") {
+			got = strings.TrimPrefix(entry, "GC_DOLT_LOGLEVEL=")
+			break
+		}
+	}
+	if got != "trace" {
+		t.Fatalf("GC_DOLT_LOGLEVEL = %q, want %q (os.Environ should win over launchctl)", got, "trace")
+	}
+}
+
+func TestProviderLifecycleProcessEnvOmitsLoglevelWhenLaunchctlEmpty(t *testing.T) {
+	// When neither os.Environ nor launchctl has GC_DOLT_LOGLEVEL, the env
+	// must not contain a synthetic empty value (which would override
+	// gc-beads-bd.sh's `${GC_DOLT_LOGLEVEL:-warning}` default to empty).
+	t.Setenv("GC_DOLT_LOGLEVEL", "")
+	_ = os.Unsetenv("GC_DOLT_LOGLEVEL")
+
+	prev := providerLifecycleLaunchctlGetenv
+	providerLifecycleLaunchctlGetenv = func(string) string { return "" }
+	t.Cleanup(func() { providerLifecycleLaunchctlGetenv = prev })
+
+	cityPath := t.TempDir()
+	envEntries := providerLifecycleProcessEnv(cityPath, "exec:"+gcBeadsBdScriptPath(cityPath))
+	for _, entry := range envEntries {
+		if strings.HasPrefix(entry, "GC_DOLT_LOGLEVEL=") {
+			t.Fatalf("GC_DOLT_LOGLEVEL should be absent when neither os.Environ nor launchctl has it, got %q", entry)
+		}
+	}
+}
+
 func TestGcBeadsBdReadOnlyFallbackDoesNotTargetLegacyProbeDatabase(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := MaterializeBuiltinPacks(cityPath); err != nil {
@@ -3218,6 +3297,163 @@ func TestRunProviderOpSanitizesInheritedRuntimeEnv(t *testing.T) {
 	}
 }
 
+func TestRunProviderOpKillsProcessGroupOnTimeout(t *testing.T) {
+	cancelCh := useCancelableProviderLifecycleContext(t)
+
+	dir := t.TempDir()
+	childPIDFile := filepath.Join(dir, "child.pid")
+	script := filepath.Join(dir, "provider-op.sh")
+	content := `#!/bin/sh
+sh -c 'echo $$ > "$GC_TEST_CHILD_PID"; while :; do sleep 1; done' &
+wait
+`
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Timeouts and explicit cancellation both drive exec.Cmd.Cancel; cancel only
+	// after the child PID is observable so the cleanup assertion cannot race setup.
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- runProviderOpWithEnv(script, append(os.Environ(), "GC_TEST_CHILD_PID="+childPIDFile), "health")
+	}()
+
+	cancel := waitForProviderLifecycleCancel(t, cancelCh)
+	t.Cleanup(cancel)
+	pid := waitForProviderTestChildPID(t, childPIDFile)
+	t.Cleanup(func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	})
+
+	cancel()
+
+	var err error
+	select {
+	case err = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider op did not return after cancellation")
+	}
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+
+	waitForProviderTestPIDExit(t, pid, "provider op")
+}
+
+func TestRunProviderProbeKillsProcessGroupOnTimeout(t *testing.T) {
+	cancelCh := useCancelableProviderLifecycleContext(t)
+
+	dir := t.TempDir()
+	childPIDFile := filepath.Join(dir, "child.pid")
+	script := filepath.Join(dir, "provider-probe.sh")
+	content := `#!/bin/sh
+sh -c 'echo $$ > "$GC_TEST_CHILD_PID"; while :; do sleep 1; done' &
+wait
+`
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_TEST_CHILD_PID", childPIDFile)
+
+	// Timeouts and explicit cancellation both drive exec.Cmd.Cancel; cancel only
+	// after the child PID is observable so the cleanup assertion cannot race setup.
+	resultCh := make(chan bool, 1)
+	go func() {
+		resultCh <- runProviderProbe(script, "", "")
+	}()
+
+	cancel := waitForProviderLifecycleCancel(t, cancelCh)
+	t.Cleanup(cancel)
+	pid := waitForProviderTestChildPID(t, childPIDFile)
+	t.Cleanup(func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	})
+
+	cancel()
+
+	var ok bool
+	select {
+	case ok = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider probe did not return after cancellation")
+	}
+	if ok {
+		t.Fatal("expected timeout probe to return false")
+	}
+
+	waitForProviderTestPIDExit(t, pid, "provider probe")
+}
+
+func useCancelableProviderLifecycleContext(t *testing.T) <-chan context.CancelFunc {
+	t.Helper()
+	oldProviderLifecycleContext := providerLifecycleContext
+	cancelCh := make(chan context.CancelFunc, 1)
+	providerLifecycleContext = func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+		ctx, cancel := context.WithCancel(parent)
+		select {
+		case cancelCh <- cancel:
+		default:
+		}
+		return ctx, cancel
+	}
+	t.Cleanup(func() {
+		providerLifecycleContext = oldProviderLifecycleContext
+	})
+	return cancelCh
+}
+
+func waitForProviderLifecycleCancel(t *testing.T, cancelCh <-chan context.CancelFunc) context.CancelFunc {
+	t.Helper()
+	select {
+	case cancel := <-cancelCh:
+		return cancel
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider lifecycle context was not created")
+		return nil
+	}
+}
+
+func waitForProviderTestChildPID(t *testing.T, path string) int {
+	t.Helper()
+	pidText := waitForProviderTestNonEmptyFile(t, path, 5*time.Second)
+	pid, err := strconv.Atoi(pidText)
+	if err != nil {
+		t.Fatalf("parse child pid: %v", err)
+	}
+	return pid
+}
+
+func waitForProviderTestNonEmptyFile(t *testing.T, path string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		pidBytes, err := os.ReadFile(path)
+		if err == nil {
+			pid := strings.TrimSpace(string(pidBytes))
+			if pid != "" {
+				return pid
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read child pid: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("child pid was not written within %s", timeout)
+	return ""
+}
+
+func waitForProviderTestPIDExit(t *testing.T, pid int, label string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("provider child pid %d survived %s cancellation", pid, label)
+}
+
 func TestStartBeadsLifecycleDoesNotMutateProcessDoltEnv(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")
@@ -5311,7 +5547,7 @@ esac
 		"SELECT 1 FROM config LIMIT 1",
 		"USE `hq`",
 		"VALUES ('issue_prefix', 'gc') ON DUPLICATE KEY UPDATE",
-		"VALUES ('types.custom', 'molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence') ON DUPLICATE KEY UPDATE",
+		"VALUES ('types.custom', 'molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step') ON DUPLICATE KEY UPDATE",
 	} {
 		if !strings.Contains(sqlText, want) {
 			t.Fatalf("dolt SQL log missing %q:\n%s", want, sqlText)
@@ -5398,7 +5634,7 @@ case "$query" in
     fi
     exit 0
     ;;
-  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''types.custom'\'', '\''molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
+  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''types.custom'\'', '\''molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
     exit 0
     ;;
   'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''issue_prefix'\'', '\''gc'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
@@ -5504,7 +5740,7 @@ case "$query" in
     fi
     exit 0
     ;;
-  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''types.custom'\'', '\''molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
+  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''types.custom'\'', '\''molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
     if [ ! -f %q ] || [ "$(cat %q)" -lt 3 ]; then
       echo "table not found: config" >&2
       exit 1
@@ -5626,7 +5862,7 @@ case "$query" in
     fi
     exit 0
     ;;
-  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''types.custom'\'', '\''molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
+  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''types.custom'\'', '\''molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
     count=0
     if [ -f %q ]; then
       count=$(cat %q)
@@ -5780,7 +6016,7 @@ case "$query" in
     fi
     exit 0
     ;;
-  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''types.custom'\'', '\''molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
+  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''types.custom'\'', '\''molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
     exit 0
     ;;
   'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''issue_prefix'\'', '\''gc'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
@@ -8815,26 +9051,21 @@ func TestStartBeadsLifecycleManagedDeferredDoesNotRequireRuntimeState(t *testing
 	ln := listenOnRandomPort(t)
 	defer func() { _ = ln.Close() }()
 	port := ln.Addr().(*net.TCPAddr).Port
-	script := gcBeadsBdScriptPath(cityPath)
-	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	scriptBody := fmt.Sprintf(`#!/bin/sh
-	echo "$@" >> %q
-	if [ "$1" = "start" ]; then
-	  mkdir -p "$(dirname %q)"
+echo "$@" >> %q
+if [ "$1" = "start" ]; then
+  mkdir -p "$(dirname %q)"
 	  cat > %q <<'JSON'
 	{"running":true,"pid":%d,"port":%d,"data_dir":%q,"started_at":"2026-04-14T00:00:00Z"}
 	JSON
 	fi
-	if [ "$1" = "init" ]; then
-	  mkdir -p "$2/.beads"
-	fi
-	exit 0
+if [ "$1" = "init" ]; then
+  mkdir -p "$2/.beads"
+fi
+exit 0
 	`, callLog, providerState, providerState, os.Getpid(), port, filepath.Join(cityPath, ".beads", "dolt"))
-	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	script := writeManagedBdTestScript(t, scriptBody)
+	writeExecStoreCityConfig(t, cityPath, "test-city", "", []config.Rig{{Name: "rig", Path: rigPath, Prefix: "rg"}})
 	seedDeferredManagedBeads(cityPath, cityPath, "tc", "hq")
 	seedDeferredManagedBeads(cityPath, rigPath, "rg", "rg")
 	if err := writeDoltRuntimeStateFile(providerState, doltRuntimeState{
@@ -8847,7 +9078,7 @@ func TestStartBeadsLifecycleManagedDeferredDoesNotRequireRuntimeState(t *testing
 		t.Fatal(err)
 	}
 
-	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_BEADS", "exec:"+script)
 	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
@@ -8961,21 +9192,24 @@ func TestStartBeadsLifecycleSkipsProviderForExternalHost(t *testing.T) {
 	// "start" should NOT be called (skipped by external host guard).
 	// "init" will be called but exits 2 (not needed).
 	callLog := filepath.Join(cityPath, "op-calls.log")
-	script := gcBeadsBdScriptPath(cityPath)
-	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho \"$1\" >> "+callLog+"\nexit 2\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	script := writeManagedBdTestScript(t, "#!/bin/sh\necho \"$1\" >> "+callLog+"\nexit 2\n")
 	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "test-city"
 
-	t.Setenv("GC_BEADS", "bd")
+[dolt]
+host = "mini2.hippo-tilapia.ts.net"
+port = 3307
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_BEADS", "exec:"+script)
 	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
 	t.Setenv("GC_DOLT_HOST", "operator-override.example.com")
 	t.Setenv("GC_DOLT_PORT", "5511")

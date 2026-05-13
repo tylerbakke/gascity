@@ -1898,13 +1898,12 @@ func TestControllerReloadCityNameChange(t *testing.T) {
 	// Change the city name.
 	writeCityTOML(t, dir, "different-city", "mayor")
 
-	// Wait for tick.
-	target := reconcileCount.Load() + 2
 	deadline := time.After(3 * time.Second)
-	for reconcileCount.Load() < target {
+	for !strings.Contains(stderr.String(), "workspace.name changed") {
 		select {
 		case <-deadline:
-			t.Fatal("timed out waiting for tick after name change")
+			t.Fatalf("timed out waiting for city name change rejection; reconciles=%d stdout=%q stderr=%q",
+				reconcileCount.Load(), stdout.String(), stderr.String())
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -2216,10 +2215,13 @@ func TestTryReloadConfig_IncludesBuiltinPackOrders(t *testing.T) {
 		}
 	}
 	// Dolt pack orders (included transitively via bd pack).
-	for _, want := range []string{"dolt-health", "dolt-gc-nudge", "dolt-remotes-patrol"} {
+	for _, want := range []string{"dolt-health", "dolt-remotes-patrol", "mol-dog-compactor"} {
 		if !names[want] {
 			t.Errorf("missing dolt order %q; got %v", want, names)
 		}
+	}
+	if names["dolt-gc-nudge"] {
+		t.Errorf("dolt-gc-nudge should not be registered as a recurring order; got %v", names)
 	}
 }
 

@@ -25,11 +25,33 @@ import (
 //go:embed config/*
 var configFS embed.FS
 
-// supported lists provider names that have hook support.
-var supported = []string{"claude", "codex", "gemini", "opencode", "copilot", "cursor", "pi", "omp"}
+// supported lists provider names that have hook support wired into
+// Gas Town's installer.
+var supported = []string{"claude", "codex", "gemini", "kiro", "opencode", "copilot", "cursor", "pi", "omp"}
 
-// unsupported lists provider names that have no hook mechanism.
-var unsupported = []string{"amp", "auggie"}
+// unwiredHookProviders lists provider names whose own CLIs do expose a
+// hook mechanism (per upstream documentation) but for which Gas Town
+// has not yet wired hook installation. Tracked as gap 4 of the
+// non-Claude provider parity audit (gastownhall/gascity#672):
+//
+//   - amp: Sourcegraph Amp CLI exposes a plugin system with
+//     session.start and tool.call events
+//     (https://ampcode.com/manual, Plugin events).
+//   - auggie: Augment Auggie CLI exposes SessionStart, SessionEnd,
+//     Stop, PreToolUse, PostToolUse hooks configured globally in
+//     ~/.augment/settings.json (https://docs.augmentcode.com/cli/overview).
+//
+// Listing them here lets Validate emit an accurate "hooks not yet
+// wired" error rather than the historical "no hook mechanism" claim,
+// which is factually wrong against current provider docs.
+//
+// Nudge delivery is unaffected: the supervisor-hosted dispatcher and
+// the legacy per-session poller (cmd/gc/cmd_nudge.go) both deliver
+// queued nudges via the worker.Handle abstraction without requiring
+// provider hooks, so amp and auggie sessions still drain queued
+// nudges. The remaining work is event-driven coordination
+// (session-start priming, pre-compaction handoff).
+var unwiredHookProviders = []string{"amp", "auggie"}
 
 // SupportedProviders returns the list of provider names with hook support.
 func SupportedProviders() []string {
@@ -75,9 +97,9 @@ func ValidateWithResolver(providers []string, resolve FamilyResolver) error {
 	for _, s := range supported {
 		sup[s] = true
 	}
-	noHook := make(map[string]bool, len(unsupported))
-	for _, u := range unsupported {
-		noHook[u] = true
+	unwired := make(map[string]bool, len(unwiredHookProviders))
+	for _, u := range unwiredHookProviders {
+		unwired[u] = true
 	}
 	var bad []string
 	for _, p := range providers {
@@ -85,8 +107,8 @@ func ValidateWithResolver(providers []string, resolve FamilyResolver) error {
 		if sup[family] {
 			continue
 		}
-		if noHook[family] {
-			bad = append(bad, fmt.Sprintf("%s (no hook mechanism)", p))
+		if unwired[family] {
+			bad = append(bad, fmt.Sprintf("%s (hooks not yet wired; see gastownhall/gascity#672 gap 4)", p))
 		} else {
 			bad = append(bad, fmt.Sprintf("%s (unknown)", p))
 		}
@@ -118,7 +140,7 @@ func InstallWithResolver(fs fsys.FS, cityDir, workDir string, providers []string
 		switch family {
 		case "claude":
 			err = installClaude(fs, cityDir)
-		case "codex", "gemini", "opencode", "copilot", "cursor", "pi", "omp":
+		case "codex", "gemini", "kiro", "opencode", "copilot", "cursor", "pi", "omp":
 			err = installOverlayManaged(fs, workDir, family)
 		default:
 			return fmt.Errorf("unsupported hook provider %q", p)

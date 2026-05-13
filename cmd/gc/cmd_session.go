@@ -544,7 +544,17 @@ func resolveSessionTemplate(cfg *config.City, input, currentRigDir string) (conf
 	if cfg == nil || input == "" {
 		return config.Agent{}, false
 	}
-	if strings.Contains(input, "/") {
+	if currentRigDir != "" && !strings.Contains(input, "/") && strings.Contains(input, ".") {
+		for _, a := range cfg.Agents {
+			if a.QualifiedName() == currentRigDir+"/"+input {
+				return a, true
+			}
+		}
+	}
+
+	// Inputs that include a rig separator ("/") or a binding prefix (".")
+	// must match a qualified name exactly after any current-rig lookup.
+	if strings.ContainsAny(input, "/.") {
 		for _, a := range cfg.Agents {
 			if a.QualifiedName() == input {
 				return a, true
@@ -1525,6 +1535,7 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer) int {
 		Actor:   eventActor(),
 		Subject: sessionID,
 		Message: "killed",
+		Payload: api.SessionLifecyclePayloadJSON(sessionID, "", "killed"),
 	})
 
 	fmt.Fprintf(stdout, "Session %s killed.\n", sessionID) //nolint:errcheck // best-effort stdout

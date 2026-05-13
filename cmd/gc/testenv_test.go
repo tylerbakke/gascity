@@ -16,9 +16,12 @@ var gcEnvVars = []string{
 	"GC_AGENT",
 	"GC_SESSION_ID",
 	"GC_SESSION_NAME",
+	"GC_SESSION_ORIGIN",
 	"GC_SHARED_SKILL_CATALOG_SNAPSHOT",
+	"GC_TEMPLATE",
 	"GC_TMUX_SESSION",
 	"GC_CITY",
+	"GC_DIR",
 }
 
 // clearGCEnv clears GC_* identity and session-routing variables for the
@@ -29,6 +32,15 @@ func clearGCEnv(t *testing.T) {
 	for _, k := range gcEnvVars {
 		t.Setenv(k, "")
 	}
+}
+
+func disableManagedDoltRecoveryForTest(t *testing.T) {
+	t.Helper()
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_DOLT_HOST", "")
+	t.Setenv("GC_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 }
 
 var testProviderStubCommands = []string{

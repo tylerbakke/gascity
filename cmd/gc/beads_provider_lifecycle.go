@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,27 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/pidutil"
 )
+
+// providerLifecycleLaunchctlGetenv reads a value from `launchctl getenv` on
+// macOS. Used by providerLifecycleProcessEnv as a fallback when an env var
+// the bd-provider script consumes (currently only GC_DOLT_LOGLEVEL) isn't
+// set in os.Environ — without this, `gc start` from a user shell silently
+// drops `launchctl setenv` values because they live in launchd's domain,
+// not the shell's env. Returns "" on non-Darwin or when the key is unset
+// or launchctl is unavailable.
+//
+// var so tests can stub without invoking real launchctl. Same pattern as
+// supervisorLaunchctlRun / supervisorLaunchdActive in cmd_supervisor_lifecycle.go.
+var providerLifecycleLaunchctlGetenv = func(key string) string {
+	if goruntime.GOOS != "darwin" {
+		return ""
+	}
+	out, err := exec.Command("launchctl", "getenv", key).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
 
 // cityDoltConfigs stores per-city Dolt configuration keyed by cityPath.
 // Registered by startBeadsLifecycle so env builders and isExternalDolt can
@@ -62,6 +84,12 @@ var resolveProviderLifecycleGCBinary = func() string {
 	}
 	return ""
 }
+
+var (
+	providerProbeTimeout = 10 * time.Second
+	// Override only in tests that do not call t.Parallel while the hook is changed.
+	providerLifecycleContext = context.WithTimeout
+)
 
 var (
 	initDirIfReadyEnsureBeadsProvider = ensureBeadsProvider
@@ -1404,11 +1432,12 @@ func normalizeScopeDoltConfig(dir string, state contract.ConfigState) error {
 // available (exit 2) or on any error. Unlike runProviderOp, exit 2 means
 // "not running" rather than "not needed."
 func runProviderProbe(script, cityPath, provider string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := providerLifecycleContext(context.Background(), providerProbeTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, script, "probe")
 	cmd.WaitDelay = 2 * time.Second
+	prepareProviderOpCommand(cmd)
 	if cityPath != "" {
 		cmd.Env = providerLifecycleProcessEnv(cityPath, provider)
 	}
@@ -1464,6 +1493,25 @@ func providerLifecycleProcessEnv(cityPath, provider string) []string {
 			env = append(env, fmt.Sprintf("GC_DOLT_ARCHIVE_LEVEL=%d", *dc.ArchiveLevel))
 		}
 	}
+	// `gc start` runs in the user's shell, which doesn't see vars set
+	// only via `launchctl setenv` — those live in launchd's domain.
+	// Fall back to launchctl-getenv so the managed dolt server's log
+	// level honors `launchctl setenv GC_DOLT_LOGLEVEL` even when the
+	// shell hasn't `export`ed it. The supervisor's reconcile path
+	// runs the same lookup; either source delivers the value.
+	const loglevelPrefix = "GC_DOLT_LOGLEVEL="
+	loglevelInEnv := false
+	for _, entry := range env {
+		if strings.HasPrefix(entry, loglevelPrefix) {
+			loglevelInEnv = true
+			break
+		}
+	}
+	if !loglevelInEnv {
+		if val := providerLifecycleLaunchctlGetenv("GC_DOLT_LOGLEVEL"); val != "" {
+			env = append(env, loglevelPrefix+val)
+		}
+	}
 	return env
 }
 
@@ -1490,7 +1538,7 @@ func acquireProviderSemaphore(ctx context.Context, cityPath string) (func(), err
 }
 
 func acquireProviderSemaphoreForOp(cityPath, op string) (func(), error) {
-	ctx, cancel := context.WithTimeout(context.Background(), providerOpTimeout(op))
+	ctx, cancel := providerLifecycleContext(context.Background(), providerOpTimeout(op))
 	release, err := acquireProviderSemaphore(ctx, cityPath)
 	if err != nil {
 		cancel()
@@ -1506,7 +1554,7 @@ func acquireProviderSemaphoreForOp(cityPath, op string) (func(), error) {
 // operation. The "start" and "recover" operations get a longer timeout
 // because dolt server startup can take 30+ seconds for large data dirs.
 // All other operations use 30s.
-func providerOpTimeout(op string) time.Duration {
+var providerOpTimeout = func(op string) time.Duration {
 	switch op {
 	case "start", "recover":
 		return 120 * time.Second
@@ -1532,11 +1580,12 @@ func runProviderOpWithEnv(script string, environ []string, args ...string) error
 	if len(args) > 0 {
 		op = args[0]
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), providerOpTimeout(op))
+	ctx, cancel := providerLifecycleContext(context.Background(), providerOpTimeout(op))
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, script, args...)
 	cmd.WaitDelay = 2 * time.Second
+	prepareProviderOpCommand(cmd)
 	if len(environ) > 0 {
 		cmd.Env = environ
 	}

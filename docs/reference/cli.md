@@ -1029,7 +1029,7 @@ gc events
 | `--after-cursor` | string |  | Resume from this supervisor event cursor (supervisor scope only) |
 | `--api` | string |  | GC API server URL override (auto-discovered by default) |
 | `--follow` | bool |  | Continuously stream events as they arrive |
-| `--payload-match` | stringArray |  | Filter by payload field (key=value, repeatable) |
+| `--payload-match` | stringArray |  | Filter by payload field (key=value or key.subkey=value, repeatable) |
 | `--seq` | bool |  | Print the current head cursor and exit |
 | `--since` | string |  | Show events since duration ago (e.g. 1h, 30m) |
 | `--timeout` | string | `30s` | Max wait duration for --watch (e.g. 30s, 5m) |
@@ -1092,9 +1092,13 @@ Compile and display a formula recipe.
 By default, shows the recipe with &#123;&#123;variable&#125;&#125; placeholders intact.
 Use --var to substitute variables and preview the resolved output.
 
+When --rig is set (or cwd is inside a rig), rig-scoped formula_vars from
+city.toml are shown as "(rig default=...)" alongside each applicable var.
+
 Examples:
   gc formula show mol-feature
   gc formula show mol-feature --var title="Auth system" --var branch=main
+  gc formula show mol-polecat-work --rig mo
 
 ```
 gc formula show <formula-name> [flags]
@@ -1811,8 +1815,19 @@ Force the current city controller to re-read effective config and
 process one reload tick without restarting the city/controller.
 
 Reload may fetch configured remote packs before recomputing effective
-config. Existing per-session restarts may still happen if normal config
-drift rules require them.
+config. By default, per-session restarts may still happen if normal
+config drift rules require them.
+
+With `--soft`, the controller accepts any detected per-session config
+drift instead of draining the drifted sessions: each open session's
+recorded config hash is updated to the hash the freshly reloaded config
+produces for it, so the immediately-following reconcile tick sees no
+drift and no config-drift drains fire. Useful when editing a running
+city's `.gc/settings.json` without disrupting in-flight work. Sessions
+whose template no longer maps to a configured agent are NOT updated;
+normal orphan/suspended drain handles them on the next tick. See
+[Soft Reload](../guides/gc-reload-design.md#soft-reload) for the full
+semantics and when to use it.
 
 ```
 gc reload [path] [flags]
@@ -1821,6 +1836,7 @@ gc reload [path] [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--async` | bool |  | Return after the controller accepts the reload request |
+| `--soft` | bool |  | Accept config drift on open sessions instead of draining them |
 | `--timeout` | string | `5m` | How long to wait for reload completion |
 
 ## gc restart
@@ -2609,6 +2625,7 @@ gc sling [target] <bead-or-formula-or-text> [flags]
 | `--nudge` | bool |  | nudge target after routing |
 | `--on` | string |  | attach wisp from formula to bead before routing |
 | `--owned` | bool |  | mark auto-convoy as owned (skip auto-close) |
+| `--reassign` | bool |  | clear any existing human assignee before routing (for human→pool handoff) |
 | `--scope-kind` | string |  | logical workflow scope kind for graph.v2 launches |
 | `--scope-ref` | string |  | logical workflow scope ref for graph.v2 launches |
 | `--stdin` | bool |  | read bead text from stdin (first line = title, rest = description) |

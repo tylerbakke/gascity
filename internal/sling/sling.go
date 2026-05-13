@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -50,6 +51,12 @@ type SlingOpts struct {
 	Nudge         bool
 	Force         bool
 	DryRun        bool
+	// Reassign clears any existing human assignee on the bead before
+	// routing so the target pool/agent can claim it. Without this, a
+	// bead claimed by a human (`bd update --claim`) stays invisible
+	// to the pool's claim filter even after sling sets gc.routed_to.
+	// See gastownhall/gascity#1007.
+	Reassign bool
 	// InlineText is set only by the CLI path for ad-hoc task text. API
 	// callers always provide explicit bead or formula references.
 	InlineText bool
@@ -905,6 +912,8 @@ func rigStoredDefaultBranch(cfg *config.City, beadID string, a config.Agent) str
 }
 
 // BuildSlingFormulaVars builds the variable map for formula instantiation.
+// Precedence (highest wins): explicit --var > rig.formula_vars > routing-injected
+// defaults (issue/rig_name/base_branch/...) > formula-level [vars.*].default.
 func BuildSlingFormulaVars(formulaName, beadID string, userVars []string, a config.Agent, deps SlingDeps) map[string]string {
 	vars := make(map[string]string, len(userVars)+6)
 	for _, v := range userVars {
@@ -913,6 +922,7 @@ func BuildSlingFormulaVars(formulaName, beadID string, userVars []string, a conf
 			vars[key] = value
 		}
 	}
+	mergeRigFormulaVars(vars, deps.Cfg, a)
 	addVar := func(key, value string) {
 		if value == "" {
 			return
@@ -947,13 +957,107 @@ func BuildSlingFormulaVars(formulaName, beadID string, userVars []string, a conf
 	return vars
 }
 
+// mergeRigFormulaVars folds rig-scoped formula_vars defaults into vars.
+// Explicit --var entries already in vars are preserved. The lookup uses
+// rigNameForAgent so agents whose Dir is a filesystem path still resolve
+// to the correct rig.
+func mergeRigFormulaVars(vars map[string]string, cfg *config.City, a config.Agent) {
+	if cfg == nil {
+		return
+	}
+	rigName := rigNameForAgent(cfg, a)
+	if rigName == "" {
+		return
+	}
+	for i := range cfg.Rigs {
+		if cfg.Rigs[i].Name != rigName {
+			continue
+		}
+		for k, v := range cfg.Rigs[i].FormulaVars {
+			if _, explicit := vars[k]; explicit {
+				continue
+			}
+			vars[k] = v
+		}
+		return
+	}
+}
+
 // ResolveSlingEnv returns extra env vars for the sling command.
-func ResolveSlingEnv(a config.Agent, deps SlingDeps) map[string]string {
-	if agentutil.IsMultiSessionAgent(&a) {
+//
+// Two env vars are projected:
+//   - GC_SLING_TARGET: the concrete session name, for single-session
+//     agents only (pool/polecat agents resolve their session name per
+//     claim and do not need this).
+//   - GC_ARTIFACT_DIR: a molecule-scoped artifact directory rooted under
+//     <cityPath>/.gc/molecules/<rootID>/artifacts/<beadID>/. Set only when
+//     the bead carries gc.root_bead_id metadata, so that ralph-loop and
+//     other stateful steps survive worker (polecat) teardown and
+//     re-sling.
+//
+// Callers that already have the bead fetched should prefer
+// ResolveSlingEnvForBead to avoid a redundant store lookup.
+func ResolveSlingEnv(a config.Agent, deps SlingDeps, beadID string) map[string]string {
+	var bead beads.Bead
+	if deps.Store != nil && strings.TrimSpace(beadID) != "" {
+		if got, err := deps.Store.Get(beadID); err == nil {
+			bead = got
+		}
+	}
+	return ResolveSlingEnvForBead(a, deps, bead)
+}
+
+// ResolveSlingEnvForBead is the bead-already-fetched variant of
+// ResolveSlingEnv. A zero-value bead disables molecule artifact
+// resolution; callers without the bead should use ResolveSlingEnv.
+func ResolveSlingEnvForBead(a config.Agent, deps SlingDeps, bead beads.Bead) map[string]string {
+	env := map[string]string{}
+
+	if !agentutil.IsMultiSessionAgent(&a) {
+		var sessionTemplate string
+		if deps.Cfg != nil {
+			sessionTemplate = deps.Cfg.Workspace.SessionTemplate
+		}
+		sn := agentutil.LookupSessionName(deps.Store, deps.CityName, a.QualifiedName(), sessionTemplate)
+		env["GC_SLING_TARGET"] = sn
+	}
+
+	if dir := resolveMoleculeArtifactDir(deps, bead); dir != "" {
+		env["GC_ARTIFACT_DIR"] = dir
+	}
+
+	// Preserve nil-vs-empty contract for callers that forward env to
+	// exec.Command — TestDoSlingEnvPassthrough asserts pool agents with
+	// no molecule context receive nil env so the subprocess inherits the
+	// parent environment unmodified.
+	if len(env) == 0 {
 		return nil
 	}
-	sn := agentutil.LookupSessionName(deps.Store, deps.CityName, a.QualifiedName(), deps.Cfg.Workspace.SessionTemplate)
-	return map[string]string{"GC_SLING_TARGET": sn}
+	return env
+}
+
+// resolveMoleculeArtifactDir returns the per-bead molecule artifact
+// directory when the bead is a molecule member, or the empty string
+// otherwise. The directory is created eagerly so pack scripts can write
+// to it immediately after dispatch.
+//
+// Best-effort: any failure (empty bead, no molecule context, mkdir error)
+// yields "" and the env var is omitted. Pack scripts that rely on
+// GC_ARTIFACT_DIR must handle its absence gracefully (typically by
+// falling back to worktree-local storage).
+func resolveMoleculeArtifactDir(deps SlingDeps, bead beads.Bead) string {
+	if strings.TrimSpace(bead.ID) == "" || strings.TrimSpace(deps.CityPath) == "" {
+		return ""
+	}
+	rootID := strings.TrimSpace(bead.Metadata["gc.root_bead_id"])
+	if rootID == "" {
+		return ""
+	}
+	dir, err := molecule.EnsureArtifactDir(fsys.OSFS{}, deps.CityPath, rootID, bead.ID)
+	if err != nil {
+		return ""
+	}
+	return dir
 }
 
 // TargetType returns a human-readable label for the agent type.

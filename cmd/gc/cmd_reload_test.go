@@ -51,7 +51,7 @@ func TestCmdReloadApplied(t *testing.T) {
 	reloadUnavailableMessageHook = func(string) string { return "" }
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdReload([]string{dir}, false, "30s", true, &stdout, &stderr); code != 0 {
+	if code := cmdReload([]string{dir}, false, false, "30s", true, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdReload = %d; stderr=%s", code, stderr.String())
 	}
 	if got := strings.TrimSpace(stdout.String()); got != "Config reloaded: 1 agents, 0 rigs (rev abc123def456)" {
@@ -67,7 +67,7 @@ func TestCmdReloadAsyncExplicitTimeoutInvalid(t *testing.T) {
 	writeCityTOML(t, dir, "test", "mayor")
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdReload([]string{dir}, true, "30s", true, &stdout, &stderr); code != 1 {
+	if code := cmdReload([]string{dir}, true, false, "30s", true, &stdout, &stderr); code != 1 {
 		t.Fatalf("cmdReload = %d, want 1", code)
 	}
 	if !strings.Contains(stderr.String(), "--async and --timeout cannot be used together") {
@@ -99,7 +99,7 @@ func TestCmdReloadControllerUnavailableUsesRicherMessage(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdReload([]string{dir}, false, "5s", true, &stdout, &stderr); code != 1 {
+	if code := cmdReload([]string{dir}, false, false, "5s", true, &stdout, &stderr); code != 1 {
 		t.Fatalf("cmdReload = %d, want 1", code)
 	}
 	if got := strings.TrimSpace(stderr.String()); got != "gc reload: city failed to start under supervisor: fetching packs: auth denied: connecting to controller: dial failed" {
@@ -130,7 +130,7 @@ func TestCmdReloadControllerUnresponsiveUsesRicherMessage(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdReload([]string{dir}, false, "5s", true, &stdout, &stderr); code != 1 {
+	if code := cmdReload([]string{dir}, false, false, "5s", true, &stdout, &stderr); code != 1 {
 		t.Fatalf("cmdReload = %d, want 1", code)
 	}
 	if got := strings.TrimSpace(stderr.String()); got != "gc reload: controller is running but not responding: reading response: i/o timeout" {
@@ -157,7 +157,7 @@ func TestCmdReloadPreservesProtocolErrors(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdReload([]string{dir}, false, "5s", true, &stdout, &stderr); code != 1 {
+	if code := cmdReload([]string{dir}, false, false, "5s", true, &stdout, &stderr); code != 1 {
 		t.Fatalf("cmdReload = %d, want 1", code)
 	}
 	if got := strings.TrimSpace(stderr.String()); got != "gc reload: parsing response: invalid character 'o' in literal null" {
@@ -188,7 +188,7 @@ func TestCmdReloadFailedReplyPrintsWarnings(t *testing.T) {
 	reloadUnavailableMessageHook = func(string) string { return "" }
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdReload([]string{dir}, false, "5s", true, &stdout, &stderr); code != 1 {
+	if code := cmdReload([]string{dir}, false, false, "5s", true, &stdout, &stderr); code != 1 {
 		t.Fatalf("cmdReload = %d, want 1", code)
 	}
 	got := stderr.String()
@@ -473,9 +473,30 @@ func TestSendReloadControlRequestNoChange(t *testing.T) {
 	if reply.Message != "No config changes detected." {
 		t.Fatalf("reply.Message = %q", reply.Message)
 	}
-	if len(reply.Warnings) != 0 {
-		t.Fatalf("reply.Warnings = %v, want none", reply.Warnings)
+	// The fixture intentionally uses [[agent]] which now emits a loud v1
+	// surface deprecation warning at every config load. That warning is
+	// not what this test guards — filter it out so the assertion still
+	// reflects "no other warnings".
+	if other := warningsWithoutV1Surfaces(reply.Warnings); len(other) != 0 {
+		t.Fatalf("reply.Warnings = %v, want none (besides v1-surface deprecations)", other)
 	}
+}
+
+// warningsWithoutV1Surfaces filters out warnings produced by
+// config.DetectLegacyV1Surfaces so existing tests whose fixtures use
+// the deprecated v1 surfaces continue to assert on the non-v1 set.
+func warningsWithoutV1Surfaces(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, w := range in {
+		if config.IsLegacyV1SurfaceWarning(w) {
+			continue
+		}
+		out = append(out, w)
+	}
+	return out
 }
 
 func TestSendReloadControlRequestInvalidConfig(t *testing.T) {

@@ -59,6 +59,7 @@ func newSlingCmd(stdout, stderr io.Writer) *cobra.Command {
 	var merge string
 	var noConvoy bool
 	var owned bool
+	var reassign bool
 	var onFormula string
 	var dryRun bool
 	var noFormula bool
@@ -113,7 +114,7 @@ Examples:
 				fmt.Fprintf(stderr, "gc sling: --scope-kind must be city or rig\n") //nolint:errcheck // best-effort stderr
 				return errExit
 			}
-			code := cmdSling(args, formula, nudge, force, title, vars, merge, noConvoy, owned, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, stdout, stderr)
+			code := cmdSling(args, formula, nudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, stdout, stderr)
 			return exitForCode(code)
 		},
 	}
@@ -125,6 +126,7 @@ Examples:
 	cmd.Flags().StringVar(&merge, "merge", "", "merge strategy: direct, mr, or local")
 	cmd.Flags().BoolVar(&noConvoy, "no-convoy", false, "skip auto-convoy creation")
 	cmd.Flags().BoolVar(&owned, "owned", false, "mark auto-convoy as owned (skip auto-close)")
+	cmd.Flags().BoolVar(&reassign, "reassign", false, "clear any existing human assignee before routing (for human→pool handoff)")
 	cmd.Flags().StringVar(&onFormula, "on", "", "attach wisp from formula to bead before routing")
 	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "show what would be done without executing")
 	cmd.Flags().BoolVar(&noFormula, "no-formula", false, "suppress default formula (route raw bead)")
@@ -174,7 +176,7 @@ func shellSlingRunner(dir, command string, env map[string]string) (string, error
 }
 
 // cmdSling is the CLI entry point for gc sling.
-func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars []string, merge string, noConvoy, owned bool, onFormula string, noFormula, fromStdin, dryRun bool, scopeKind, scopeRef string, stdout, stderr io.Writer) int {
+func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars []string, merge string, noConvoy, owned, reassign bool, onFormula string, noFormula, fromStdin, dryRun bool, scopeKind, scopeRef string, stdout, stderr io.Writer) int {
 	// --stdin: read bead text from stdin early (before city resolution)
 	// so errors are reported immediately. First line = title, rest = description.
 	var stdinDescription string
@@ -336,6 +338,7 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 		Merge:         merge,
 		NoConvoy:      noConvoy,
 		Owned:         owned,
+		Reassign:      reassign,
 		Nudge:         doNudge,
 		Force:         force,
 		DryRun:        dryRun,
@@ -948,73 +951,15 @@ func collectConflictErrors(err error, visit func(*sourceworkflow.ConflictError))
 }
 
 // buildSlingFormulaVars merges caller-provided vars with the runtime context
-// needed by common work formulas. Explicit --var entries always win.
+// needed by common work formulas. Delegates to the canonical implementation
+// in internal/sling so CLI dry-run previews match production routing, but
+// injects cliBranchResolver so live `git symbolic-ref origin/HEAD` probes
+// fire when neither bead metadata nor rig.DefaultBranch supply a branch.
 func buildSlingFormulaVars(formulaName, beadID string, userVars []string, a config.Agent, deps slingDeps) map[string]string {
-	vars := make(map[string]string, len(userVars)+6)
-	for _, v := range userVars {
-		key, value, ok := strings.Cut(v, "=")
-		if ok && key != "" {
-			vars[key] = value
-		}
-	}
-	addVar := func(key, value string) {
-		if value == "" {
-			return
-		}
-		if _, explicit := vars[key]; explicit {
-			return
-		}
-		vars[key] = value
-	}
-	addRoutingVar := func(key, value string) {
-		if _, explicit := vars[key]; explicit {
-			return
-		}
-		vars[key] = value
-	}
-
-	if beadID != "" {
-		// Attached work formulas conventionally expect issue=<bead-id>.
-		addVar("issue", beadID)
-	}
-	addRoutingVar("rig_name", a.Dir)
-	addRoutingVar("binding_name", a.BindingName)
-	addRoutingVar("binding_prefix", a.BindingPrefix())
-
-	autoBranch := slingFormulaTargetBranch(beadID, deps, a)
-	if slingFormulaUsesBaseBranch(formulaName) {
-		addVar("base_branch", autoBranch)
-	}
-	if slingFormulaUsesTargetBranch(formulaName) {
-		addVar("target_branch", autoBranch)
-	}
-
-	return vars
-}
-
-// slingFormulaSearchPaths returns the formula search paths for the current
-// sling context. Uses the target agent's rig to select rig-specific layers,
-// falling back to city-level layers via FormulaLayers.SearchPaths.
-//
-// slingFormulaTargetBranch resolves the branch used as base_branch /
-// target_branch in formula vars. Resolution order:
-//  1. metadata.target on the work bead (or convoy ancestor)
-//  2. DefaultBranch recorded on the bead's rig in city.toml
-//  3. DefaultBranch recorded on the agent's rig in city.toml
-//  4. Live probe of the rig repo (git symbolic-ref origin/HEAD)
-func slingFormulaTargetBranch(beadID string, deps slingDeps, a config.Agent) string {
 	if deps.Branches == nil {
 		deps.Branches = cliBranchResolver{}
 	}
-	return sling.SlingFormulaTargetBranch(beadID, deps, a)
-}
-
-func slingFormulaUsesBaseBranch(formula string) bool {
-	return strings.HasPrefix(formula, "mol-polecat-") || formula == "mol-scoped-work"
-}
-
-func slingFormulaUsesTargetBranch(formula string) bool {
-	return formula == "mol-refinery-patrol"
+	return sling.BuildSlingFormulaVars(formulaName, beadID, userVars, a, deps)
 }
 
 // resolveSlingEnv returns extra env vars for the sling command.

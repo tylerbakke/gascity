@@ -6,9 +6,11 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/testutil"
 )
 
@@ -65,9 +67,16 @@ func clearInheritedBeadsEnv(t *testing.T) {
 // (discoverDoltProcesses returns nil there). The test-config allowlist keeps
 // unrelated city/runtime dolt servers out of the diff so background activity
 // does not false-positive the cleanup check.
-func requireNoLeakedDoltAfter(t *testing.T) {
+func requireNoLeakedDoltAfterForPaths(t *testing.T, paths ...string) {
 	t.Helper()
-	requireNoLeakedDoltAfterWith(t, discoverDoltProcesses)
+	requireNoLeakedDoltAfterWithFilter(t, discoverDoltProcesses, func(configPath string) bool {
+		for _, path := range paths {
+			if path != "" && pathutil.PathWithin(path, configPath) {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // requireNoLeakedDoltAfterWith is the testReporter+injectable-enumerator
@@ -77,9 +86,18 @@ func requireNoLeakedDoltAfter(t *testing.T) {
 // without spawning real dolt children.
 func requireNoLeakedDoltAfterWith(t testReporter, enumerate func() ([]DoltProcInfo, error)) {
 	t.Helper()
-	initial := snapshotDoltProcessPIDsWith(t, enumerate)
+	homeDir, _ := os.UserHomeDir()
+	tempDir := os.TempDir()
+	requireNoLeakedDoltAfterWithFilter(t, enumerate, func(configPath string) bool {
+		return isTestConfigPath(configPath, homeDir, tempDir)
+	})
+}
+
+func requireNoLeakedDoltAfterWithFilter(t testReporter, enumerate func() ([]DoltProcInfo, error), includeConfigPath func(string) bool) {
+	t.Helper()
+	initial := snapshotDoltProcessPIDsWithFilter(t, enumerate, includeConfigPath)
 	t.Cleanup(func() {
-		leaked := snapshotDoltProcessPIDsWith(t, enumerate)
+		leaked := snapshotDoltProcessPIDsWithFilter(t, enumerate, includeConfigPath)
 		for pid := range initial {
 			delete(leaked, pid)
 		}
@@ -108,15 +126,22 @@ func requireNoLeakedDoltAfterWith(t testReporter, enumerate func() ([]DoltProcIn
 // swallowed discovery failure can never silently mask a real leak.
 func snapshotDoltProcessPIDsWith(t testReporter, enumerate func() ([]DoltProcInfo, error)) map[int]string {
 	t.Helper()
+	homeDir, _ := os.UserHomeDir()
+	tempDir := os.TempDir()
+	return snapshotDoltProcessPIDsWithFilter(t, enumerate, func(configPath string) bool {
+		return isTestConfigPath(configPath, homeDir, tempDir)
+	})
+}
+
+func snapshotDoltProcessPIDsWithFilter(t testReporter, enumerate func() ([]DoltProcInfo, error), includeConfigPath func(string) bool) map[int]string {
+	t.Helper()
 	procs, err := enumerate()
 	if err != nil {
 		t.Fatalf("discoverDoltProcesses: %v", err)
 	}
-	homeDir, _ := os.UserHomeDir()
-	tempDir := os.TempDir()
 	out := make(map[int]string, len(procs))
 	for _, p := range procs {
-		if !isTestConfigPath(extractConfigPath(p.Argv), homeDir, tempDir) {
+		if !includeConfigPath(extractConfigPath(p.Argv)) {
 			continue
 		}
 		out[p.PID] = strings.Join(p.Argv, " ")
@@ -143,5 +168,48 @@ func cleanupManagedDoltTestCity(t *testing.T, cityPath string) {
 		if err := shutdownBeadsProvider(cityPath); err != nil {
 			t.Logf("shutdownBeadsProvider(%s): %v", cityPath, err)
 		}
+		stopManagedDoltProcessesUnderTestCity(t, cityPath)
 	})
+}
+
+func stopManagedDoltProcessesUnderTestCity(t *testing.T, cityPath string) {
+	t.Helper()
+	procs, err := discoverDoltProcesses()
+	if err != nil {
+		t.Fatalf("discoverDoltProcesses: %v", err)
+	}
+	for _, p := range procs {
+		configPath := extractConfigPath(p.Argv)
+		if !pathutil.PathWithin(cityPath, configPath) {
+			continue
+		}
+		stopManagedDoltTestPID(t, p.PID)
+	}
+}
+
+func stopManagedDoltTestPID(t *testing.T, pid int) {
+	t.Helper()
+	if pid <= 0 || !managedStopPIDAlive(pid) {
+		return
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+		t.Fatalf("signal dolt test pid %d with SIGTERM: %v", pid, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for managedStopPIDAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !managedStopPIDAlive(pid) {
+		return
+	}
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		t.Fatalf("signal dolt test pid %d with SIGKILL: %v", pid, err)
+	}
+	deadline = time.Now().Add(time.Second)
+	for managedStopPIDAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if managedStopPIDAlive(pid) {
+		t.Fatalf("dolt test pid %d still alive after SIGKILL", pid)
+	}
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 type listFailStore struct {
@@ -1814,6 +1815,49 @@ func TestBuildDesiredState_MinZeroDefaultScaleCheckRoutedWorkCreatesPoolSession(
 	}
 	if polecatSessions != 1 {
 		t.Fatalf("polecat desired sessions = %d, want 1 for min=0 routed ready work; stderr:\n%s", polecatSessions, stderr.String())
+	}
+}
+
+func TestBuildDesiredState_MinZeroDefaultScaleCheckNoWorkDropsPendingPoolCreate(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	const template = "polecat"
+	session := beads.Bead{
+		ID:     "session-pending",
+		Title:  "polecat",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel, "template:" + template},
+		Metadata: map[string]string{
+			"template":             template,
+			"session_name":         PoolSessionName(template, "session-pending"),
+			"agent_name":           template,
+			"state":                "creating",
+			"pending_create_claim": boolMetadata(true),
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              template,
+			StartCommand:      "true",
+			MinActiveSessions: intPtr(0),
+			MaxActiveSessions: intPtr(3),
+		}},
+	}
+
+	var stderr strings.Builder
+	dsResult := buildDesiredStateWithSessionBeads(
+		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(),
+		store, nil, newSessionBeadSnapshot([]beads.Bead{session}), nil, &stderr,
+	)
+
+	if got := dsResult.ScaleCheckCounts[template]; got != 0 {
+		t.Fatalf("ScaleCheckCounts[%s] = %d, want 0 with no routed ready work", template, got)
+	}
+	if _, ok := dsResult.State[session.Metadata["session_name"]]; ok {
+		t.Fatalf("pending pool session was preserved with no runnable work; desired=%#v stderr:\n%s", dsResult.State, stderr.String())
 	}
 }
 
@@ -3845,8 +3889,12 @@ func TestBuildDesiredState_PendingCreatePoolSessionUsesConcreteBeadIdentity(t *t
 	}
 }
 
-func TestBuildDesiredState_PendingCreatePoolSessionStaysDesiredWithoutScaleDemand(t *testing.T) {
+func TestBuildDesiredState_PendingCreatePoolSessionDropsWithoutScaleDemand(t *testing.T) {
 	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "repos", "gascity")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatalf("create rig path: %v", err)
+	}
 	store := beads.NewMemStore()
 	sessionName := "workflows__codex-max-mc-new"
 	if _, err := store.Create(beads.Bead{
@@ -3867,7 +3915,7 @@ func TestBuildDesiredState_PendingCreatePoolSessionStaysDesiredWithoutScaleDeman
 		t.Fatalf("create session bead: %v", err)
 	}
 	cfg := &config.City{
-		Rigs: []config.Rig{{Name: "gascity", Path: filepath.Join(cityPath, "repos", "gascity")}},
+		Rigs: []config.Rig{{Name: "gascity", Path: rigPath}},
 		Agents: []config.Agent{{
 			Name:              "workflows.codex-max",
 			Dir:               "gascity",
@@ -3884,15 +3932,8 @@ func TestBuildDesiredState_PendingCreatePoolSessionStaysDesiredWithoutScaleDeman
 	if got := dsResult.ScaleCheckCounts["gascity/workflows.codex-max"]; got != 0 {
 		t.Fatalf("ScaleCheckCounts[gascity/workflows.codex-max] = %d, want 0", got)
 	}
-	got, ok := dsResult.State[sessionName]
-	if !ok {
-		t.Fatalf("desired state missing pending-create pool session: keys=%v", mapKeys(dsResult.State))
-	}
-	if got.TemplateName != "gascity/workflows.codex-max" {
-		t.Fatalf("TemplateName = %q, want gascity/workflows.codex-max", got.TemplateName)
-	}
-	if got.InstanceName != sessionName {
-		t.Fatalf("InstanceName = %q, want existing session name %q", got.InstanceName, sessionName)
+	if _, ok := dsResult.State[sessionName]; ok {
+		t.Fatalf("pending-create pool session stayed desired without runnable work: keys=%v base=%v", mapKeys(dsResult.State), mapKeys(dsResult.BaseState))
 	}
 }
 
@@ -5405,6 +5446,88 @@ func TestEnsureDependencyOnlyTemplate_StoreBackedUsesInstanceIdentity(t *testing
 	}
 	if template := tp.Env["GC_TEMPLATE"]; template != "gascity/db" {
 		t.Fatalf("store-backed dep-floor GC_TEMPLATE = %q, want base %q", template, "gascity/db")
+	}
+}
+
+func TestBuildDesiredState_DependencyFloorSkipsFailedCreate(t *testing.T) {
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{
+				Name:              "db",
+				Dir:               "gascity",
+				StartCommand:      "true",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(3),
+				ScaleCheck:        "printf 0",
+			},
+			{
+				Name:              "api",
+				Dir:               "gascity",
+				StartCommand:      "true",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(3),
+				ScaleCheck:        "printf 0",
+				DependsOn:         []string{"gascity/db"},
+			},
+		},
+	}
+
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "api",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "template:gascity/api"},
+		Metadata: map[string]string{
+			"template":     "gascity/api",
+			"agent_name":   "gascity/api",
+			"session_name": "s-api-root",
+			"state":        "active",
+			"pool_managed": "true",
+			"pool_slot":    "1",
+		},
+	}); err != nil {
+		t.Fatalf("seed api root bead: %v", err)
+	}
+	failed, err := store.Create(beads.Bead{
+		Title:  "db failed create",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "template:gascity/db"},
+		Metadata: map[string]string{
+			"template":             "gascity/db",
+			"agent_name":           "gascity/db-failed",
+			"session_name":         "s-db-failed",
+			"state":                string(sessionpkg.StateFailedCreate),
+			"dependency_only":      "true",
+			"pool_managed":         "true",
+			"pool_slot":            "1",
+			"pending_create_claim": "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed failed-create dependency bead: %v", err)
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+
+	var tp TemplateParams
+	var found bool
+	for _, entry := range dsResult.State {
+		if entry.TemplateName == "gascity/db" && entry.DependencyOnly {
+			tp = entry
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("store-backed dependency floor for db not found: %+v", dsResult.State)
+	}
+	if tp.SessionName == failed.Metadata["session_name"] {
+		t.Fatalf("dependency floor reused failed-create bead %s with session %q", failed.ID, tp.SessionName)
+	}
+	if tp.SessionName == "" {
+		t.Fatal("dependency floor session name is empty")
 	}
 }
 

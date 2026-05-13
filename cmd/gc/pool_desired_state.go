@@ -83,7 +83,11 @@ func computePoolDesiredStates(
 	trace *sessionReconcilerTraceCycle,
 ) []PoolDesiredState {
 	// Build reverse lookup: any identifier → session bead ID.
-	// Assignee on work beads may be a bead ID, session name, or alias.
+	// Assignee on work beads may be a bead ID, session name, alias, or
+	// a prior alias preserved in alias_history. Resume-tier dispatch
+	// drops in-progress work whose owning session can't be resolved
+	// from this map, so missing identities cause live sessions to look
+	// orphaned and let a duplicate spawn for the same bead.
 	assigneeToSessionBeadID := make(map[string]string)
 	sessionBeadTemplate := make(map[string]string)
 	for _, sb := range sessionBeads {
@@ -94,12 +98,8 @@ func computePoolDesiredStates(
 		if template != "" {
 			sessionBeadTemplate[sb.ID] = template
 		}
-		assigneeToSessionBeadID[sb.ID] = sb.ID
-		if sn := strings.TrimSpace(sb.Metadata["session_name"]); sn != "" {
-			assigneeToSessionBeadID[sn] = sb.ID
-		}
-		if ni := strings.TrimSpace(sb.Metadata["configured_named_identity"]); ni != "" {
-			assigneeToSessionBeadID[ni] = sb.ID
+		for _, id := range sessionBeadAssigneeIdentities(sb) {
+			assigneeToSessionBeadID[id] = sb.ID
 		}
 	}
 

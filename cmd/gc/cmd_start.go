@@ -221,6 +221,60 @@ func buildIdleTracker(cfg *config.City, cityName, _ string, sp runtime.Provider)
 	return it
 }
 
+// buildMaxSessionAgeTracker creates a maxSessionAgeTracker from the config,
+// registering threshold + jitter for every agent that has max_session_age
+// set. Returns nil when no agent uses the feature (disabled, no-op).
+// Mirrors buildIdleTracker so the set of session names registered matches
+// what the reconciler observes.
+func buildMaxSessionAgeTracker(cfg *config.City, cityName string, sp runtime.Provider) maxSessionAgeTracker {
+	var hasAny bool
+	st := cfg.Workspace.SessionTemplate
+	for _, a := range cfg.Agents {
+		if a.MaxSessionAgeDuration() > 0 {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
+		return nil
+	}
+	tr := newMaxSessionAgeTracker()
+	var registeredAny bool
+	for _, a := range cfg.Agents {
+		maxAge := a.MaxSessionAgeDuration()
+		if maxAge <= 0 {
+			continue
+		}
+		jitter := a.MaxSessionAgeJitterDuration()
+		named := config.FindNamedSession(cfg, a.QualifiedName())
+		if named != nil {
+			if named.ModeOrDefault() != "always" {
+				tr.setConfig(config.NamedSessionRuntimeName(cityName, cfg.Workspace, a.QualifiedName()), maxAge, jitter)
+				registeredAny = true
+			}
+			if !a.SupportsInstanceExpansion() {
+				continue
+			}
+		}
+		sp0 := scaleParamsFor(&a)
+		if a.SupportsInstanceExpansion() {
+			for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, st, sp) {
+				sn := startupSessionName(cityName, qualifiedInstance, st)
+				tr.setConfig(sn, maxAge, jitter)
+				registeredAny = true
+			}
+			continue
+		}
+		sn := startupSessionName(cityName, a.QualifiedName(), st)
+		tr.setConfig(sn, maxAge, jitter)
+		registeredAny = true
+	}
+	if !registeredAny {
+		return nil
+	}
+	return tr
+}
+
 func newStartCmd(stdout, stderr io.Writer) *cobra.Command {
 	var foregroundMode bool
 	cmd := &cobra.Command{
@@ -913,6 +967,14 @@ func resolveConfiguredWorkDir(cityPath, cityName, qualifiedName string, a *confi
 	}
 	workDir, err := workdirutil.ResolveWorkDirPathStrict(cityPath, cityName, qualifiedName, *a, rigs)
 	if err != nil {
+		return "", err
+	}
+	// Guard against spawning into a path whose ancestor has a stale
+	// worktree pointer — see gascity#1556. Fails closed before MkdirAll
+	// so the operator sees the broken ancestor instead of a structurally
+	// orphaned spawn. workDir is already absolute (ResolveWorkDirPathStrict
+	// returns through ResolveDirPath), so no further resolution is needed.
+	if err := workdirutil.ValidateAncestorWorktreesNotStale(workDir); err != nil {
 		return "", err
 	}
 	return resolveAgentDir(cityPath, workDir)

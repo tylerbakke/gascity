@@ -9,7 +9,37 @@ import (
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/session"
 )
+
+// sessionBeadAssigneeIdentities returns every identifier under which a work
+// bead could be assigned to this session: the session bead ID, session_name,
+// configured_named_identity, current alias, and any prior aliases preserved
+// in alias_history. Pool polecat aliases (e.g. "nux") are first-class
+// assignment identities, so leaving them out of orphan-detection causes
+// in-progress work to be reset under a live owner — see the
+// SkipsLiveSessionAssignedByAlias regression tests.
+func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
+	identities := make([]string, 0, 5)
+	if id := strings.TrimSpace(sb.ID); id != "" {
+		identities = append(identities, id)
+	}
+	if sn := strings.TrimSpace(sb.Metadata["session_name"]); sn != "" {
+		identities = append(identities, sn)
+	}
+	if ni := strings.TrimSpace(sb.Metadata["configured_named_identity"]); ni != "" {
+		identities = append(identities, ni)
+	}
+	if al := strings.TrimSpace(sb.Metadata["alias"]); al != "" {
+		identities = append(identities, al)
+	}
+	for _, prior := range session.AliasHistory(sb.Metadata) {
+		if prior = strings.TrimSpace(prior); prior != "" {
+			identities = append(identities, prior)
+		}
+	}
+	return identities
+}
 
 type releasedPoolAssignment struct {
 	ID    string
@@ -91,19 +121,13 @@ func releaseOrphanedPoolAssignments(
 	}
 
 	openIdentifiers := makeOpenSessionStoreRefIndex(cityPath, cfg, openSessionBeads, storeRefAware)
-	legacyOpenIdentifiers := make(map[string]struct{}, len(openSessionBeads)*3)
+	legacyOpenIdentifiers := make(map[string]struct{}, len(openSessionBeads)*5)
 	for _, sb := range openSessionBeads {
 		if sb.Status == "closed" {
 			continue
 		}
-		if id := strings.TrimSpace(sb.ID); id != "" {
+		for _, id := range sessionBeadAssigneeIdentities(sb) {
 			legacyOpenIdentifiers[id] = struct{}{}
-		}
-		if sn := strings.TrimSpace(sb.Metadata["session_name"]); sn != "" {
-			legacyOpenIdentifiers[sn] = struct{}{}
-		}
-		if ni := strings.TrimSpace(sb.Metadata["configured_named_identity"]); ni != "" {
-			legacyOpenIdentifiers[ni] = struct{}{}
 		}
 	}
 
@@ -168,7 +192,7 @@ func releaseOrphanedPoolAssignments(
 const unresolvedOpenSessionStoreRef = "\x00unresolved"
 
 func makeOpenSessionStoreRefIndex(cityPath string, cfg *config.City, openSessionBeads []beads.Bead, storeRefAware bool) map[string]map[string]struct{} {
-	index := make(map[string]map[string]struct{}, len(openSessionBeads)*3)
+	index := make(map[string]map[string]struct{}, len(openSessionBeads)*5)
 	if !storeRefAware {
 		return index
 	}
@@ -180,9 +204,9 @@ func makeOpenSessionStoreRefIndex(cityPath string, cfg *config.City, openSession
 		if !ok {
 			storeRef = unresolvedOpenSessionStoreRef
 		}
-		addOpenSessionStoreRef(index, sb.ID, storeRef)
-		addOpenSessionStoreRef(index, sb.Metadata["session_name"], storeRef)
-		addOpenSessionStoreRef(index, sb.Metadata["configured_named_identity"], storeRef)
+		for _, id := range sessionBeadAssigneeIdentities(sb) {
+			addOpenSessionStoreRef(index, id, storeRef)
+		}
 	}
 	return index
 }
@@ -289,10 +313,10 @@ func liveOpenSessionAssignmentExists(store beads.Store, assignee string) bool {
 		if sb.Status == "closed" || !isSessionBead(sb) {
 			continue
 		}
-		if assignee == strings.TrimSpace(sb.ID) ||
-			assignee == strings.TrimSpace(sb.Metadata["session_name"]) ||
-			assignee == strings.TrimSpace(sb.Metadata["configured_named_identity"]) {
-			return true
+		for _, id := range sessionBeadAssigneeIdentities(sb) {
+			if assignee == id {
+				return true
+			}
 		}
 	}
 	return false
@@ -304,11 +328,13 @@ func liveSessionBeadExistsByIdentity(store beads.Store, assignee string) bool {
 		if err != nil {
 			continue
 		}
-		if sb.Status != "closed" && isSessionBead(sb) &&
-			(assignee == strings.TrimSpace(sb.ID) ||
-				assignee == strings.TrimSpace(sb.Metadata["session_name"]) ||
-				assignee == strings.TrimSpace(sb.Metadata["configured_named_identity"])) {
-			return true
+		if sb.Status == "closed" || !isSessionBead(sb) {
+			continue
+		}
+		for _, candidate := range sessionBeadAssigneeIdentities(sb) {
+			if assignee == candidate {
+				return true
+			}
 		}
 	}
 	return false
