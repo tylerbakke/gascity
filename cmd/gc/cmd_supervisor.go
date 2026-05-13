@@ -978,14 +978,18 @@ func runSupervisor(stdout, stderr io.Writer) int {
 			}
 		case req := <-restartCityCh:
 			supervisorRec := supervisorEventRecorderForCity(registry, req.name, stderr)
-			dispatchRestartCity(req, registry, reconcileCh, supervisorRec, stderr)
-			// Run reconcile inline so the respawn happens before
-			// returning the reply to the client. The reconcile request
-			// queued by performCityRestart unblocks the next select
-			// cycle; calling safeReconcile here makes the contract
-			// "restart-city completes once the city is back" instead
-			// of "restart-city completes after queueing a reconcile".
-			safeReconcile()
+			// ci-iczpa: dispatchRestartCity must run reconcile *inside*
+			// the drain → respawn-wait sequence so the helper observes
+			// the city reappear in the registry before replying. Passing
+			// safeReconcile as the OnReconcile hook means reconcile runs
+			// on this same goroutine between drain and respawn-wait,
+			// then the helper polls the registry up to RespawnTimeout
+			// and surfaces a respawn_timeout error to the client when
+			// the respawn never lands. The trailing safeReconcile() that
+			// used to live here was a no-op for the reply path (the
+			// wire reply was already written by the time we got here),
+			// so removing it keeps the contract honest.
+			dispatchRestartCity(req, registry, reconcileCh, safeReconcile, supervisorRestartCityDefaultRespawnTimeout, supervisorRec, stderr)
 		case <-ctx.Done():
 			// Shutdown all cities. Collect under lock, then stop outside
 			// to avoid blocking API requests during graceful shutdown.

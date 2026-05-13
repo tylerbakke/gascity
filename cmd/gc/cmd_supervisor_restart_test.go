@@ -441,6 +441,129 @@ func TestPerformCityRestartTimeoutForces(t *testing.T) {
 	}
 }
 
+// TestPerformCityRestartReturnsRespawnTimeoutWhenCityNeverComesBack
+// guards ci-iczpa: production saw `gc supervisor restart-city` hang and
+// then exit 0 even though the controller had been drained and never
+// respawned. performCityRestart must surface a non-nil error when the
+// city does not reappear in the registry within RespawnTimeout so the
+// supervisor's main loop can propagate that as `error <message>` and
+// the CLI can exit non-zero.
+func TestPerformCityRestartReturnsRespawnTimeoutWhenCityNeverComesBack(t *testing.T) {
+	cr := newCityRegistry()
+	mc, _, _ := fakeManagedCity(t, "trader", false)
+	cr.Add("/trader", mc)
+
+	reconcileCh := make(chan reconcileRequest, 1)
+	rec := &collectingRecorder{}
+	binarySHA := func() (string, error) { return "sha", nil }
+
+	res, err := performCityRestart(performCityRestartParams{
+		Name:           "trader",
+		Force:          false,
+		Timeout:        2 * time.Second,
+		RespawnTimeout: 200 * time.Millisecond,
+		Registry:       cr,
+		ReconcileCh:    reconcileCh,
+		Recorder:       rec,
+		BinarySHA:      binarySHA,
+		Stderr:         io.Discard,
+	})
+	if err == nil {
+		t.Fatalf("performCityRestart err = nil, want respawn-timeout error")
+	}
+	if !strings.Contains(err.Error(), "respawn") {
+		t.Fatalf("err = %v, want it to mention respawn", err)
+	}
+	if !strings.Contains(err.Error(), "trader") {
+		t.Fatalf("err = %v, want it to mention the city name", err)
+	}
+	// Drain still ran — caller should be told whether the drain was
+	// graceful or forced so logs/events stay informative even when the
+	// respawn itself fails.
+	if res.DrainDur <= 0 {
+		t.Fatalf("res.DrainDur = %s, want positive — drain should still have run", res.DrainDur)
+	}
+}
+
+// TestPerformCityRestartSucceedsWhenCityRespawnsBeforeTimeout simulates
+// the supervisor's reconcile path bringing the controller back online
+// after the drain. performCityRestart must observe the new entry in the
+// registry and return success.
+func TestPerformCityRestartSucceedsWhenCityRespawnsBeforeTimeout(t *testing.T) {
+	cr := newCityRegistry()
+	mc, _, _ := fakeManagedCity(t, "trader", false)
+	cr.Add("/trader", mc)
+
+	reconcileCh := make(chan reconcileRequest, 1)
+	rec := &collectingRecorder{}
+	binarySHA := func() (string, error) { return "sha", nil }
+
+	// Simulate reconcile respawn: shortly after the drain begins,
+	// republish a fresh managedCity under the same name. The wait loop
+	// in performCityRestart must observe the new entry and return.
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		replacement, _, _ := fakeManagedCity(t, "trader", true)
+		cr.Add("/trader", replacement)
+	}()
+
+	res, err := performCityRestart(performCityRestartParams{
+		Name:           "trader",
+		Force:          false,
+		Timeout:        2 * time.Second,
+		RespawnTimeout: 2 * time.Second,
+		Registry:       cr,
+		ReconcileCh:    reconcileCh,
+		Recorder:       rec,
+		BinarySHA:      binarySHA,
+		Stderr:         io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("performCityRestart err = %v, want nil after respawn", err)
+	}
+	if res.Forced {
+		t.Fatalf("res.Forced = true, want false on graceful drain + respawn")
+	}
+	if !cr.Has("/trader") {
+		t.Fatalf("registry no longer has trader entry, but the respawn helper added one")
+	}
+}
+
+// TestRestartCitySupervisorSurfacesRespawnTimeoutToStderr exercises the
+// CLI client side of ci-iczpa: when the supervisor replies with an
+// `error respawn_timeout:` line, the CLI must exit non-zero and write
+// the operator-visible message to stderr (not stdout) so watchdogs and
+// human operators can see the failure.
+func TestRestartCitySupervisorSurfacesRespawnTimeoutToStderr(t *testing.T) {
+	gcHome := shortTempDir(t, "gc-home-")
+	runtimeDir := shortTempDir(t, "gc-run-")
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+
+	sockPath := filepath.Join(gcHome, "supervisor.sock")
+	startTestSupervisorSocket(t, sockPath, func(cmd string) string {
+		switch {
+		case cmd == "ping":
+			return "4242\n"
+		case strings.HasPrefix(cmd, "restart-city "):
+			return "error respawn_timeout: city \"trader\" did not respawn within 60s\n"
+		}
+		return ""
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := restartCitySupervisor(&stdout, &stderr, "trader", false, time.Minute)
+	if code != 1 {
+		t.Fatalf("restartCitySupervisor code = %d, want 1 for respawn_timeout", code)
+	}
+	if !strings.Contains(stderr.String(), "respawn_timeout") {
+		t.Fatalf("stderr = %q, want it to contain respawn_timeout", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "respawn_timeout") {
+		t.Fatalf("stdout = %q, error message must go to stderr, not stdout", stdout.String())
+	}
+}
+
 func TestPerformCityRestartLeavesSiblingsUntouched(t *testing.T) {
 	cr := newCityRegistry()
 	target, _, _ := fakeManagedCity(t, "trader", false)

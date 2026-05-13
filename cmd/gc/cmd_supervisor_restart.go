@@ -25,6 +25,20 @@ import (
 // reload reply timeout and gives in-flight polecat work time to wrap up.
 var supervisorRestartCityDefaultTimeout = 5 * time.Minute
 
+// supervisorRestartCityDefaultRespawnTimeout bounds how long
+// performCityRestart waits for the city to reappear in the registry
+// after reconcile has been triggered. ci-iczpa: without this guard the
+// CLI returned "ok" even when the controller never respawned, because
+// the wire reply was sent right after drain completed. Sixty seconds
+// matches the controller startup budget operators tolerate before
+// considering a respawn dead.
+var supervisorRestartCityDefaultRespawnTimeout = 60 * time.Second
+
+// supervisorRestartCityRespawnPollInterval bounds how aggressively the
+// wait loop scans the registry snapshot for a respawned city. Kept
+// short so respawn is observed quickly without dominating CPU.
+var supervisorRestartCityRespawnPollInterval = 50 * time.Millisecond
+
 // restartCityRequest is enqueued onto restartCityCh by the socket handler
 // and consumed by the supervisor's main loop. The reply channel returns
 // the helper's structured result so the socket handler can emit a
@@ -51,15 +65,29 @@ type restartCityResponse struct {
 // performCityRestartParams bundles the dependencies performCityRestart
 // needs so the helper is unit-testable without spinning up a real
 // supervisor / city goroutine.
+//
+// RespawnTimeout, when positive, makes performCityRestart wait for the
+// city to reappear in the registry after reconcile fires. A zero or
+// negative value skips the wait — convenient for unit tests that don't
+// model reconcile but want to exercise the drain path directly. The
+// production supervisor (dispatchRestartCity) always sets a positive
+// default so ci-iczpa cannot regress.
+//
+// OnReconcile lets the caller run reconcile synchronously between the
+// drain and the respawn wait. The supervisor's main loop runs reconcile
+// itself (its goroutine drives the whole loop), so it passes a closure
+// that invokes safeReconcile directly; tests can leave it nil.
 type performCityRestartParams struct {
-	Name        string
-	Force       bool
-	Timeout     time.Duration
-	Registry    *cityRegistry
-	ReconcileCh chan reconcileRequest
-	Recorder    events.Recorder
-	BinarySHA   func() (string, error)
-	Stderr      io.Writer
+	Name           string
+	Force          bool
+	Timeout        time.Duration
+	RespawnTimeout time.Duration
+	Registry       *cityRegistry
+	ReconcileCh    chan reconcileRequest
+	OnReconcile    func()
+	Recorder       events.Recorder
+	BinarySHA      func() (string, error)
+	Stderr         io.Writer
 }
 
 // performCityRestartResult is the success-path output of
@@ -146,16 +174,42 @@ func performCityRestart(params performCityRestartParams) (performCityRestartResu
 	drainDur := time.Since(drainStart)
 
 	// Trigger reconcile so the supervisor brings the city back up on
-	// the current on-disk binary. Non-blocking: a queued reconcile is
-	// already enough to re-cover the slot we vacated.
+	// the current on-disk binary. The queued reconcileRequest covers
+	// asynchronous callers; the inline OnReconcile hook lets the
+	// supervisor's main loop run reconcile right now (we are already
+	// holding the loop's goroutine, so a queued request would only be
+	// drained after we return — too late to verify the respawn).
 	if params.ReconcileCh != nil {
 		select {
 		case params.ReconcileCh <- reconcileRequest{}:
 		default:
 		}
 	}
+	if params.OnReconcile != nil {
+		params.OnReconcile()
+	}
 
 	newSHA, _ := params.BinarySHA()
+
+	// Wait for the controller to come back. ci-iczpa: production saw
+	// `restart-city` hang and silently exit 0 even though the city had
+	// been drained and never respawned. By waiting for the city to
+	// reappear in the registry (or the timeout to elapse), we can
+	// surface a respawn_timeout error so the CLI exits non-zero with
+	// a clear message instead of pretending success.
+	if params.RespawnTimeout > 0 {
+		if !waitForCityRespawn(params.Registry, params.Name, params.RespawnTimeout) {
+			return performCityRestartResult{
+					OldBinarySHA: oldSHA,
+					NewBinarySHA: newSHA,
+					DrainDur:     drainDur,
+					Forced:       forced,
+				}, fmt.Errorf(
+					"respawn_timeout: city %q did not respawn within %s after drain; check supervisor logs for init-failure backoff",
+					params.Name, params.RespawnTimeout,
+				)
+		}
+	}
 
 	if params.Recorder != nil {
 		payload, _ := json.Marshal(api.ControllerRestartPayload{
@@ -179,6 +233,39 @@ func performCityRestart(params performCityRestartParams) (performCityRestartResu
 		DrainDur:     drainDur,
 		Forced:       forced,
 	}, nil
+}
+
+// waitForCityRespawn polls the registry snapshot until a non-tombstoned
+// city with the given name appears or timeout elapses. Returns true on
+// observed respawn, false on timeout. Lock-free read path via the
+// atomic snapshot — safe to call concurrently with reconcile.
+func waitForCityRespawn(cr *cityRegistry, name string, timeout time.Duration) bool {
+	if cr == nil || timeout <= 0 {
+		return false
+	}
+	poll := supervisorRestartCityRespawnPollInterval
+	if poll <= 0 {
+		poll = 50 * time.Millisecond
+	}
+	if poll > timeout {
+		poll = timeout / 4
+		if poll <= 0 {
+			poll = time.Millisecond
+		}
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		snap := cr.Snapshot()
+		if snap != nil {
+			if view, ok := snap.byName[name]; ok && view != nil && !view.Tombstoned {
+				return true
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(poll)
+	}
 }
 
 // drainAndStopCity cancels the managed city's context, optionally waits
@@ -435,19 +522,30 @@ func supervisorEventRecorderForCity(cr *cityRegistry, name string, stderr io.Wri
 // main loop and writes the helper's response back to req.reply. Run
 // from the main reconcile loop so reconcile and restart serialize
 // (we never have a half-stopped city racing reconcile).
-func dispatchRestartCity(req restartCityRequest, cr *cityRegistry, reconcileCh chan reconcileRequest, rec events.Recorder, stderr io.Writer) {
+//
+// onReconcile is the closure the main loop uses to run reconcile
+// synchronously between the drain and the respawn wait. It must be
+// non-nil in production so ci-iczpa cannot regress; tests may pass nil
+// because they don't model the reconcile loop. respawnTimeout overrides
+// the default 60s wait window; pass <= 0 to use the package default.
+func dispatchRestartCity(req restartCityRequest, cr *cityRegistry, reconcileCh chan reconcileRequest, onReconcile func(), respawnTimeout time.Duration, rec events.Recorder, stderr io.Writer) {
 	if rec == nil {
 		rec = events.Discard
 	}
+	if respawnTimeout <= 0 {
+		respawnTimeout = supervisorRestartCityDefaultRespawnTimeout
+	}
 	res, err := performCityRestart(performCityRestartParams{
-		Name:        req.name,
-		Force:       req.force,
-		Timeout:     req.timeout,
-		Registry:    cr,
-		ReconcileCh: reconcileCh,
-		Recorder:    rec,
-		BinarySHA:   gcBinarySHA,
-		Stderr:      stderr,
+		Name:           req.name,
+		Force:          req.force,
+		Timeout:        req.timeout,
+		RespawnTimeout: respawnTimeout,
+		Registry:       cr,
+		ReconcileCh:    reconcileCh,
+		OnReconcile:    onReconcile,
+		Recorder:       rec,
+		BinarySHA:      gcBinarySHA,
+		Stderr:         stderr,
 	})
 	resp := restartCityResponse{
 		OldBinarySHA: res.OldBinarySHA,
