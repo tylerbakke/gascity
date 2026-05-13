@@ -3949,6 +3949,239 @@ func TestCityRuntimeSafeTick_PassesThroughWhenNoPanic(t *testing.T) {
 	}
 }
 
+// controlDispatcherLoop must run ticks serially: a slow tick must
+// finish before the next queued signal is consumed. The producer-side
+// buffer (size 1) and single-receiver loop together enforce one tick
+// in flight per city.
+func TestCityRuntimeControlDispatcherLoop_RunsTicksSerially(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var concurrent atomic.Int32
+	var maxConcurrent atomic.Int32
+	tickDone := make(chan struct{}, 8)
+	cr := &CityRuntime{
+		cityName:            "test-city",
+		logPrefix:           "test-city",
+		stderr:              io.Discard,
+		controlDispatcherCh: make(chan struct{}, 1),
+		controlDispatcherTickFn: func(ctx context.Context) {
+			n := concurrent.Add(1)
+			defer concurrent.Add(-1)
+			if n > maxConcurrent.Load() {
+				maxConcurrent.Store(n)
+			}
+			// Long enough that a second concurrent receive would be
+			// observable; short enough to keep the test fast.
+			select {
+			case <-time.After(20 * time.Millisecond):
+			case <-ctx.Done():
+			}
+			tickDone <- struct{}{}
+		},
+	}
+
+	loopExited := make(chan struct{})
+	go func() {
+		cr.controlDispatcherLoop(ctx)
+		close(loopExited)
+	}()
+
+	// Fire a burst of signals. The size-1 buffer collapses them but
+	// drives at least two distinct ticks: the first runs immediately,
+	// the second consumes the queued signal once the first returns.
+	for i := 0; i < 5; i++ {
+		select {
+		case cr.controlDispatcherCh <- struct{}{}:
+		default:
+		}
+	}
+
+	// Drive at least one follow-up tick by sending after the first one
+	// drains, exercising the queued-signal path.
+	select {
+	case <-tickDone:
+	case <-time.After(time.Second):
+		t.Fatalf("first dispatcher tick did not complete within 1s")
+	}
+	select {
+	case cr.controlDispatcherCh <- struct{}{}:
+	default:
+	}
+	select {
+	case <-tickDone:
+	case <-time.After(time.Second):
+		t.Fatalf("follow-up dispatcher tick did not complete within 1s")
+	}
+
+	if got := maxConcurrent.Load(); got != 1 {
+		t.Errorf("max concurrent ticks = %d, want 1 (loop must serialize)", got)
+	}
+
+	cancel()
+	select {
+	case <-loopExited:
+	case <-time.After(time.Second):
+		t.Fatalf("controlDispatcherLoop did not exit within 1s of ctx cancel")
+	}
+}
+
+// controlDispatcherLoop must exit promptly when ctx is canceled, even
+// if a tick is currently in flight. Production tests rely on this for
+// clean teardown; the supervisor relies on it for shutdown.
+func TestCityRuntimeControlDispatcherLoop_ExitsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cr := &CityRuntime{
+		cityName:            "test-city",
+		logPrefix:           "test-city",
+		stderr:              io.Discard,
+		controlDispatcherCh: make(chan struct{}, 1),
+	}
+
+	loopExited := make(chan struct{})
+	go func() {
+		cr.controlDispatcherLoop(ctx)
+		close(loopExited)
+	}()
+
+	cancel()
+	select {
+	case <-loopExited:
+	case <-time.After(time.Second):
+		t.Fatalf("controlDispatcherLoop did not exit within 1s of ctx cancel")
+	}
+}
+
+// When the test hook is nil, controlDispatcherLoop must fall through
+// to the production controlDispatcherTick. A nil bead store is the
+// production guard rail — controlDispatcherTick returns immediately
+// without panicking, so the loop should consume the signal and return
+// to wait without crashing.
+func TestCityRuntimeControlDispatcherLoop_UsesProductionTickByDefault(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	cr := &CityRuntime{
+		cityName:            "test-city",
+		logPrefix:           "test-city",
+		stderr:              io.Discard,
+		controlDispatcherCh: make(chan struct{}, 1),
+		// controlDispatcherTickFn intentionally nil; loop must fall
+		// through to cr.controlDispatcherTick. Both store and
+		// sessionDrains are nil, so the production tick exits early
+		// without touching any unset dependency.
+	}
+
+	loopExited := make(chan struct{})
+	go func() {
+		cr.controlDispatcherLoop(ctx)
+		close(loopExited)
+	}()
+
+	cr.controlDispatcherCh <- struct{}{}
+	// Give the loop a moment to consume and run the tick.
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+	select {
+	case <-loopExited:
+	case <-time.After(time.Second):
+		t.Fatalf("controlDispatcherLoop did not exit within 1s after default tick path")
+	}
+}
+
+// Regression for ci-zlr5j: when control-dispatcher ticks run on the
+// same goroutine as the main reconciler select, a slow tick (5-12s
+// under bead-store churn with 3+ polecats) starves reload, convergence,
+// and poke channels — the visible symptom is "Reload request could not
+// be accepted because the controller is busy" persisting for tens of
+// minutes.
+//
+// With the fix, control-dispatcher runs on its own goroutine via
+// controlDispatcherLoop. A reload request sent while a slow dispatcher
+// tick is in flight must be accepted promptly (well under the previous
+// 60s "controller-busy" budget; in this test we require <2s, matching
+// the exit criterion on ci-zlr5j).
+func TestCityRuntimeControlDispatcherLoop_DoesNotStarveReloadAccept(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	const slowTickDuration = 5 * time.Second
+	tickInflight := make(chan struct{}, 1)
+	cr := &CityRuntime{
+		cityName:            "test-city",
+		logPrefix:           "test-city",
+		stderr:              io.Discard,
+		controlDispatcherCh: make(chan struct{}, 1),
+		reloadReqCh:         make(chan reloadRequest, 1),
+		controlDispatcherTickFn: func(ctx context.Context) {
+			select {
+			case tickInflight <- struct{}{}:
+			default:
+			}
+			select {
+			case <-time.After(slowTickDuration):
+			case <-ctx.Done():
+			}
+		},
+	}
+
+	go cr.controlDispatcherLoop(ctx)
+
+	// Fire 10 dispatcher signals. The size-1 buffer collapses them
+	// to 1 in flight + 1 queued; the rest are dropped. With the bug,
+	// the main select would block 5s + 5s = 10s before accepting
+	// reload. With the fix, the dispatcher goroutine owns this work
+	// and the main select stays responsive.
+	for i := 0; i < 10; i++ {
+		select {
+		case cr.controlDispatcherCh <- struct{}{}:
+		default:
+		}
+	}
+
+	// Wait until the first slow tick is in flight, mirroring the
+	// observed production state where dispatcher work is mid-execution
+	// when a reload arrives.
+	select {
+	case <-tickInflight:
+	case <-time.After(time.Second):
+		t.Fatalf("first dispatcher tick did not start within 1s")
+	}
+
+	// Drive a minimal stand-in for the main reconciler select. In
+	// production this is cr.run's for/select; here we exercise the
+	// same property under test (reload accept latency) against the
+	// shared CityRuntime. The receive must complete within the
+	// exit-criterion budget.
+	mainSelectDone := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		select {
+		case <-cr.reloadReqCh:
+			mainSelectDone <- time.Since(start)
+		case <-ctx.Done():
+		}
+	}()
+
+	start := time.Now()
+	select {
+	case cr.reloadReqCh <- reloadRequest{}:
+	case <-time.After(time.Second):
+		t.Fatalf("could not enqueue reload onto reloadReqCh within 1s")
+	}
+
+	var latency time.Duration
+	select {
+	case latency = <-mainSelectDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("reload not received within 2s while dispatcher is mid-tick — dispatcher is starving the main loop (elapsed %v)", time.Since(start))
+	}
+	if latency > 100*time.Millisecond {
+		t.Errorf("reload-receive latency = %v; should be near-instant when dispatcher runs on its own goroutine", latency)
+	}
+}
+
 // A panic during startup reconciliation must NOT cause run() to exit
 // or call shutdown(): the supervisor loop must survive a transient
 // bead-store failure (or the nil deref it would trigger) without

@@ -93,12 +93,16 @@ type CityRuntime struct {
 	pokeCh              chan struct{}            // non-blocking signal to trigger immediate reconciler tick
 	controlDispatcherCh chan struct{}            // non-blocking signal for control-dispatcher-only reconcile
 	nudgeWakeCh         chan struct{}            // signal to dispatch queued nudges; fed by wake socket listener
-	activeReload        *reloadRequest
-	onStarted           func()
-	onStatus            func(string)
-	managedDoltHealth   func(string) error
-	managedDoltOwned    func(string) (bool, error)
-	managedDoltPort     func(string) string
+	// controlDispatcherTickFn overrides the dispatcher tick body for
+	// tests. Production code leaves it nil; controlDispatcherLoop falls
+	// through to cr.controlDispatcherTick.
+	controlDispatcherTickFn func(context.Context)
+	activeReload            *reloadRequest
+	onStarted               func()
+	onStatus                func(string)
+	managedDoltHealth       func(string) error
+	managedDoltOwned        func(string) (bool, error)
+	managedDoltPort         func(string) string
 
 	shutdownOnce             sync.Once
 	preserveSessionsShutdown atomic.Bool
@@ -560,6 +564,17 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Run the control-dispatcher loop on its own goroutine. Dispatcher
+	// ticks reconcile per-rig session beads and can take 5-12s under
+	// bead-store churn with 3+ active polecats. Wrapping them in safeTick
+	// on the main reconciler goroutine starves reload, convergence, and
+	// poke channels — the visible symptom is "Reload request could not
+	// be accepted because the controller is busy." Moving the work to
+	// its own goroutine keeps the main select responsive while preserving
+	// per-city tick serialization (one dispatcher tick at a time per
+	// city, because the loop owns the receive). See ci-zlr5j.
+	go cr.controlDispatcherLoop(ctx)
+
 	// Start the supervisor nudge dispatcher when configured. The wake-socket
 	// listener feeds nudgeWakeCh on every producer enqueue, giving sub-second
 	// dispatch latency. Patrol-tick fallback inside cr.tick() guarantees
@@ -585,10 +600,6 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			cr.safeTick(func() {
 				cr.nudgeDispatchTick(ctx)
 			}, "nudge-wake")
-		case <-cr.controlDispatcherCh:
-			cr.safeTick(func() {
-				cr.controlDispatcherTick(ctx)
-			}, "control-dispatcher")
 		case req := <-cr.reloadReqCh:
 			cr.safeTick(func() {
 				cr.handleReloadRequest(&req)
@@ -647,6 +658,45 @@ func (cr *CityRuntime) safeTick(fn func(), trigger string) (panicked bool) {
 	}()
 	fn()
 	return false
+}
+
+// controlDispatcherLoop drives control-dispatcher ticks on a dedicated
+// goroutine so they cannot starve the main reconciler loop's reload,
+// convergence, poke, or patrol channels.
+//
+// Why this is a separate goroutine: control-dispatcher work is a
+// per-rig reconcile (buildDesiredStateWithSessionBeads + bead sync +
+// pool reconcile) that takes 5-12s under bead-store churn with 3+
+// active polecats. The main reconciler loop's select is single-threaded
+// over a half-dozen channels; running dispatcher ticks inline blocks
+// reload accept for the duration of the tick, which manifests
+// operationally as "Reload request could not be accepted because the
+// controller is busy" persisting for tens of minutes. Moving the work
+// off-loop fixes the starvation without changing the dispatcher's
+// per-city tick serialization (one in flight at a time, naturally
+// enforced by the single-receiver loop).
+//
+// The controlDispatcherCh buffer is size 1, so producer bursts collapse
+// to at most one queued signal in addition to whatever is currently
+// running — the loop never accumulates a backlog.
+//
+// The loop exits when ctx is canceled. Panics inside the tick body are
+// recovered by safeTick and logged to stderr, mirroring the main loop's
+// swallow-and-continue behavior so a single transient store failure
+// cannot terminate dispatcher reconciliation.
+func (cr *CityRuntime) controlDispatcherLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-cr.controlDispatcherCh:
+			fn := cr.controlDispatcherTickFn
+			if fn == nil {
+				fn = cr.controlDispatcherTick
+			}
+			cr.safeTick(func() { fn(ctx) }, "control-dispatcher")
+		}
+	}
 }
 
 func convergenceStartupComplete(cr *CityRuntime) bool {
