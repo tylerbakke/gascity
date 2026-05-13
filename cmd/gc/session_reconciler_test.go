@@ -1889,6 +1889,180 @@ func TestReconcileSessionBeads_OnDemandNamedSessionWakesFromRoutedSingletonTempl
 	}
 }
 
+// TestReconcileSessionBeads_OnDemandNamedSessionWakesFromPolecatHandoff exercises
+// the worker→named-session handoff: a ready work bead with both
+// assignee=identity and gc.routed_to=identity must wake an asleep canonical
+// on-demand session whose prior sleep_reason was a deliberate marker like
+// "city-stop".
+func TestReconcileSessionBeads_OnDemandNamedSessionWakesFromPolecatHandoff(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "refinery",
+			StartCommand:      "true",
+			MaxActiveSessions: intPtr(1),
+			WorkQuery:         "printf ''",
+		}},
+		NamedSessions: []config.NamedSession{{Template: "refinery", Mode: "on_demand"}},
+	}
+	identity := "refinery"
+	sessionName := config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, identity)
+
+	woken, running := reconcileAsleepNamedSessionWithHandoffWork(t, cfg, sessionName, identity, handoffWorkOpts{
+		Assignee:    identity,
+		RoutedTo:    identity,
+		SleepReason: "city-stop",
+	})
+	if woken != 1 {
+		t.Fatalf("woken = %d, want 1 (refinery did not wake on polecat→refinery handoff)", woken)
+	}
+	if !running {
+		t.Fatal("on-demand refinery was not started from polecat→refinery handoff demand")
+	}
+}
+
+// TestReconcileSessionBeads_OnDemandNamedSessionWakesFromHandoffWithScaleCheck
+// covers the handoff when the named-session-backing agent has a custom
+// scale_check configured. The wake must come from the routed/assigned bead
+// itself, not from the scale_check result (which here returns 0).
+func TestReconcileSessionBeads_OnDemandNamedSessionWakesFromHandoffWithScaleCheck(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "refinery",
+			StartCommand:      "true",
+			MaxActiveSessions: intPtr(1),
+			WorkQuery:         "printf ''",
+			ScaleCheck:        "printf 0",
+		}},
+		NamedSessions: []config.NamedSession{{Template: "refinery", Mode: "on_demand"}},
+	}
+	identity := "refinery"
+	sessionName := config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, identity)
+
+	woken, running := reconcileAsleepNamedSessionWithHandoffWork(t, cfg, sessionName, identity, handoffWorkOpts{
+		Assignee:    identity,
+		RoutedTo:    identity,
+		SleepReason: "city-stop",
+	})
+	if woken != 1 {
+		t.Fatalf("woken = %d, want 1 with scale_check (refinery did not wake on handoff)", woken)
+	}
+	if !running {
+		t.Fatal("on-demand refinery with scale_check was not started from handoff demand")
+	}
+}
+
+// TestReconcileSessionBeads_OnDemandNamedSessionWakesFromRoutedToOnlyWithAssignee
+// covers the case where the bead's assignee points to some other agent
+// (e.g. a worker that crashed mid-handoff) but gc.routed_to points to the
+// named session. gc.routed_to must be honored as a wake signal even when
+// bead.assignee does not match the named identity.
+func TestReconcileSessionBeads_OnDemandNamedSessionWakesFromRoutedToOnlyWithAssignee(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "refinery",
+			StartCommand:      "true",
+			MaxActiveSessions: intPtr(1),
+			WorkQuery:         "printf ''",
+		}},
+		NamedSessions: []config.NamedSession{{Template: "refinery", Mode: "on_demand"}},
+	}
+	identity := "refinery"
+	sessionName := config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, identity)
+
+	// Bead is assigned to a stale polecat ID but routed_to refinery.
+	woken, running := reconcileAsleepNamedSessionWithHandoffWork(t, cfg, sessionName, identity, handoffWorkOpts{
+		Assignee:    "stale-polecat-session-id",
+		RoutedTo:    identity,
+		SleepReason: "city-stop",
+	})
+	if woken != 1 {
+		t.Fatalf("woken = %d, want 1 (refinery did not wake on routed_to-only demand with stale assignee)", woken)
+	}
+	if !running {
+		t.Fatal("on-demand refinery was not started from routed_to demand when bead had stale assignee")
+	}
+}
+
+type handoffWorkOpts struct {
+	Assignee    string
+	RoutedTo    string
+	SleepReason string
+}
+
+func reconcileAsleepNamedSessionWithHandoffWork(t *testing.T, cfg *config.City, sessionName, identity string, opts handoffWorkOpts) (int, bool) {
+	t.Helper()
+
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	clk := &clock.Fake{Time: time.Date(2026, 5, 12, 12, 0, 0, 0, time.UTC)}
+	sp := runtime.NewFake()
+	workMeta := map[string]string{}
+	if opts.RoutedTo != "" {
+		workMeta["gc.routed_to"] = opts.RoutedTo
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:    "polecat handoff work",
+		Type:     "task",
+		Status:   "open",
+		Assignee: opts.Assignee,
+		Metadata: workMeta,
+	}); err != nil {
+		t.Fatalf("Create(work): %v", err)
+	}
+	sleepReason := opts.SleepReason
+	if sleepReason == "" {
+		sleepReason = "city-stop"
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  sessionName,
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":               sessionName,
+			"alias":                      identity,
+			"template":                   cfg.NamedSessions[0].Template,
+			"state":                      "asleep",
+			"sleep_reason":               sleepReason,
+			"generation":                 "1",
+			"instance_token":             "canonical-token",
+			namedSessionMetadataKey:      "true",
+			namedSessionIdentityMetadata: identity,
+			namedSessionModeMetadata:     "on_demand",
+		},
+	}); err != nil {
+		t.Fatalf("Create(session): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	dsResult := buildDesiredState(cfg.EffectiveCityName(), cityPath, clk.Now().UTC(), cfg, sp, store, &stderr)
+	if !dsResult.NamedSessionDemand[identity] {
+		t.Fatalf("NamedSessionDemand[%s] = false for assignee=%s routed_to=%s; stderr:\n%s",
+			identity, opts.Assignee, opts.RoutedTo, stderr.String())
+	}
+	cfgNames := configuredSessionNames(cfg, cfg.EffectiveCityName(), store)
+	syncSessionBeads(cityPath, store, dsResult.State, sp, cfgNames, cfg, clk, &stderr, true)
+	sessions, err := loadSessionBeads(store)
+	if err != nil {
+		t.Fatalf("loadSessionBeads: %v", err)
+	}
+	poolDesired := PoolDesiredCounts(ComputePoolDesiredStates(cfg, dsResult.AssignedWorkBeads, sessions, dsResult.ScaleCheckCounts))
+	if poolDesired == nil {
+		poolDesired = make(map[string]int)
+	}
+	mergeNamedSessionDemand(poolDesired, dsResult.NamedSessionDemand, cfg)
+
+	woken := reconcileSessionBeadsAtPathWithNamedDemand(
+		context.Background(), cityPath, sessions, dsResult.State, cfgNames, cfg, sp,
+		store, nil, dsResult.AssignedWorkBeads, nil, nil, newDrainTracker(), poolDesired,
+		dsResult.NamedSessionDemand, dsResult.StoreQueryPartial, nil, cfg.EffectiveCityName(),
+		nil, clk, events.Discard, 0, 0, &stdout, &stderr,
+	)
+	return woken, sp.IsRunning(sessionName)
+}
+
 func reconcileExistingAsleepNamedSessionWithRoutedWork(t *testing.T, cfg *config.City, sessionName, identity, routedTo string) (int, bool) {
 	t.Helper()
 

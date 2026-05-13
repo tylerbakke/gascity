@@ -275,9 +275,17 @@ func buildDesiredStateWithSessionBeads(
 			// creates ephemeral capacity through the pool pipeline. The implicit
 			// routed-work scale_check feeds named demand separately so it does
 			// not create a parallel generic worker for the same backing template.
+			//
+			// defaultNamedSessionDemand must run for every named-session-backing
+			// agent (not only those without a scale_check) so that a handoff with
+			// gc.routed_to=<identity> wakes the named session even when the
+			// agent's own scale_check returns 0 — e.g. because it counts only
+			// unassigned routed work and the handoff just set assignee=<identity>.
 			poolDir := agentCommandDir(cityPath, &cfg.Agents[i], cfg.Rigs)
-			if store != nil && strings.TrimSpace(cfg.Agents[i].ScaleCheck) == "" {
+			if store != nil {
 				defaultNamedScaleTargets = append(defaultNamedScaleTargets, defaultScaleCheckTargetForAgent(cityPath, cfg, &cfg.Agents[i], store, rigStores))
+			}
+			if strings.TrimSpace(cfg.Agents[i].ScaleCheck) == "" {
 				continue
 			}
 			pendingPools = append(pendingPools, poolEvalWork{agentIdx: i, sp: sp, poolDir: poolDir, newDemand: store != nil})
@@ -955,11 +963,27 @@ func defaultNamedSessionDemand(targets []defaultScaleCheckTarget, cfg *config.Ci
 			}
 		}
 		for _, b := range ready {
-			if strings.TrimSpace(b.Assignee) != "" {
-				continue
-			}
+			// gc.routed_to is the authoritative wake signal for named on-demand
+			// sessions and is honored regardless of bead.assignee. Without this,
+			// a worker→named-session handoff that sets both assignee=<identity>
+			// and gc.routed_to=<identity> on the same bead would be missed when
+			// the legacy assignee-empty filter dropped it.
 			routedTo := strings.TrimSpace(b.Metadata["gc.routed_to"])
+			assignee := strings.TrimSpace(b.Assignee)
 			if routedTo == "" {
+				// Fall back to assignee-only routing: if the bead is assigned
+				// directly to a named identity (no routed_to metadata set), that
+				// is also a valid wake signal — common when a caller dispatches
+				// directly to a named session.
+				if assignee == "" {
+					continue
+				}
+				if spec, ok := namedByIdentity[assignee]; ok {
+					template := strings.TrimSpace(namedSessionBackingTemplate(spec))
+					if _, targetTemplate := group.templates[template]; targetTemplate {
+						demand[spec.Identity] = true
+					}
+				}
 				continue
 			}
 			if spec, ok := namedByIdentity[routedTo]; ok {
