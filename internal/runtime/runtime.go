@@ -119,8 +119,9 @@ type Provider interface {
 	// exist. Used for graceful shutdown before Stop.
 	Interrupt(name string) error
 
-	// IsRunning reports whether the named session exists and has a
-	// live process.
+	// IsRunning reports whether the named provider runtime exists. It does not
+	// prove that the configured agent process is alive; callers that need that
+	// distinction should use ObserveLiveness or ProcessAlive.
 	IsRunning(name string) bool
 
 	// IsAttached reports whether a user terminal is currently connected
@@ -139,7 +140,11 @@ type Provider interface {
 
 	// Nudge sends structured content to the named session to wake or
 	// redirect the agent. Returns nil if the session does not exist
-	// (best-effort). Use [TextContent] to wrap a plain string.
+	// and the provider can safely treat that as a best-effort no-op.
+	// Providers that can observe a live session without owning the
+	// delivery channel return [ErrSessionNotFound] so callers do not
+	// mistake a no-op for delivery. Use [TextContent] to wrap a plain
+	// string.
 	Nudge(name string, content []ContentBlock) error
 
 	// SetMeta stores a key-value pair associated with the named session.
@@ -378,6 +383,14 @@ func hashPathContentSkipEntry(d fs.DirEntry) bool {
 	return strings.HasSuffix(base, "~")
 }
 
+// Lifecycle describes the expected lifetime of a runtime command.
+type Lifecycle string
+
+const (
+	// LifecycleOneShot marks commands that are expected to do bounded work and exit.
+	LifecycleOneShot Lifecycle = "one_shot"
+)
+
 // Config holds the parameters for starting a new session.
 type Config struct {
 	// WorkDir is the working directory for the session process.
@@ -386,6 +399,10 @@ type Config struct {
 	// Command is the shell command to run in the session.
 	// If empty, a default shell is started.
 	Command string
+
+	// Lifecycle describes whether the command is long-lived or expected to
+	// exit after one turn. Empty means the default long-lived session lifecycle.
+	Lifecycle Lifecycle
 
 	// Env is additional environment variables set in the session.
 	Env map[string]string
@@ -407,6 +424,10 @@ type Config struct {
 
 	// EmitsPermissionWarning is true if the agent shows a bypass-permissions dialog.
 	EmitsPermissionWarning bool
+
+	// AcceptStartupDialogs overrides automatic startup dialog handling.
+	// Nil keeps the runtime default derived from other startup hints.
+	AcceptStartupDialogs *bool
 
 	// Nudge is text typed into the session after the agent is ready.
 	// Used for CLI agents that don't accept command-line prompts.

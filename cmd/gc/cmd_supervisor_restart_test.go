@@ -631,7 +631,7 @@ func TestHandleSupervisorConnRestartCity(t *testing.T) {
 		if err != nil {
 			return
 		}
-		handleSupervisorConn(conn, func(supervisorShutdownMode) {}, nil, restartCh, nil)
+		handleSupervisorConn(conn, func(supervisorShutdownMode, shutdownTrigger) bool { return false }, nil, restartCh, nil)
 	}()
 
 	// Stub the responder: pretend the supervisor's main loop processed

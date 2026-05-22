@@ -11,6 +11,8 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
+const formulaFilesystemSearchGuidance = "**Never use wide filesystem searches when a CLI command exists.**"
+
 func TestRenderPromptEmptyPath(t *testing.T) {
 	f := fsys.NewFake()
 	got := renderPrompt(f, "/city", "", "", PromptContext{}, "", io.Discard, nil, nil, nil)
@@ -424,6 +426,45 @@ Binding: {{ .BindingName }} {{ .BindingPrefix }}
 	}
 }
 
+func TestRenderPromptBindingPrefixReachesTemplate(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/peer.template.md"] = []byte("peer={{ .RigName }}/{{ .BindingPrefix }}worker\nbinding={{ .BindingName }}\n")
+	cases := []struct {
+		name string
+		ctx  PromptContext
+		want string
+	}{
+		{
+			name: "bound",
+			ctx: PromptContext{
+				BindingName:   "gastown",
+				BindingPrefix: "gastown.",
+				RigName:       "demo",
+			},
+			want: "peer=demo/gastown.worker\nbinding=gastown\n",
+		},
+		{
+			name: "unbound",
+			ctx: PromptContext{
+				RigName: "demo",
+			},
+			want: "peer=demo/worker\nbinding=\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr strings.Builder
+			got := renderPrompt(f, "/city", "", "prompts/peer.template.md", tc.ctx, "", &stderr, nil, nil, nil)
+			if stderr.Len() > 0 {
+				t.Fatalf("renderPrompt stderr: %s", stderr.String())
+			}
+			if got != tc.want {
+				t.Errorf("renderPrompt() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRenderPromptWorkQuery(t *testing.T) {
 	f := fsys.NewFake()
 	f.Files["/city/prompts/test.md.tmpl"] = []byte("Work: {{ .WorkQuery }}")
@@ -722,6 +763,45 @@ func TestRenderPromptMaintenanceDogPromptHasRequiredSharedTemplates(t *testing.T
 	}
 	if !strings.Contains(got, "Following Your Formula") {
 		t.Fatalf("rendered prompt missing following-mol fragment:\n%s", got)
+	}
+	if !strings.Contains(got, formulaFilesystemSearchGuidance) {
+		t.Fatalf("rendered prompt missing filesystem search guidance:\n%s", got)
+	}
+}
+
+func TestFormulaFilesystemSearchGuidanceCoversPromptSources(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("filepath.Abs(repo root): %v", err)
+	}
+
+	paths := []string{
+		"examples/gastown/packs/gastown/template-fragments/following-mol.template.md",
+		"examples/gastown/packs/maintenance/template-fragments/following-mol.template.md",
+		"internal/bootstrap/packs/core/assets/prompts/pool-worker.md",
+		"internal/bootstrap/packs/core/assets/prompts/graph-worker.md",
+	}
+	for _, rel := range paths {
+		t.Run(rel, func(t *testing.T) {
+			path := filepath.Join(repoRoot, rel)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("os.ReadFile(%s): %v", path, err)
+			}
+			text := string(data)
+			for _, want := range []string{
+				formulaFilesystemSearchGuidance,
+				"`find /`",
+				"`find ~`",
+				"`find /Users`",
+				"`find $HOME`",
+				"`gc` / `bd`",
+			} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("%s missing %q", rel, want)
+				}
+			}
+		})
 	}
 }
 

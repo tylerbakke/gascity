@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/processgroup"
 	"github.com/gastownhall/gascity/internal/searchpath"
 	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/spf13/cobra"
@@ -326,40 +327,11 @@ func supervisorProcessEnvMap(data []byte) map[string]string {
 }
 
 func terminateProcessGroup(pgid int, timeout time.Duration) error {
-	if pgid <= 1 || pgid == supervisorGetpgrp() {
-		return fmt.Errorf("refusing to signal unsafe process group %d", pgid)
-	}
-	if err := supervisorKill(-pgid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
-	}
-	if err := waitForProcessGroupExit(pgid, timeout); err == nil {
-		return nil
-	}
-	if err := supervisorKill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
-	}
-	return waitForProcessGroupExit(pgid, timeout)
-}
-
-func waitForProcessGroupExit(pgid int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		if !processGroupAlive(pgid) {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("process group %d did not exit within %s", pgid, timeout)
-		}
-		time.Sleep(supervisorProcessGroupPollPeriod)
-	}
-}
-
-func processGroupAlive(pgid int) bool {
-	if pgid <= 0 {
-		return false
-	}
-	err := supervisorKill(-pgid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	return processgroup.Terminate(pgid, timeout, processgroup.Options{
+		Kill:           supervisorKill,
+		CurrentGroupID: supervisorGetpgrp,
+		PollPeriod:     supervisorProcessGroupPollPeriod,
+	})
 }
 
 func newSupervisorRunCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -418,6 +390,10 @@ func defaultSupervisorBeadsActor() {
 }
 
 func doSupervisorStart(stdout, stderr io.Writer) int {
+	return doSupervisorStartJSON(stdout, stderr, false)
+}
+
+func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 	if msg, blocked := platformSupervisorHomeOverrideError(); blocked {
 		fmt.Fprintf(stderr, "gc supervisor start: %s\n", msg) //nolint:errcheck // best-effort stderr
 		return 1
@@ -467,6 +443,14 @@ func doSupervisorStart(stdout, stderr io.Writer) int {
 	deadline := time.Now().Add(supervisorReadyTimeout)
 	for time.Now().Before(deadline) {
 		if pid := supervisorAliveHook(); pid != 0 {
+			if jsonOut {
+				return writeLifecycleActionJSONOrExit(stdout, stderr, "gc supervisor start", lifecycleActionJSON{
+					Command:       "supervisor start",
+					Action:        "start",
+					Message:       "Supervisor started.",
+					SupervisorPID: pid,
+				})
+			}
 			fmt.Fprintf(stdout, "Supervisor started (PID %d)\n", pid) //nolint:errcheck // best-effort stdout
 			return 0
 		}
@@ -816,11 +800,91 @@ var supervisorServiceEnvKeys = map[string]bool{
 	"XDG_STATE_HOME":                           true,
 }
 
+// providerCredentialEnvPrefixes lists provider-specific env-var name prefixes
+// whose values are treated as agent-provider credentials and forwarded into
+// the supervisor's persistent env (launchd plist / systemd unit) and into
+// spawned agent processes. The same predicate gates the global baseline in
+// cmd_start.go: the SDK cannot know which agent uses which provider (zero
+// hardcoded roles), so credentials for any known provider are passed through,
+// and the trust boundary is the managed session itself.
+//
+// The list is curated, not auto-discovered: the supervisor's persistent env has
+// a bounded size (launchd plists in particular), so we only forward prefixes
+// belonging to provider-owned namespaces. Broad ecosystems such as AWS use
+// exact names in providerCredentialEnvKeys to avoid persisting unrelated
+// tooling/runtime state. Users with niche or in-house providers can opt in via
+// GC_SUPERVISOR_ENV.
+//
+// Keep alphabetised. Documented providers (with the env vars they typically
+// use):
+//
+//	ANTHROPIC_   Anthropic / Claude (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, ...)
+//	AZURE_       Azure OpenAI (AZURE_OPENAI_API_KEY, AZURE_OPENAI_BASE_URL,
+//	             AZURE_OPENAI_API_VERSION, AZURE_OPENAI_ENDPOINT, ...)
+//	CEREBRAS_    Cerebras (CEREBRAS_API_KEY)
+//	COHERE_      Cohere (COHERE_API_KEY)
+//	DEEPSEEK_    DeepSeek (DEEPSEEK_API_KEY)
+//	FIREWORKS_   Fireworks AI (FIREWORKS_API_KEY)
+//	GEMINI_      Google Gemini direct API (GEMINI_API_KEY)
+//	GOOGLE_      Google Cloud / Vertex (GOOGLE_API_KEY,
+//	             GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, ...)
+//	GROQ_        Groq (GROQ_API_KEY)
+//	MISTRAL_     Mistral (MISTRAL_API_KEY)
+//	OLLAMA_      Ollama local (OLLAMA_API_KEY, OLLAMA_HOST, OLLAMA_BASE_URL)
+//	OPENAI_      OpenAI (OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_API_VERSION)
+//	OPENROUTER_  OpenRouter (OPENROUTER_API_KEY)
+//	TOGETHER_    Together AI (TOGETHER_API_KEY)
+//	VERTEX_      Vertex AI direct (VERTEX_PROJECT_ID, VERTEX_LOCATION, ...)
+//	XAI_         xAI / Grok (XAI_API_KEY)
 var providerCredentialEnvPrefixes = []string{
 	"ANTHROPIC_",
+	"AZURE_",
+	"CEREBRAS_",
+	"COHERE_",
+	"DEEPSEEK_",
+	"FIREWORKS_",
 	"GEMINI_",
 	"GOOGLE_",
+	"GROQ_",
+	"MISTRAL_",
+	"OLLAMA_",
 	"OPENAI_",
+	"OPENROUTER_",
+	"TOGETHER_",
+	"VERTEX_",
+	"XAI_",
+}
+
+// providerCredentialEnvKeys lists exact provider credential/config env vars for
+// providers whose common env namespace is broader than provider auth.
+//
+// AWS Bedrock uses standard AWS SDK credential and configuration env vars, but
+// the AWS_ prefix also covers unrelated CLI, CI, pager, runtime, and container
+// metadata state. Keep this exact list bounded to the keys agents need for
+// Bedrock auth/config; users can opt in additional keys through
+// GC_SUPERVISOR_ENV.
+var providerCredentialEnvKeys = map[string]bool{
+	"AWS_ACCESS_KEY_ID":                      true,
+	"AWS_BEARER_TOKEN_BEDROCK":               true,
+	"AWS_CA_BUNDLE":                          true,
+	"AWS_CONFIG_FILE":                        true,
+	"AWS_CONTAINER_AUTHORIZATION_TOKEN":      true,
+	"AWS_CONTAINER_CREDENTIALS_FULL_URI":     true,
+	"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": true,
+	"AWS_DEFAULT_REGION":                     true,
+	"AWS_EC2_METADATA_DISABLED":              true,
+	"AWS_ENDPOINT_URL":                       true,
+	"AWS_ENDPOINT_URL_BEDROCK":               true,
+	"AWS_PROFILE":                            true,
+	"AWS_REGION":                             true,
+	"AWS_ROLE_ARN":                           true,
+	"AWS_SDK_LOAD_CONFIG":                    true,
+	"AWS_SECRET_ACCESS_KEY":                  true,
+	"AWS_SESSION_TOKEN":                      true,
+	"AWS_SHARED_CREDENTIALS_FILE":            true,
+	"AWS_USE_DUALSTACK_ENDPOINT":             true,
+	"AWS_USE_FIPS_ENDPOINT":                  true,
+	"AWS_WEB_IDENTITY_TOKEN_FILE":            true,
 }
 
 var supervisorServiceFixedEnvKeys = map[string]bool{
@@ -900,6 +964,9 @@ func shouldPersistSupervisorEnv(key string) bool {
 }
 
 func isProviderCredentialEnv(key string) bool {
+	if providerCredentialEnvKeys[key] {
+		return true
+	}
 	for _, prefix := range providerCredentialEnvPrefixes {
 		if strings.HasPrefix(key, prefix) {
 			return true

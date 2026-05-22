@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -1501,6 +1502,144 @@ func TestRequireWorkflowServeFollowSessionEnvAllowsManagedSession(t *testing.T) 
 	}
 }
 
+func TestRunWorkflowServeReturnsControlErrorWithoutQuarantine(t *testing.T) {
+	clearInheritedBeadsEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	cityDir := t.TempDir()
+	cleanupManagedDoltTestCity(t, cityDir)
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n\n[daemon]\nformula_v2 = true\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+
+	prevCityFlag := cityFlag
+	prevList := workflowServeList
+	prevControl := controlDispatcherServe
+	prevInterval := workflowServeIdlePollInterval
+	prevAttempts := workflowServeIdlePollAttempts
+	cityFlag = ""
+	workflowServeIdlePollInterval = 0
+	workflowServeIdlePollAttempts = 0
+	t.Cleanup(func() {
+		cityFlag = prevCityFlag
+		workflowServeList = prevList
+		controlDispatcherServe = prevControl
+		workflowServeIdlePollInterval = prevInterval
+		workflowServeIdlePollAttempts = prevAttempts
+	})
+
+	calls := 0
+	var controlled []string
+	retryableErr := errors.New("source store temporarily unavailable")
+	workflowServeList = func(_, _ string, _ map[string]string) ([]hookBead, error) {
+		calls++
+		if calls == 1 {
+			return []hookBead{
+				{ID: "gc-ctrl-bad", Metadata: map[string]string{"gc.kind": "fanout"}},
+				{ID: "gc-ctrl-good", Metadata: map[string]string{"gc.kind": "scope-check"}},
+			}, nil
+		}
+		return nil, nil
+	}
+	controlDispatcherServe = func(_, _ string, beadID string, _ io.Writer, _ io.Writer) error {
+		controlled = append(controlled, beadID)
+		if beadID == "gc-ctrl-bad" {
+			return retryableErr
+		}
+		return nil
+	}
+
+	err := runWorkflowServe("", false, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("runWorkflowServe err = nil, want retryable control error")
+	}
+	if !strings.Contains(err.Error(), "processing control bead gc-ctrl-bad") || !errors.Is(err, retryableErr) {
+		t.Fatalf("runWorkflowServe err = %v, want wrapped retryable control error", err)
+	}
+	if !slices.Equal(controlled, []string{"gc-ctrl-bad"}) {
+		t.Fatalf("controlled beads = %#v, want stop at retryable bad bead", controlled)
+	}
+}
+
+func TestQuarantineControlGraphBeadClosesWithDiagnostics(t *testing.T) {
+	store := beads.NewMemStore()
+	control, err := store.Create(beads.Bead{
+		Title:  "control",
+		Status: "open",
+		Labels: []string{"gc:control"},
+		Metadata: map[string]string{
+			"gc.kind": "fanout",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+
+	if err := quarantineControlGraphBead(store, control.ID, fmt.Errorf("bad workflow")); err != nil {
+		t.Fatalf("quarantineControlGraphBead: %v", err)
+	}
+
+	got, err := store.Get(control.ID)
+	if err != nil {
+		t.Fatalf("get control: %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("status = %q, want closed", got.Status)
+	}
+	if got.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("outcome = %q, want fail", got.Metadata["gc.outcome"])
+	}
+	if got.Metadata["gc.failure_class"] != "hard" {
+		t.Fatalf("failure_class = %q, want hard", got.Metadata["gc.failure_class"])
+	}
+	if got.Metadata["gc.failure_reason"] != "malformed_control_graph" {
+		t.Fatalf("failure_reason = %q, want malformed_control_graph", got.Metadata["gc.failure_reason"])
+	}
+	if got.Metadata["gc.control_quarantined"] != "true" {
+		t.Fatalf("control_quarantined = %q, want true", got.Metadata["gc.control_quarantined"])
+	}
+	if !strings.Contains(got.Metadata["gc.control_quarantine_reason"], "bad workflow") {
+		t.Fatalf("control_quarantine_reason = %q, want bad workflow", got.Metadata["gc.control_quarantine_reason"])
+	}
+	if got.Metadata["gc.control_quarantined_at"] == "" {
+		t.Fatal("control_quarantined_at is empty")
+	}
+	if !slices.Contains(got.Labels, "gc:control-quarantined") {
+		t.Fatalf("labels = %#v, want gc:control-quarantined", got.Labels)
+	}
+}
+
+func TestQuarantineControlGraphBeadTruncatesReasonAtUTF8Boundary(t *testing.T) {
+	store := beads.NewMemStore()
+	control, err := store.Create(beads.Bead{
+		Title:  "control",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.kind": "fanout",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+	reason := strings.Repeat("a", maxControlQuarantineReasonMetadata-1) + "é tail"
+
+	if err := quarantineControlGraphBead(store, control.ID, errors.New(reason)); err != nil {
+		t.Fatalf("quarantineControlGraphBead: %v", err)
+	}
+
+	got, err := store.Get(control.ID)
+	if err != nil {
+		t.Fatalf("get control: %v", err)
+	}
+	recorded := got.Metadata["gc.control_quarantine_reason"]
+	if len(recorded) > maxControlQuarantineReasonMetadata {
+		t.Fatalf("recorded reason length = %d, want <= %d", len(recorded), maxControlQuarantineReasonMetadata)
+	}
+	if !utf8.ValidString(recorded) {
+		t.Fatalf("recorded reason is invalid UTF-8: %q", recorded)
+	}
+}
+
 func TestRunWorkflowServeRoutesTraceOpenWarningsToCommandStderr(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
@@ -1808,7 +1947,7 @@ func TestRunControlDispatcherWithStoreRoutesRalphTraceWarningToStderr(t *testing
 			"gc.attempt":         "1",
 			"gc.step_ref":        "implement.check.1",
 			"gc.check_mode":      "exec",
-			"gc.check_path":      checkPath,
+			"gc.check_path":      "pass-check.sh",
 			"gc.check_timeout":   "30s",
 			"gc.max_attempts":    "1",
 			"gc.root_bead_id":    workflow.ID,
@@ -1912,7 +2051,7 @@ func TestRunControlDispatcherWithStoreWarnsOnLegacyTracePath(t *testing.T) {
 			"gc.attempt":         "1",
 			"gc.step_ref":        "implement.check.1",
 			"gc.check_mode":      "exec",
-			"gc.check_path":      checkPath,
+			"gc.check_path":      "pass-check.sh",
 			"gc.check_timeout":   "30s",
 			"gc.max_attempts":    "1",
 			"gc.root_bead_id":    workflow.ID,
@@ -2027,7 +2166,7 @@ func TestRunWorkflowServeDedupsTraceWarningsAcrossNestedControlDispatch(t *testi
 				"gc.attempt":         "1",
 				"gc.step_ref":        stepID + ".check.1",
 				"gc.check_mode":      "exec",
-				"gc.check_path":      checkPath,
+				"gc.check_path":      "pass-check.sh",
 				"gc.check_timeout":   "30s",
 				"gc.max_attempts":    "1",
 				"gc.root_bead_id":    workflow.ID,
@@ -2163,7 +2302,7 @@ func TestRunWorkflowServeDedupsLegacyTraceWarningsAcrossNestedControlDispatch(t 
 				"gc.attempt":         "1",
 				"gc.step_ref":        stepID + ".check.1",
 				"gc.check_mode":      "exec",
-				"gc.check_path":      checkPath,
+				"gc.check_path":      "pass-check.sh",
 				"gc.check_timeout":   "30s",
 				"gc.max_attempts":    "1",
 				"gc.root_bead_id":    workflow.ID,
@@ -3007,6 +3146,356 @@ func TestRunWorkflowServeSkipsPendingControlBeadAndProcessesLaterReady(t *testin
 	}
 }
 
+func TestRunWorkflowServeSkipsUnexpectedNonControlBeadAndProcessesLaterReady(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n\n[daemon]\nformula_v2 = true\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+
+	prevCityFlag := cityFlag
+	prevList := workflowServeList
+	prevControl := controlDispatcherServe
+	prevInterval := workflowServeIdlePollInterval
+	prevAttempts := workflowServeIdlePollAttempts
+	cityFlag = ""
+	workflowServeIdlePollInterval = 0
+	workflowServeIdlePollAttempts = 0
+	t.Cleanup(func() {
+		cityFlag = prevCityFlag
+		workflowServeList = prevList
+		controlDispatcherServe = prevControl
+		workflowServeIdlePollInterval = prevInterval
+		workflowServeIdlePollAttempts = prevAttempts
+	})
+
+	var controlled []string
+	calls := 0
+	workflowServeList = func(_, _ string, _ map[string]string) ([]hookBead, error) {
+		calls++
+		switch calls {
+		case 1:
+			return []hookBead{
+				{ID: "gc-task", Metadata: map[string]string{"gc.routed_to": "workflows.codex-max"}},
+				{ID: "gc-ready", Metadata: map[string]string{"gc.kind": "scope-check"}},
+			}, nil
+		default:
+			return nil, nil
+		}
+	}
+	controlDispatcherServe = func(_, _ string, beadID string, _ io.Writer, _ io.Writer) error {
+		controlled = append(controlled, beadID)
+		return nil
+	}
+
+	if err := runWorkflowServe("", false, io.Discard, io.Discard); err != nil {
+		t.Fatalf("runWorkflowServe: %v", err)
+	}
+
+	if !slices.Equal(controlled, []string{"gc-ready"}) {
+		t.Fatalf("controlled beads = %#v, want only valid control bead processed", controlled)
+	}
+}
+
+func TestRunWorkflowServeSkipsUnexpectedNonControlOnly(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n\n[daemon]\nformula_v2 = true\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+
+	prevCityFlag := cityFlag
+	prevList := workflowServeList
+	prevControl := controlDispatcherServe
+	prevInterval := workflowServeIdlePollInterval
+	prevAttempts := workflowServeIdlePollAttempts
+	cityFlag = ""
+	workflowServeIdlePollInterval = 0
+	workflowServeIdlePollAttempts = 0
+	t.Cleanup(func() {
+		cityFlag = prevCityFlag
+		workflowServeList = prevList
+		controlDispatcherServe = prevControl
+		workflowServeIdlePollInterval = prevInterval
+		workflowServeIdlePollAttempts = prevAttempts
+	})
+
+	calls := 0
+	workflowServeList = func(_, _ string, _ map[string]string) ([]hookBead, error) {
+		calls++
+		return []hookBead{
+			{ID: "gc-task", Metadata: map[string]string{"gc.routed_to": "workflows.codex-max"}},
+		}, nil
+	}
+	controlDispatcherServe = func(_, _ string, beadID string, _ io.Writer, _ io.Writer) error {
+		t.Fatalf("controlDispatcherServe called for non-control bead %q", beadID)
+		return nil
+	}
+
+	if err := runWorkflowServe("", false, io.Discard, io.Discard); err != nil {
+		t.Fatalf("runWorkflowServe: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("workflowServeList calls = %d, want one all-unexpected queue pass", calls)
+	}
+}
+
+func TestRunWorkflowServeTreatsTransientControllerSpawnPendingAsNonFatal(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n\n[daemon]\nformula_v2 = true\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+
+	prevCityFlag := cityFlag
+	prevList := workflowServeList
+	prevControl := controlDispatcherServe
+	prevInterval := workflowServeIdlePollInterval
+	prevAttempts := workflowServeIdlePollAttempts
+	cityFlag = ""
+	workflowServeIdlePollInterval = 0
+	workflowServeIdlePollAttempts = 0
+	t.Cleanup(func() {
+		cityFlag = prevCityFlag
+		workflowServeList = prevList
+		controlDispatcherServe = prevControl
+		workflowServeIdlePollInterval = prevInterval
+		workflowServeIdlePollAttempts = prevAttempts
+	})
+
+	calls := 0
+	workflowServeList = func(_, _ string, _ map[string]string) ([]hookBead, error) {
+		calls++
+		if calls == 1 {
+			return []hookBead{{ID: "gc-retry-control", Metadata: map[string]string{"gc.kind": "retry"}}}, nil
+		}
+		return nil, nil
+	}
+	controlDispatcherServe = func(_, _ string, beadID string, _ io.Writer, _ io.Writer) error {
+		if beadID != "gc-retry-control" {
+			t.Fatalf("controlDispatcherServe beadID = %q, want gc-retry-control", beadID)
+		}
+		return fmt.Errorf("classified transient controller spawn: %w", dispatch.ErrControlPending)
+	}
+
+	if err := runWorkflowServe("", false, io.Discard, io.Discard); err != nil {
+		t.Fatalf("runWorkflowServe: %v", err)
+	}
+}
+
+func TestRunWorkflowServeTreatsTransientControlErrorAsPending(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n\n[daemon]\nformula_v2 = true\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+
+	prevCityFlag := cityFlag
+	prevList := workflowServeList
+	prevControl := controlDispatcherServe
+	prevInterval := workflowServeIdlePollInterval
+	prevAttempts := workflowServeIdlePollAttempts
+	cityFlag = ""
+	workflowServeIdlePollInterval = 0
+	workflowServeIdlePollAttempts = 0
+	t.Cleanup(func() {
+		cityFlag = prevCityFlag
+		workflowServeList = prevList
+		controlDispatcherServe = prevControl
+		workflowServeIdlePollInterval = prevInterval
+		workflowServeIdlePollAttempts = prevAttempts
+	})
+
+	var attempted []string
+	var processed []string
+	calls := 0
+	workflowServeList = func(_, _ string, _ map[string]string) ([]hookBead, error) {
+		calls++
+		if calls == 1 {
+			return []hookBead{
+				{ID: "gc-transient", Metadata: map[string]string{"gc.kind": "ralph"}},
+				{ID: "gc-ready", Metadata: map[string]string{"gc.kind": "scope-check"}},
+			}, nil
+		}
+		return nil, nil
+	}
+	controlDispatcherServe = func(_, _ string, beadID string, _ io.Writer, _ io.Writer) error {
+		attempted = append(attempted, beadID)
+		if beadID == "gc-transient" {
+			return fmt.Errorf("gc-transient: spawning iteration 2: adding dep: failed to check for dependency cycle: invalid connection: i/o timeout")
+		}
+		processed = append(processed, beadID)
+		return nil
+	}
+
+	if err := runWorkflowServe("", false, io.Discard, io.Discard); err != nil {
+		t.Fatalf("runWorkflowServe: %v", err)
+	}
+
+	if !slices.Equal(attempted, []string{"gc-transient", "gc-ready"}) {
+		t.Fatalf("attempted beads = %#v, want transient bead skipped before ready bead is processed", attempted)
+	}
+	if !slices.Equal(processed, []string{"gc-ready"}) {
+		t.Fatalf("processed beads = %#v, want only later ready bead to be processed", processed)
+	}
+}
+
+func TestRunControlDispatcherQuarantinesMalformedControlGraph(t *testing.T) {
+	clearGCEnv(t)
+
+	store := beads.NewMemStore()
+	workflow, err := store.Create(beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+	subject, err := store.Create(beads.Bead{
+		Title: "closed subject",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.scope_ref":    "missing-scope",
+			"gc.scope_role":   "member",
+			"gc.root_bead_id": workflow.ID,
+			"gc.outcome":      "fail",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create subject: %v", err)
+	}
+	if err := store.Close(subject.ID); err != nil {
+		t.Fatalf("close subject: %v", err)
+	}
+	control, err := store.Create(beads.Bead{
+		Title: "Finalize missing scope",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "missing-scope",
+			"gc.scope_role":   "control",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+	if err := store.DepAdd(control.ID, subject.ID, "blocks"); err != nil {
+		t.Fatalf("add control dependency: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	if err := runControlDispatcherWithStoreAndConfig(t.TempDir(), t.TempDir(), store, control, control.ID, cfg, io.Discard, &stderr); err != nil {
+		t.Fatalf("runControlDispatcherWithStoreAndConfig: %v", err)
+	}
+
+	after, err := store.Get(control.ID)
+	if err != nil {
+		t.Fatalf("get control: %v", err)
+	}
+	if after.Status != "closed" {
+		t.Fatalf("control status = %q, want closed", after.Status)
+	}
+	if got := after.Metadata["gc.outcome"]; got != "fail" {
+		t.Fatalf("gc.outcome = %q, want fail", got)
+	}
+	if got := after.Metadata["gc.failure_reason"]; got != "malformed_control_graph" {
+		t.Fatalf("gc.failure_reason = %q, want malformed_control_graph", got)
+	}
+	if got := after.Metadata["gc.control_quarantined"]; got != "true" {
+		t.Fatalf("gc.control_quarantined = %q, want true", got)
+	}
+	if got := after.Metadata["gc.control_quarantined_at"]; got == "" {
+		t.Fatalf("gc.control_quarantined_at is empty")
+	}
+	if got := after.Metadata["gc.control_quarantine_reason"]; !strings.Contains(got, "scope body missing") {
+		t.Fatalf("gc.control_quarantine_reason = %q, want scope body missing", got)
+	}
+	if !slices.Contains(after.Labels, "gc:control-quarantined") {
+		t.Fatalf("labels = %#v, want gc:control-quarantined", after.Labels)
+	}
+	if got := stderr.String(); !strings.Contains(got, "control dispatch: quarantined bead="+control.ID) {
+		t.Fatalf("stderr = %q, want quarantine message", got)
+	}
+}
+
+func TestRunControlDispatcherQuarantinesMalformedFanoutScopeBody(t *testing.T) {
+	clearGCEnv(t)
+
+	store := beads.NewMemStore()
+	workflow, err := store.Create(beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+	fanout, err := store.Create(beads.Bead{
+		Title: "Fan out missing scope",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "fanout",
+			"gc.fanout_state": "spawned",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "missing-scope",
+			"gc.scope_role":   "member",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create fanout: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	if err := runControlDispatcherWithStoreAndConfig(t.TempDir(), t.TempDir(), store, fanout, fanout.ID, cfg, io.Discard, &stderr); err != nil {
+		t.Fatalf("runControlDispatcherWithStoreAndConfig: %v", err)
+	}
+
+	after, err := store.Get(fanout.ID)
+	if err != nil {
+		t.Fatalf("get fanout: %v", err)
+	}
+	if after.Status != "closed" {
+		t.Fatalf("fanout status = %q, want closed", after.Status)
+	}
+	if got := after.Metadata["gc.outcome"]; got != "fail" {
+		t.Fatalf("gc.outcome = %q, want fail", got)
+	}
+	if got := after.Metadata["gc.failure_reason"]; got != "malformed_control_graph" {
+		t.Fatalf("gc.failure_reason = %q, want malformed_control_graph", got)
+	}
+	if got := after.Metadata["gc.control_quarantined"]; got != "true" {
+		t.Fatalf("gc.control_quarantined = %q, want true", got)
+	}
+	if !slices.Contains(after.Labels, "gc:control-quarantined") {
+		t.Fatalf("labels = %#v, want gc:control-quarantined", after.Labels)
+	}
+	if got := stderr.String(); !strings.Contains(got, "control dispatch: quarantined bead="+fanout.ID) {
+		t.Fatalf("stderr = %q, want quarantine message", got)
+	}
+}
+
 func TestRunWorkflowServeSkipsLegacyOversizedControlAndProcessesLaterReady(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
@@ -3106,6 +3595,83 @@ func TestRunWorkflowServeReturnsQueryError(t *testing.T) {
 	}
 }
 
+func TestRunWorkflowServeQueryKillEmitsCurrentSessionPayload(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "rigs", "backend")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+	cityToml := fmt.Sprintf(`[workspace]
+name = "test-city"
+
+[daemon]
+formula_v2 = true
+
+[[rigs]]
+name = "backend"
+path = %q
+
+[[agent]]
+name = "worker"
+dir = "backend"
+`, rigDir)
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_SESSION_ID", "sess-control-123")
+	t.Setenv("GC_TEMPLATE", "gascity/workflows.codex-min")
+
+	prevCityFlag := cityFlag
+	prevList := workflowServeList
+	prevControl := controlDispatcherServe
+	cityFlag = ""
+	t.Cleanup(func() {
+		cityFlag = prevCityFlag
+		workflowServeList = prevList
+		controlDispatcherServe = prevControl
+	})
+
+	workflowServeList = func(_, _ string, _ map[string]string) ([]hookBead, error) {
+		return nil, errors.New("signal: killed")
+	}
+	controlDispatcherServe = func(_, _, _ string, _ io.Writer, _ io.Writer) error {
+		t.Fatal("controlDispatcherServe should not be called on query failure")
+		return nil
+	}
+
+	err := runWorkflowServe("backend/worker", false, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("runWorkflowServe returned nil error, want query failure")
+	}
+	evts, readErr := events.ReadFiltered(filepath.Join(cityDir, ".gc", "events.jsonl"), events.Filter{Type: events.SessionWorkQueryFailed})
+	if readErr != nil {
+		t.Fatalf("read work-query failure events: %v", readErr)
+	}
+	if len(evts) != 1 {
+		t.Fatalf("work-query failure events = %d, want 1: %+v", len(evts), evts)
+	}
+	if evts[0].Subject != "gascity/workflows.codex-min" {
+		t.Fatalf("event subject = %q, want current session template", evts[0].Subject)
+	}
+	payload := decodeSessionLifecyclePayload(t, evts[0])
+	if payload.SessionID != "sess-control-123" {
+		t.Fatalf("payload SessionID = %q, want sess-control-123", payload.SessionID)
+	}
+	if payload.Template != "gascity/workflows.codex-min" {
+		t.Fatalf("payload Template = %q, want current session template", payload.Template)
+	}
+	if payload.Template == "backend/worker" {
+		t.Fatalf("payload Template used target agent %q, want current session context", payload.Template)
+	}
+	if payload.Reason != "work query killed (signal: killed)" {
+		t.Fatalf("payload Reason = %q, want work query killed (signal: killed)", payload.Reason)
+	}
+}
+
 func TestRunWorkflowServeExpandsTemplateCommandsWithCityFallback(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
@@ -3184,7 +3750,7 @@ func TestRunWorkflowServeFollowUsesSweepFallback(t *testing.T) {
 	}
 	controlDispatcherServe = func(_, _ string, beadID string, _ io.Writer, _ io.Writer) error {
 		processed = append(processed, beadID)
-		return os.ErrDeadlineExceeded
+		return errors.New("synthetic dispatch failure")
 	}
 
 	wfcAgent := config.Agent{Name: "control-dispatcher", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(1)}
@@ -3196,8 +3762,8 @@ func TestRunWorkflowServeFollowUsesSweepFallback(t *testing.T) {
 		nil,
 		io.Discard,
 	)
-	if err == nil || !strings.Contains(err.Error(), os.ErrDeadlineExceeded.Error()) {
-		t.Fatalf("runWorkflowServeFollow error = %v, want wrapped %v", err, os.ErrDeadlineExceeded)
+	if err == nil || !strings.Contains(err.Error(), "synthetic dispatch failure") {
+		t.Fatalf("runWorkflowServeFollow error = %v, want wrapped synthetic dispatch failure", err)
 	}
 	if !slices.Equal(processed, []string{"gc-ready"}) {
 		t.Fatalf("processed beads = %#v, want sweep fallback to process gc-ready", processed)

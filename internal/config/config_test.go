@@ -271,6 +271,27 @@ mcp = ["city-mcp"]
 	}
 }
 
+func TestParseWorkspaceEnv(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "bright-lights"
+
+[workspace.env]
+GC_TARGET_BRANCH = "boylec/develop"
+FOO = "bar"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Workspace.Env["GC_TARGET_BRANCH"]; got != "boylec/develop" {
+		t.Errorf("Workspace.Env[GC_TARGET_BRANCH] = %q, want %q", got, "boylec/develop")
+	}
+	if got := cfg.Workspace.Env["FOO"]; got != "bar" {
+		t.Errorf("Workspace.Env[FOO] = %q, want %q", got, "bar")
+	}
+}
+
 func TestParseNoAgents(t *testing.T) {
 	data := []byte(`
 [workspace]
@@ -1726,8 +1747,8 @@ func TestDefaultPoolCheckUsesPoolName(t *testing.T) {
 		PoolName: "hello-world/dog",
 	}
 	check := a.EffectiveScaleCheck()
-	if !strings.Contains(check, "gc.routed_to=hello-world/dog-1") {
-		t.Errorf("EffectiveScaleCheck() = %q, want gc.routed_to=hello-world/dog-1", check)
+	if !strings.Contains(check, "gc.routed_to=hello-world/dog") {
+		t.Errorf("EffectiveScaleCheck() = %q, want gc.routed_to=hello-world/dog", check)
 	}
 }
 
@@ -1741,11 +1762,153 @@ func TestDefaultPoolCheckUsesBdReady(t *testing.T) {
 	if !strings.Contains(check, "bd ready") {
 		t.Errorf("EffectiveScaleCheck() = %q, want bd ready for blocker-aware counting", check)
 	}
+	if !strings.Contains(check, "--exclude-type=epic") {
+		t.Errorf("EffectiveScaleCheck() = %q, want --exclude-type=epic for executable demand only", check)
+	}
 	if strings.Contains(check, "--type=molecule") {
 		t.Errorf("EffectiveScaleCheck() = %q, should not count molecule containers as demand", check)
 	}
 	if strings.Contains(check, "--status=in_progress") || strings.Contains(check, "${active:-0}") {
 		t.Errorf("EffectiveScaleCheck() = %q, should not count in-progress work as new demand", check)
+	}
+}
+
+// TestPoolDemandPredicateSharedWithWorkQuery is the structural regression
+// test for the protocol-mismatch class addressed by PR #1516. The
+// reconciler's pool-demand path (EffectivePoolDemandQuery) and the
+// worker's claim path (EffectiveWorkQuery Tier 3) must derive their
+// "is there work on this routed queue?" predicate from the same
+// bdReadyPoolDemandShell helper. Adding a tier to one without updating
+// the other re-introduces the spawn-storm bug — this test ensures both
+// reference the identical predicate string for the same target.
+func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
+	tests := []struct {
+		name   string
+		agent  Agent
+		target string
+	}{
+		{
+			name:   "template",
+			agent:  Agent{Name: "worker", Dir: "foundations"},
+			target: "foundations/worker",
+		},
+		{
+			name: "pool instance",
+			agent: Agent{
+				Name:     "worker-1",
+				Dir:      "foundations",
+				PoolName: "foundations/worker",
+			},
+			target: "foundations/worker",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			predicate := bdReadyPoolDemandShell(tt.target)
+
+			wq := tt.agent.EffectiveWorkQuery()
+			if !strings.Contains(wq, predicate) {
+				t.Errorf("EffectiveWorkQuery() missing shared predicate %q in %q", predicate, wq)
+			}
+
+			demand := tt.agent.EffectivePoolDemandQuery()
+			if !strings.Contains(demand, predicate) {
+				t.Errorf("EffectivePoolDemandQuery() missing shared predicate %q in %q", predicate, demand)
+			}
+		})
+	}
+}
+
+// TestEffectivePoolDemandQueryRespectsOverride verifies the user-set
+// scale_check override flows through unchanged. Pass-through behavior
+// preserves config-side flexibility while keeping the default form
+// structurally tied to the work_query predicate.
+func TestEffectivePoolDemandQueryRespectsOverride(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "foundations", ScaleCheck: "echo 7"}
+	if got := a.EffectivePoolDemandQuery(); got != "echo 7" {
+		t.Errorf("EffectivePoolDemandQuery() = %q, want %q", got, "echo 7")
+	}
+	if got := a.EffectiveScaleCheck(); got != "echo 7" {
+		t.Errorf("EffectiveScaleCheck() = %q, want pass-through %q", got, "echo 7")
+	}
+}
+
+// TestPoolDemandAndWorkQueryAgreeOnRoutedSemantics is the behavioral
+// counterpart to TestPoolDemandPredicateSharedWithWorkQuery. Given a
+// fake bd that returns the same routed-and-claimable signal to either
+// caller, EffectiveWorkQuery (worker side) and EffectivePoolDemandQuery
+// (reconciler side) must agree: both see work, or both see none.
+//
+// The "state worker can't claim" cases — the bead is assigned, blocked,
+// in_progress, or an epic — are filtered by `bd ready --unassigned
+// --exclude-type=epic`, so the fake returns [] for them and both paths
+// report no work. This is the
+// regression test for the spawn-storm class fo-spawn-storm describes.
+func TestPoolDemandAndWorkQueryAgreeOnRoutedSemantics(t *testing.T) {
+	cases := []struct {
+		name           string
+		agent          Agent
+		target         string
+		bdReadyOutput  string
+		wantWorkQuery  string
+		wantDemandZero bool
+	}{
+		{
+			name:           "no routed work",
+			agent:          Agent{Name: "worker", Dir: "foundations"},
+			target:         "foundations/worker",
+			bdReadyOutput:  `[]`,
+			wantWorkQuery:  `[]`,
+			wantDemandZero: true,
+		},
+		{
+			name:           "one routed unassigned bead",
+			agent:          Agent{Name: "worker", Dir: "foundations"},
+			target:         "foundations/worker",
+			bdReadyOutput:  `[{"id":"fo-routed"}]`,
+			wantWorkQuery:  `[{"id":"fo-routed"}]`,
+			wantDemandZero: false,
+		},
+		{
+			name: "pool instance uses pool target",
+			agent: Agent{
+				Name:     "worker-1",
+				Dir:      "foundations",
+				PoolName: "foundations/worker",
+			},
+			target:         "foundations/worker",
+			bdReadyOutput:  `[{"id":"fo-routed"}]`,
+			wantWorkQuery:  `[{"id":"fo-routed"}]`,
+			wantDemandZero: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bdScript := `#!/bin/sh
+case "$*" in
+  *"ready --metadata-field gc.routed_to=` + tc.target + ` --unassigned --exclude-type=epic"*)
+    printf '%s' '` + tc.bdReadyOutput + `'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`
+			wqOut := strings.TrimSpace(runEffectiveWorkQuery(t, tc.agent, nil, bdScript))
+			if wqOut != tc.wantWorkQuery {
+				t.Errorf("EffectiveWorkQuery output = %q, want %q", wqOut, tc.wantWorkQuery)
+			}
+			demandOut := strings.TrimSpace(runShellWithFakeBd(t, tc.agent.EffectivePoolDemandQuery(), nil, bdScript))
+			if tc.wantDemandZero {
+				if demandOut != "0" {
+					t.Errorf("EffectivePoolDemandQuery output = %q, want 0", demandOut)
+				}
+			} else {
+				if demandOut == "0" {
+					t.Errorf("EffectivePoolDemandQuery output = %q, want >0 when work_query reports work", demandOut)
+				}
+			}
+		})
 	}
 }
 
@@ -1832,6 +1995,85 @@ func TestEffectiveScalingExplicit(t *testing.T) {
 	}
 }
 
+func TestAgentUsesCanonicalSingletonPoolIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		a    Agent
+		want bool
+	}{
+		{
+			name: "max one pool flavor uses canonical identity",
+			a:    Agent{Name: "worker", MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(1)},
+			want: true,
+		},
+		{
+			name: "namepool max one keeps instance identity",
+			a:    Agent{Name: "worker", MaxActiveSessions: ptrInt(1), NamepoolNames: []string{"alpha"}},
+		},
+		{
+			name: "multi session pool keeps instance identity",
+			a:    Agent{Name: "worker", MaxActiveSessions: ptrInt(2)},
+		},
+		{
+			name: "unbounded pool keeps instance identity",
+			a:    Agent{Name: "worker"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.a.UsesCanonicalSingletonPoolIdentity(); got != tt.want {
+				t.Fatalf("UsesCanonicalSingletonPoolIdentity() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAgentSupportsExpandedSessionIdentities(t *testing.T) {
+	tests := []struct {
+		name string
+		a    *Agent
+		want bool
+	}{
+		{
+			name: "nil",
+		},
+		{
+			name: "disabled max zero",
+			a:    &Agent{Name: "worker", MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(0)},
+		},
+		{
+			name: "canonical singleton pool",
+			a:    &Agent{Name: "worker", MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(1)},
+		},
+		{
+			name: "fixed singleton",
+			a:    &Agent{Name: "worker", MaxActiveSessions: ptrInt(1)},
+		},
+		{
+			name: "bounded pool",
+			a:    &Agent{Name: "worker", MaxActiveSessions: ptrInt(2)},
+			want: true,
+		},
+		{
+			name: "unbounded pool",
+			a:    &Agent{Name: "worker"},
+			want: true,
+		},
+		{
+			name: "namepool max one",
+			a:    &Agent{Name: "worker", MaxActiveSessions: ptrInt(1), NamepoolNames: []string{"alpha", "beta"}},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.a.SupportsExpandedSessionIdentities(); got != tt.want {
+				t.Fatalf("SupportsExpandedSessionIdentities() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEffectiveScaleCheckDefaults(t *testing.T) {
 	// Check empty → default uses qualified name.
 	a := Agent{
@@ -1845,6 +2087,9 @@ func TestEffectiveScaleCheckDefaults(t *testing.T) {
 	}
 	if !strings.Contains(check, "--unassigned") {
 		t.Errorf("EffectiveScaleCheck = %q, want --unassigned for new unassigned demand", check)
+	}
+	if !strings.Contains(check, "--exclude-type=epic") {
+		t.Errorf("EffectiveScaleCheck = %q, want --exclude-type=epic for executable demand only", check)
 	}
 	if strings.Contains(check, "--type=molecule") || strings.Contains(check, "${molecules:-0}") {
 		t.Errorf("EffectiveScaleCheck = %q, should not count molecule containers as demand", check)
@@ -1868,6 +2113,9 @@ func TestEffectiveScaleCheckDefaultsQualified(t *testing.T) {
 	if !strings.Contains(check, "--unassigned") {
 		t.Errorf("EffectiveScaleCheck = %q, want --unassigned for new unassigned demand", check)
 	}
+	if !strings.Contains(check, "--exclude-type=epic") {
+		t.Errorf("EffectiveScaleCheck = %q, want --exclude-type=epic for executable demand only", check)
+	}
 	if strings.Contains(check, "--type=molecule") {
 		t.Errorf("EffectiveScaleCheck = %q, should not count molecule containers as demand", check)
 	}
@@ -1888,6 +2136,9 @@ func TestEffectiveScaleCheckUsesReadyOnly(t *testing.T) {
 
 	if !strings.Contains(check, "bd ready") {
 		t.Errorf("missing bd ready query for blocker-aware task counting")
+	}
+	if !strings.Contains(check, "--exclude-type=epic") {
+		t.Errorf("EffectiveScaleCheck = %q, want --exclude-type=epic for executable demand only", check)
 	}
 	if strings.Contains(check, "--status=open --type=molecule") {
 		t.Errorf("unexpected molecule query in scale check: %q", check)
@@ -2303,6 +2554,29 @@ func TestDaemonMaxRestartsZero(t *testing.T) {
 	}
 }
 
+func TestDaemonAutoRestartOnDriftDefault(t *testing.T) {
+	d := DaemonConfig{}
+	if !d.AutoRestartOnDriftEnabled() {
+		t.Errorf("AutoRestartOnDriftEnabled() = false, want true (default)")
+	}
+}
+
+func TestDaemonAutoRestartOnDriftExplicitTrue(t *testing.T) {
+	v := true
+	d := DaemonConfig{AutoRestartOnDrift: &v}
+	if !d.AutoRestartOnDriftEnabled() {
+		t.Errorf("AutoRestartOnDriftEnabled() = false, want true")
+	}
+}
+
+func TestDaemonAutoRestartOnDriftExplicitFalse(t *testing.T) {
+	v := false
+	d := DaemonConfig{AutoRestartOnDrift: &v}
+	if d.AutoRestartOnDriftEnabled() {
+		t.Errorf("AutoRestartOnDriftEnabled() = true, want false (kill switch)")
+	}
+}
+
 func TestDaemonRestartWindowDefault(t *testing.T) {
 	d := DaemonConfig{}
 	got := d.RestartWindowDuration()
@@ -2489,6 +2763,122 @@ name = "mayor"
 	}
 }
 
+// --- DoltStopTimeout tests ---
+
+func TestDaemonDoltStopTimeoutDefault(t *testing.T) {
+	d := DaemonConfig{}
+	got := d.DoltStopTimeoutDuration()
+	if got != DefaultDoltStopTimeout {
+		t.Errorf("DoltStopTimeoutDuration() = %v, want %v", got, DefaultDoltStopTimeout)
+	}
+}
+
+func TestDaemonDoltStopTimeoutCustom(t *testing.T) {
+	d := DaemonConfig{DoltStopTimeout: "45s"}
+	got := d.DoltStopTimeoutDuration()
+	if got != 45*time.Second {
+		t.Errorf("DoltStopTimeoutDuration() = %v, want 45s", got)
+	}
+}
+
+func TestDaemonDoltStopTimeoutZero(t *testing.T) {
+	d := DaemonConfig{DoltStopTimeout: "0s"}
+	got := d.DoltStopTimeoutDuration()
+	if got != 0 {
+		t.Errorf("DoltStopTimeoutDuration() = %v, want 0", got)
+	}
+}
+
+func TestDaemonDoltStopTimeoutInvalid(t *testing.T) {
+	d := DaemonConfig{DoltStopTimeout: "not-a-duration"}
+	got := d.DoltStopTimeoutDuration()
+	if got != DefaultDoltStopTimeout {
+		t.Errorf("DoltStopTimeoutDuration() = %v, want %v (default for invalid)", got, DefaultDoltStopTimeout)
+	}
+}
+
+func TestParseDoltStopTimeout(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "test"
+
+[daemon]
+dolt_stop_timeout = "1m"
+
+[[agent]]
+name = "mayor"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Daemon.DoltStopTimeout != "1m" {
+		t.Errorf("Daemon.DoltStopTimeout = %q, want %q", cfg.Daemon.DoltStopTimeout, "1m")
+	}
+	got := cfg.Daemon.DoltStopTimeoutDuration()
+	if got != time.Minute {
+		t.Errorf("DoltStopTimeoutDuration() = %v, want 1m", got)
+	}
+}
+
+func TestValidateNonNegativeDurationsRejectsNegativeDoltStopTimeout(t *testing.T) {
+	cfg := &City{}
+	cfg.Daemon.DoltStopTimeout = "-1s"
+	err := ValidateNonNegativeDurations(cfg, "city.toml")
+	if err == nil {
+		t.Fatal("ValidateNonNegativeDurations() = nil, want error for negative dolt_stop_timeout")
+	}
+	if !strings.Contains(err.Error(), "dolt_stop_timeout") ||
+		!strings.Contains(err.Error(), "must not be negative") ||
+		!strings.Contains(err.Error(), `"-1s"`) {
+		t.Errorf("ValidateNonNegativeDurations() error = %q, want it to name the field, the constraint, and the value", err)
+	}
+}
+
+func TestValidateNonNegativeDurationsAllowsZeroAndPositive(t *testing.T) {
+	for _, v := range []string{"", "0s", "30s", "1m"} {
+		cfg := &City{}
+		cfg.Daemon.DoltStopTimeout = v
+		if err := ValidateNonNegativeDurations(cfg, "city.toml"); err != nil {
+			t.Errorf("ValidateNonNegativeDurations(dolt_stop_timeout=%q) = %v, want nil", v, err)
+		}
+	}
+}
+
+func TestValidateNonNegativeDurationsIgnoresUnparseable(t *testing.T) {
+	// Parse errors are ValidateDurations' job (warning-only); the negative
+	// guard must not promote a typo to a hard error.
+	cfg := &City{}
+	cfg.Daemon.DoltStopTimeout = "not-a-duration"
+	if err := ValidateNonNegativeDurations(cfg, "city.toml"); err != nil {
+		t.Errorf("ValidateNonNegativeDurations(unparseable) = %v, want nil", err)
+	}
+}
+
+func TestLoadWithIncludesRejectsNegativeDoltStopTimeout(t *testing.T) {
+	dir := t.TempDir()
+	cityPath := filepath.Join(dir, "city.toml")
+	if err := os.WriteFile(cityPath, []byte(`
+[workspace]
+name = "test"
+
+[daemon]
+dolt_stop_timeout = "-5s"
+
+[[agent]]
+name = "mayor"
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	_, _, err := LoadWithIncludes(fsys.OSFS{}, cityPath)
+	if err == nil {
+		t.Fatal("LoadWithIncludes() = nil error, want rejection of negative dolt_stop_timeout")
+	}
+	if !strings.Contains(err.Error(), "must not be negative") {
+		t.Errorf("LoadWithIncludes() error = %q, want negative-duration rejection", err)
+	}
+}
+
 // --- DriftDrainTimeout tests ---
 
 func TestDaemonDriftDrainTimeoutDefault(t *testing.T) {
@@ -2536,6 +2926,56 @@ name = "mayor"
 	got := cfg.Daemon.DriftDrainTimeoutDuration()
 	if got != 3*time.Minute {
 		t.Errorf("DriftDrainTimeoutDuration() = %v, want 3m", got)
+	}
+}
+
+// --- StartReadyTimeout tests ---
+
+func TestDaemonStartReadyTimeoutDefault(t *testing.T) {
+	d := DaemonConfig{}
+	got := d.StartReadyTimeoutDuration()
+	if got != DefaultStartReadyTimeout {
+		t.Errorf("StartReadyTimeoutDuration() = %v, want %v", got, DefaultStartReadyTimeout)
+	}
+}
+
+func TestDaemonStartReadyTimeoutCustom(t *testing.T) {
+	d := DaemonConfig{StartReadyTimeout: "10m"}
+	got := d.StartReadyTimeoutDuration()
+	if got != 10*time.Minute {
+		t.Errorf("StartReadyTimeoutDuration() = %v, want 10m", got)
+	}
+}
+
+func TestDaemonStartReadyTimeoutInvalid(t *testing.T) {
+	d := DaemonConfig{StartReadyTimeout: "not-a-duration"}
+	got := d.StartReadyTimeoutDuration()
+	if got != DefaultStartReadyTimeout {
+		t.Errorf("StartReadyTimeoutDuration() = %v, want %v (default for invalid)", got, DefaultStartReadyTimeout)
+	}
+}
+
+func TestParseStartReadyTimeout(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "test"
+
+[daemon]
+start_ready_timeout = "7m"
+
+[[agent]]
+name = "mayor"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Daemon.StartReadyTimeout != "7m" {
+		t.Errorf("Daemon.StartReadyTimeout = %q, want %q", cfg.Daemon.StartReadyTimeout, "7m")
+	}
+	got := cfg.Daemon.StartReadyTimeoutDuration()
+	if got != 7*time.Minute {
+		t.Errorf("StartReadyTimeoutDuration() = %v, want 7m", got)
 	}
 }
 
@@ -3653,6 +4093,14 @@ func TestEffectiveMethodsQualifyConsistently(t *testing.T) {
 
 func runEffectiveWorkQuery(t *testing.T, a Agent, env map[string]string, bdScript string) string {
 	t.Helper()
+	return runShellWithFakeBd(t, a.EffectiveWorkQuery(), env, bdScript)
+}
+
+// runShellWithFakeBd executes shellCmd with a fake `bd` script on PATH so
+// shared-predicate tests can exercise EffectiveWorkQuery and
+// EffectivePoolDemandQuery against the same simulated bd state.
+func runShellWithFakeBd(t *testing.T, shellCmd string, env map[string]string, bdScript string) string {
+	t.Helper()
 
 	tmp := t.TempDir()
 	bdPath := filepath.Join(tmp, "bd")
@@ -3660,14 +4108,14 @@ func runEffectiveWorkQuery(t *testing.T, a Agent, env map[string]string, bdScrip
 		t.Fatalf("write fake bd: %v", err)
 	}
 
-	cmd := exec.Command("sh", "-c", a.EffectiveWorkQuery())
+	cmd := exec.Command("sh", "-c", shellCmd)
 	cmd.Env = []string{"PATH=" + tmp + ":" + os.Getenv("PATH")}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("run work query: %v", err)
+		t.Fatalf("run shell with fake bd: %v", err)
 	}
 	return string(out)
 }
@@ -4293,6 +4741,9 @@ func TestInjectImplicitAgents_NoProviders(t *testing.T) {
 	}
 	if !a.Implicit {
 		t.Fatal("control-dispatcher should be implicit")
+	}
+	if !reflect.DeepEqual(a.ProcessNames, []string{"gc"}) {
+		t.Fatalf("control-dispatcher ProcessNames = %v, want [gc]", a.ProcessNames)
 	}
 }
 

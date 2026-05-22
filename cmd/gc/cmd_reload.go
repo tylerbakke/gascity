@@ -64,7 +64,9 @@ type reloadControlReply struct {
 	Message  string        `json:"message,omitempty"`
 	Revision string        `json:"revision,omitempty"`
 	Warnings []string      `json:"warnings,omitempty"`
-	Error    string        `json:"error,omitempty"`
+	// AcceptedDriftCount is set only for soft reload requests.
+	AcceptedDriftCount *int   `json:"accepted_drift_count,omitempty"`
+	Error              string `json:"error,omitempty"`
 }
 
 type reloadRequest struct {
@@ -78,6 +80,7 @@ type reloadRequest struct {
 func newReloadCmd(stdout, stderr io.Writer) *cobra.Command {
 	var async bool
 	var soft bool
+	var jsonOut bool
 	var timeoutValue string
 	cmd := &cobra.Command{
 		Use:   "reload [path]",
@@ -92,16 +95,17 @@ config drift rules require them.
 With --soft, the controller accepts any detected per-session config
 drift instead of draining the drifted sessions: each open session's
 recorded config hash is updated to the hash the freshly reloaded
-config produces for it, so the immediately-following reconcile tick
-sees no drift and no config-drift drains fire. Useful when editing a
-running city's .gc/settings.json without disrupting in-flight work.
-Sessions whose template no longer maps to a configured agent are
-NOT updated; normal orphan/suspended drain handles them on the next
-tick.`,
+config produces for it, the matching hash breakdown is refreshed, and
+any already queued config-drift drain for that session is canceled. The
+immediately-following reconcile tick sees no drift and no config-drift
+drains fire. Useful when editing a running city's .gc/settings.json
+without disrupting in-flight work. Sessions whose template no longer
+maps to a configured agent are NOT updated; normal orphan/suspended
+drain handles them on the next tick.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			timeoutChanged := cmd.Flags().Changed("timeout")
-			if cmdReload(args, async, soft, timeoutValue, timeoutChanged, stdout, stderr) != 0 {
+			if cmdReload(args, async, soft, jsonOut, timeoutValue, timeoutChanged, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -109,11 +113,12 @@ tick.`,
 	}
 	cmd.Flags().BoolVar(&async, "async", false, "Return after the controller accepts the reload request")
 	cmd.Flags().BoolVar(&soft, "soft", false, "Accept config drift on open sessions instead of draining them")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL summary")
 	cmd.Flags().StringVar(&timeoutValue, "timeout", "5m", "How long to wait for reload completion")
 	return cmd
 }
 
-func cmdReload(args []string, async bool, soft bool, timeoutValue string, timeoutChanged bool, stdout, stderr io.Writer) int {
+func cmdReload(args []string, async bool, soft bool, jsonOut bool, timeoutValue string, timeoutChanged bool, stdout, stderr io.Writer) int {
 	cityPath, err := resolveCommandCity(args)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc reload: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -153,8 +158,23 @@ func cmdReload(args []string, async bool, soft bool, timeoutValue string, timeou
 
 	switch reply.Outcome {
 	case reloadOutcomeAccepted, reloadOutcomeApplied, reloadOutcomeNoChange:
-		if strings.TrimSpace(reply.Message) != "" {
+		message := strings.TrimSpace(reply.Message)
+		if jsonOut {
+			return writeLifecycleActionJSONOrExit(stdout, stderr, "gc reload", lifecycleActionJSON{
+				Command:  "reload",
+				Action:   "reload",
+				Message:  message,
+				CityPath: cityPath,
+				Async:    lifecycleBoolPtr(async),
+				Soft:     lifecycleBoolPtr(soft),
+				Outcome:  string(reply.Outcome),
+				Revision: reply.Revision,
+			})
+		} else if message != "" {
 			fmt.Fprintln(stdout, strings.TrimSpace(reply.Message)) //nolint:errcheck // best-effort stdout
+		}
+		if !jsonOut && soft && reply.AcceptedDriftCount != nil {
+			fmt.Fprintf(stdout, "soft reload: accepted config drift on %d session(s)\n", *reply.AcceptedDriftCount) //nolint:errcheck // best-effort stdout
 		}
 		for _, warning := range reply.Warnings {
 			fmt.Fprintf(stderr, "gc reload: warning: %s\n", warning) //nolint:errcheck // best-effort stderr

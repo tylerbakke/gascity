@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -66,7 +67,7 @@ func TestRemoveStaleManagedDoltLifecycleLockRemovesWhenStateKnownAndClosed(t *te
 	}
 	t.Setenv("PATH", filepath.Join(t.TempDir(), "missing-bin"))
 
-	_, procChecked := fileOpenedByAnyProcessFromProc(path)
+	_, procChecked := fileOpenedByAnyProcessFromProc(context.Background(), path)
 	if err := removeStaleManagedDoltLifecycleLock(path); err != nil {
 		t.Fatalf("removeStaleManagedDoltLifecycleLock: %v", err)
 	}
@@ -91,7 +92,7 @@ func TestRemoveStaleManagedDoltLifecycleLockPreservesOpenFile(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = f.Close() })
 
-	_, procChecked := fileOpenedByAnyProcessFromProc(path)
+	_, procChecked := fileOpenedByAnyProcessFromProc(context.Background(), path)
 	if !procChecked {
 		// On systems where /proc isn't readable and lsof is missing,
 		// open-state is unknown — the cleanup preserves regardless. The
@@ -158,7 +159,7 @@ func TestCleanupStaleManagedDoltLifecycleLocksForSupervisorStartRemovesStaleLock
 		t.Fatalf("Register(%q): %v", cityPath, err)
 	}
 
-	_, procChecked := fileOpenedByAnyProcessFromProc(lockPath)
+	_, procChecked := fileOpenedByAnyProcessFromProc(context.Background(), lockPath)
 	if err := cleanupStaleManagedDoltLifecycleLocksForSupervisorStart(gcHome); err != nil {
 		t.Fatalf("cleanupStaleManagedDoltLifecycleLocksForSupervisorStart: %v", err)
 	}
