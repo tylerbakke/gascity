@@ -29,10 +29,11 @@ var supervisorRestartCityDefaultTimeout = 5 * time.Minute
 // performCityRestart waits for the city to reappear in the registry
 // after reconcile has been triggered. ci-iczpa: without this guard the
 // CLI returned "ok" even when the controller never respawned, because
-// the wire reply was sent right after drain completed. Sixty seconds
-// matches the controller startup budget operators tolerate before
-// considering a respawn dead.
-var supervisorRestartCityDefaultRespawnTimeout = 60 * time.Second
+// the wire reply was sent right after drain completed. ci-n97k2: bumped
+// from 60s to 120s — dolt cold-start alone takes ~62s on a cold city,
+// so 60s caused false timeout failures on the first restart after a
+// clean supervisor start.
+var supervisorRestartCityDefaultRespawnTimeout = 120 * time.Second
 
 // supervisorRestartCityRespawnPollInterval bounds how aggressively the
 // wait loop scans the registry snapshot for a respawned city. Kept
