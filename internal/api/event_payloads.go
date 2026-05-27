@@ -7,6 +7,13 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
+
+	// Blank import: pgauth's init() registers PostgresCredentialResolvedPayload
+	// in the events registry. The api package never references pgauth's types
+	// directly (the payload bytes flow through events.Event.Payload as JSON),
+	// so the import exists solely to fire the registration before the registry-
+	// coverage tests run.
+	_ "github.com/gastownhall/gascity/internal/pgauth"
 )
 
 // API-layer event payload types. Every API emitter takes one of these
@@ -461,12 +468,12 @@ func init() {
 	events.RegisterPayload(events.SessionSuspended, events.NoPayload{})
 	events.RegisterPayload(events.SessionUpdated, events.NoPayload{})
 	events.RegisterPayload(events.SessionDrainAckedWithAssignedWork, SessionDrainAckedWithAssignedWorkPayload{})
+	events.RegisterPayload(events.SessionStranded, events.NoPayload{})
 	events.RegisterPayload(events.SessionWorkQueryFailed, SessionLifecyclePayload{})
 	events.RegisterPayload(events.ConvoyCreated, events.NoPayload{})
 	events.RegisterPayload(events.ConvoyClosed, events.NoPayload{})
 	events.RegisterPayload(events.ControllerStarted, events.NoPayload{})
 	events.RegisterPayload(events.ControllerStopped, events.NoPayload{})
-	events.RegisterPayload(events.ControllerRestart, ControllerRestartPayload{})
 	events.RegisterPayload(events.SupervisorShutdownRequested, SupervisorShutdownPayload{})
 	events.RegisterPayload(events.CitySuspended, events.NoPayload{})
 	events.RegisterPayload(events.CityResumed, events.NoPayload{})

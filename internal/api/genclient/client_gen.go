@@ -1918,6 +1918,16 @@ type PoolOverride struct {
 	OnDeath      *string `json:"OnDeath"`
 }
 
+// PostgresCredentialResolvedPayload defines model for PostgresCredentialResolvedPayload.
+type PostgresCredentialResolvedPayload struct {
+	Host      string `json:"host"`
+	Port      string `json:"port"`
+	ScopeKind string `json:"scope_kind"`
+	ScopeName string `json:"scope_name"`
+	Source    string `json:"source"`
+	User      string `json:"user"`
+}
+
 // ProjectIdentityStampedPayload defines model for ProjectIdentityStampedPayload.
 type ProjectIdentityStampedPayload struct {
 	Layer     string  `json:"layer"`
@@ -3360,6 +3370,18 @@ type TypedEventStreamEnvelopeOrderFired struct {
 	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopePgCredentialResolved defines model for TypedEventStreamEnvelopePgCredentialResolved.
+type TypedEventStreamEnvelopePgCredentialResolved struct {
+	Actor    string                            `json:"actor"`
+	Message  *string                           `json:"message,omitempty"`
+	Payload  PostgresCredentialResolvedPayload `json:"payload"`
+	Seq      int64                             `json:"seq"`
+	Subject  *string                           `json:"subject,omitempty"`
+	Ts       time.Time                         `json:"ts"`
+	Type     string                            `json:"type"`
+	Workflow *WorkflowEventProjection          `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeProjectIdentityStamped defines model for TypedEventStreamEnvelopeProjectIdentityStamped.
 type TypedEventStreamEnvelopeProjectIdentityStamped struct {
 	Actor    string                        `json:"actor"`
@@ -3533,6 +3555,18 @@ type TypedEventStreamEnvelopeSessionStopped struct {
 	Actor    string                   `json:"actor"`
 	Message  *string                  `json:"message,omitempty"`
 	Payload  SessionLifecyclePayload  `json:"payload"`
+	Seq      int64                    `json:"seq"`
+	Subject  *string                  `json:"subject,omitempty"`
+	Ts       time.Time                `json:"ts"`
+	Type     string                   `json:"type"`
+	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedEventStreamEnvelopeSessionStranded defines model for TypedEventStreamEnvelopeSessionStranded.
+type TypedEventStreamEnvelopeSessionStranded struct {
+	Actor    string                   `json:"actor"`
+	Message  *string                  `json:"message,omitempty"`
+	Payload  NoPayload                `json:"payload"`
 	Seq      int64                    `json:"seq"`
 	Subject  *string                  `json:"subject,omitempty"`
 	Ts       time.Time                `json:"ts"`
@@ -4057,6 +4091,19 @@ type TypedTaggedEventStreamEnvelopeOrderFired struct {
 	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedTaggedEventStreamEnvelopePgCredentialResolved defines model for TypedTaggedEventStreamEnvelopePgCredentialResolved.
+type TypedTaggedEventStreamEnvelopePgCredentialResolved struct {
+	Actor    string                            `json:"actor"`
+	City     string                            `json:"city"`
+	Message  *string                           `json:"message,omitempty"`
+	Payload  PostgresCredentialResolvedPayload `json:"payload"`
+	Seq      int64                             `json:"seq"`
+	Subject  *string                           `json:"subject,omitempty"`
+	Ts       time.Time                         `json:"ts"`
+	Type     string                            `json:"type"`
+	Workflow *WorkflowEventProjection          `json:"workflow,omitempty"`
+}
+
 // TypedTaggedEventStreamEnvelopeProjectIdentityStamped defines model for TypedTaggedEventStreamEnvelopeProjectIdentityStamped.
 type TypedTaggedEventStreamEnvelopeProjectIdentityStamped struct {
 	Actor    string                        `json:"actor"`
@@ -4245,6 +4292,19 @@ type TypedTaggedEventStreamEnvelopeSessionStopped struct {
 	City     string                   `json:"city"`
 	Message  *string                  `json:"message,omitempty"`
 	Payload  SessionLifecyclePayload  `json:"payload"`
+	Seq      int64                    `json:"seq"`
+	Subject  *string                  `json:"subject,omitempty"`
+	Ts       time.Time                `json:"ts"`
+	Type     string                   `json:"type"`
+	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeSessionStranded defines model for TypedTaggedEventStreamEnvelopeSessionStranded.
+type TypedTaggedEventStreamEnvelopeSessionStranded struct {
+	Actor    string                   `json:"actor"`
+	City     string                   `json:"city"`
+	Message  *string                  `json:"message,omitempty"`
+	Payload  NoPayload                `json:"payload"`
 	Seq      int64                    `json:"seq"`
 	Subject  *string                  `json:"subject,omitempty"`
 	Ts       time.Time                `json:"ts"`
@@ -5850,6 +5910,32 @@ func (t *EventPayload) MergeOutboundEventPayload(v OutboundEventPayload) error {
 	return err
 }
 
+// AsPostgresCredentialResolvedPayload returns the union data inside the EventPayload as a PostgresCredentialResolvedPayload
+func (t EventPayload) AsPostgresCredentialResolvedPayload() (PostgresCredentialResolvedPayload, error) {
+	var body PostgresCredentialResolvedPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromPostgresCredentialResolvedPayload overwrites any union data inside the EventPayload as the provided PostgresCredentialResolvedPayload
+func (t *EventPayload) FromPostgresCredentialResolvedPayload(v PostgresCredentialResolvedPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergePostgresCredentialResolvedPayload performs a merge with any union data inside the EventPayload, using the provided PostgresCredentialResolvedPayload
+func (t *EventPayload) MergePostgresCredentialResolvedPayload(v PostgresCredentialResolvedPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsProjectIdentityStampedPayload returns the union data inside the EventPayload as a ProjectIdentityStampedPayload
 func (t EventPayload) AsProjectIdentityStampedPayload() (ProjectIdentityStampedPayload, error) {
 	var body ProjectIdentityStampedPayload
@@ -7180,6 +7266,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeOrderFired(v Typ
 	return err
 }
 
+// AsTypedEventStreamEnvelopePgCredentialResolved returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopePgCredentialResolved
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopePgCredentialResolved() (TypedEventStreamEnvelopePgCredentialResolved, error) {
+	var body TypedEventStreamEnvelopePgCredentialResolved
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopePgCredentialResolved overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopePgCredentialResolved
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopePgCredentialResolved(v TypedEventStreamEnvelopePgCredentialResolved) error {
+	v.Type = "pg.credential_resolved"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopePgCredentialResolved performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopePgCredentialResolved
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopePgCredentialResolved(v TypedEventStreamEnvelopePgCredentialResolved) error {
+	v.Type = "pg.credential_resolved"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeProjectIdentityStamped returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeProjectIdentityStamped
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeProjectIdentityStamped() (TypedEventStreamEnvelopeProjectIdentityStamped, error) {
 	var body TypedEventStreamEnvelopeProjectIdentityStamped
@@ -7600,6 +7714,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionStopped(v
 	return err
 }
 
+// AsTypedEventStreamEnvelopeSessionStranded returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionStranded
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionStranded() (TypedEventStreamEnvelopeSessionStranded, error) {
+	var body TypedEventStreamEnvelopeSessionStranded
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeSessionStranded overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeSessionStranded
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeSessionStranded(v TypedEventStreamEnvelopeSessionStranded) error {
+	v.Type = "session.stranded"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeSessionStranded performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeSessionStranded
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionStranded(v TypedEventStreamEnvelopeSessionStranded) error {
+	v.Type = "session.stranded"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeSessionSuspended returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionSuspended
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionSuspended() (TypedEventStreamEnvelopeSessionSuspended, error) {
 	var body TypedEventStreamEnvelopeSessionSuspended
@@ -7930,6 +8072,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeOrderFailed()
 	case "order.fired":
 		return t.AsTypedEventStreamEnvelopeOrderFired()
+	case "pg.credential_resolved":
+		return t.AsTypedEventStreamEnvelopePgCredentialResolved()
 	case "project.identity.stamped":
 		return t.AsTypedEventStreamEnvelopeProjectIdentityStamped()
 	case "provider.swapped":
@@ -7960,6 +8104,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeSessionQuarantined()
 	case "session.stopped":
 		return t.AsTypedEventStreamEnvelopeSessionStopped()
+	case "session.stranded":
+		return t.AsTypedEventStreamEnvelopeSessionStranded()
 	case "session.suspended":
 		return t.AsTypedEventStreamEnvelopeSessionSuspended()
 	case "session.undrained":
@@ -8859,6 +9005,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeOrde
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopePgCredentialResolved returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopePgCredentialResolved
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopePgCredentialResolved() (TypedTaggedEventStreamEnvelopePgCredentialResolved, error) {
+	var body TypedTaggedEventStreamEnvelopePgCredentialResolved
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopePgCredentialResolved overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopePgCredentialResolved
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopePgCredentialResolved(v TypedTaggedEventStreamEnvelopePgCredentialResolved) error {
+	v.Type = "pg.credential_resolved"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopePgCredentialResolved performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopePgCredentialResolved
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopePgCredentialResolved(v TypedTaggedEventStreamEnvelopePgCredentialResolved) error {
+	v.Type = "pg.credential_resolved"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeProjectIdentityStamped
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped() (TypedTaggedEventStreamEnvelopeProjectIdentityStamped, error) {
 	var body TypedTaggedEventStreamEnvelopeProjectIdentityStamped
@@ -9279,6 +9453,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSess
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopeSessionStranded returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionStranded
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionStranded() (TypedTaggedEventStreamEnvelopeSessionStranded, error) {
+	var body TypedTaggedEventStreamEnvelopeSessionStranded
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeSessionStranded overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeSessionStranded
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeSessionStranded(v TypedTaggedEventStreamEnvelopeSessionStranded) error {
+	v.Type = "session.stranded"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeSessionStranded performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeSessionStranded
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSessionStranded(v TypedTaggedEventStreamEnvelopeSessionStranded) error {
+	v.Type = "session.stranded"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeSessionSuspended returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionSuspended
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionSuspended() (TypedTaggedEventStreamEnvelopeSessionSuspended, error) {
 	var body TypedTaggedEventStreamEnvelopeSessionSuspended
@@ -9609,6 +9811,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeOrderFailed()
 	case "order.fired":
 		return t.AsTypedTaggedEventStreamEnvelopeOrderFired()
+	case "pg.credential_resolved":
+		return t.AsTypedTaggedEventStreamEnvelopePgCredentialResolved()
 	case "project.identity.stamped":
 		return t.AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped()
 	case "provider.swapped":
@@ -9639,6 +9843,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeSessionQuarantined()
 	case "session.stopped":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionStopped()
+	case "session.stranded":
+		return t.AsTypedTaggedEventStreamEnvelopeSessionStranded()
 	case "session.suspended":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionSuspended()
 	case "session.undrained":

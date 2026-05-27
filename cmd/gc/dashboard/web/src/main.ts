@@ -7,7 +7,6 @@ import { renderMail, installMailInteractions, resetMailNoCity } from "./panels/m
 import { renderConvoys, installConvoyInteractions, resetConvoysNoCity } from "./panels/convoys";
 import { eventTypeFromMessage, loadActivityHistory, resetActivity, startActivityStream, stopActivityStream, installActivityInteractions } from "./panels/activity";
 import { renderAdminPanels, installAdminInteractions, renderAdminEmptyStates } from "./panels/admin";
-import { renderFleetStatus } from "./panels/fleet-status";
 import { invalidateOptions } from "./panels/options";
 import { installPanelAffordances, popPause, refreshPaused, reportUIError, setPopPauseListener } from "./ui";
 import { installCommandPalette } from "./palette";

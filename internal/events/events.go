@@ -51,6 +51,12 @@ const (
 	// policy (commit-and-push, clear-assignee-and-respawn, or escalate).
 	// See gastownhall/gascity#2293.
 	SessionDrainAckedWithAssignedWork = "session.drain_acked_with_assigned_work"
+	// SessionStranded fires when a pool slot retains an in-progress work
+	// bead after its runtime has exited — i.e., the worker process is
+	// gone but the bead's assignee/state still references it. Surfaces
+	// the reconciler-detected leak so pack-level subscribers can decide
+	// whether to clear-assignee-and-respawn or escalate.
+	SessionStranded = "session.stranded"
 	// SessionWorkQueryFailed fires when the current managed session's
 	// work-discovery query subprocess is killed by an external signal or
 	// aborted by the runner-imposed timeout before producing output.
@@ -112,6 +118,13 @@ const (
 	// each scheduled maintenance cycle completes or fails.
 	StoreMaintenanceDone   = "gc.store.maintenance.done"
 	StoreMaintenanceFailed = "gc.store.maintenance.failed"
+
+	// Postgres credential resolution. Emitted by the bd-env projection
+	// path on every successful pgauth resolve. The payload identifies
+	// the scope and the resolution tier that supplied the value; it
+	// MUST NOT carry the password value (asserted by
+	// TestPostgresEventOmitsPassword).
+	PostgresCredentialResolved = "pg.credential_resolved"
 )
 
 // KnownEventTypes lists every event-type constant this package defines.
@@ -123,6 +136,7 @@ var KnownEventTypes = []string{
 	SessionDraining, SessionUndrained, SessionQuarantined,
 	SessionIdleKilled, SessionMaxAgeKilled, SessionSuspended, SessionUpdated,
 	SessionDrainAckedWithAssignedWork,
+	SessionStranded,
 	SessionWorkQueryFailed,
 	BeadCreated, BeadClosed, BeadUpdated,
 	MailSent, MailRead, MailArchived, MailMarkedRead, MailMarkedUnread,
@@ -142,6 +156,7 @@ var KnownEventTypes = []string{
 	ExtMsgInbound, ExtMsgOutbound,
 	EventsRotated,
 	StoreMaintenanceDone, StoreMaintenanceFailed,
+	PostgresCredentialResolved,
 }
 
 // Event is a single recorded occurrence in the system.

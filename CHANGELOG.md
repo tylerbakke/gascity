@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `gc --json-schema` manifest output no longer includes the removed
+  `transport` field. Consumers should use each role schema's `x-gc-jsonl`
+  extension, when present, to determine JSONL record-count behavior.
 - `gc session attach` now re-applies `session_live` hooks (status-bar theme,
   keybindings) when it recreates a session whose tmux runtime had exited.
   Previously the resume path in `resolvedWorkerRuntimeWithConfigAndMetadata`

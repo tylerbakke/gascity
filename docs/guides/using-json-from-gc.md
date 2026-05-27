@@ -227,7 +227,7 @@ For streaming commands, validate each JSONL record against the result schema:
 
 ```sh
 gc events --json-schema=result > /tmp/gc-events.schema.json
-gc events --follow | while IFS= read -r line; do
+gc events --json --follow | while IFS= read -r line; do
   printf '%s\n' "$line" | jq .
 done
 ```

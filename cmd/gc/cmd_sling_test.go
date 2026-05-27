@@ -349,7 +349,7 @@ func init() {
 		"my-formula", "convoy-formula",
 	} {
 		content := fmt.Sprintf("formula = %q\nversion = 1\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\n", name)
-		_ = os.WriteFile(filepath.Join(dir, name+".formula.toml"), []byte(content), 0o644)
+		_ = os.WriteFile(filepath.Join(dir, name+".toml"), []byte(content), 0o644)
 	}
 	sharedTestFormulaDir = dir
 
@@ -934,6 +934,142 @@ func TestDoSlingNudgePoolMember(t *testing.T) {
 	}
 }
 
+func TestDoSlingNudgePoolMemberUsesBeadDerivedSessionName(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	const sessionName = "gm-glz06f"
+	if err := sp.Start(context.Background(), sessionName, runtime.Config{}); err != nil {
+		t.Fatalf("Start(%q): %v", sessionName, err)
+	}
+	sp.WaitForIdleErrors[sessionName] = nil
+	sp.Calls = nil
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name: "polecat",
+			Dir:  "hw",
+		}},
+	}
+	a := cfg.Agents[0]
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	deps.CityPath = t.TempDir()
+	store := newSlingTestStore()
+	deps.Store = store
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "pool session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":      "hw/polecat",
+			"agent_name":    "hw/polecat",
+			"provider_kind": "claude",
+			"session_name":  sessionName,
+			"pool_slot":     "7",
+			"state":         "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session bead): %v", err)
+	}
+
+	opts := testOpts(a, "BL-1")
+	opts.Nudge = true
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0; stderr: %s", code, stderr.String())
+	}
+	for _, c := range sp.Calls {
+		if (c.Method == "Nudge" || c.Method == "NudgeNow") && c.Name == sessionName {
+			if !strings.Contains(stdout.String(), "Nudged hw/polecat") {
+				t.Fatalf("stdout = %q, want delivered nudge confirmation", stdout.String())
+			}
+			if strings.Contains(stdout.String(), "No running sessions") || strings.Contains(stderr.String(), "poke failed") {
+				t.Fatalf("stdout=%q stderr=%q, want no controller wake fallback", stdout.String(), stderr.String())
+			}
+			updated, err := store.Get(sessionBead.ID)
+			if err != nil {
+				t.Fatalf("Get(session bead): %v", err)
+			}
+			if got := updated.Metadata["last_nudge_delivered_at"]; got == "" {
+				t.Fatalf("last_nudge_delivered_at = %q, want delivered nudge stamp", got)
+			}
+			return
+		}
+	}
+	t.Fatalf("runtime calls = %+v, want Nudge/NudgeNow on bead-derived session %q", sp.Calls, sessionName)
+}
+
+func TestDoSlingNudgePoolUsesCityStoreForSessionBeads(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	sessionName := "workflows__codex-max-mc-session-test"
+	if err := sp.Start(context.Background(), sessionName, runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	sp.Calls = nil
+	a := config.Agent{
+		Name:        "codex-max",
+		Dir:         "gascity",
+		BindingName: "workflows",
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{a},
+	}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	deps.CityPath = t.TempDir()
+	writeSlingTestCity(t, deps.CityPath, "[workspace]\nname = \"test-city\"\n")
+	cityStore := beads.NewMemStore()
+	if _, err := cityStore.Create(beads.Bead{
+		Title:  "gascity/workflows.codex-max-8",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "gascity/workflows.codex-max",
+			"session_name": sessionName,
+			"pool_slot":    "8",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prevOpen := slingOpenCityStore
+	slingOpenCityStore = func(path string) (beads.Store, error) {
+		if path != deps.CityPath {
+			t.Fatalf("slingOpenCityStore(%q), want %q", path, deps.CityPath)
+		}
+		return cityStore, nil
+	}
+	t.Cleanup(func() { slingOpenCityStore = prevOpen })
+	prevPoller := startNudgePoller
+	startNudgePoller = func(_, _, _ string) error { return nil }
+	t.Cleanup(func() { startNudgePoller = prevPoller })
+
+	doSlingNudge(&a, deps.CityName, deps.CityPath, cfg, sp, deps.Store, stdout, stderr)
+	if strings.Contains(stdout.String(), "No running sessions") || strings.Contains(stderr.String(), "poke failed") {
+		t.Fatalf("sling nudge missed live city-store pool session; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if stderr.Len() > 0 {
+		t.Fatalf("stderr = %q, want no warning", stderr.String())
+	}
+	var observedLiveSession bool
+	for _, call := range sp.Calls {
+		if call.Method == "IsRunning" && call.Name == sessionName {
+			observedLiveSession = true
+			break
+		}
+	}
+	if !observedLiveSession {
+		t.Fatalf("runtime calls = %#v, want IsRunning for city-store session %q", sp.Calls, sessionName)
+	}
+	if !strings.Contains(stdout.String(), "gascity/workflows.codex-max-8") {
+		t.Fatalf("stdout = %q, want nudge output for city-store pool instance", stdout.String())
+	}
+}
+
 func TestDoSlingNudgePoolNoMembers(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
@@ -956,6 +1092,53 @@ func TestDoSlingNudgePoolNoMembers(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "poke failed") {
 		t.Errorf("stderr = %q, want 'poke failed' message (no controller socket in test)", stderr.String())
+	}
+}
+
+// TestBuiltInSlingSlotSuffixedTargetNormalizesRoutedTo is the write-side guard
+// for #2592: resolving and slinging a slot-suffixed pool target ("saitoc/polecat-2")
+// must record the base pool qualified name in gc.routed_to, so the pool's
+// exact-match work_query (keyed on the base template) can see the bead.
+func TestBuiltInSlingSlotSuffixedTargetNormalizesRoutedTo(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	maxPolecats := 5
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "saitoc", Path: "/tmp/saitoc", Prefix: "gc"}},
+		Agents: []config.Agent{
+			{Name: "polecat", Dir: "saitoc", MaxActiveSessions: &maxPolecats},
+		},
+	}
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	store := newSlingTestStore()
+	deps.Store = store
+
+	created, err := store.Create(beads.Bead{Title: "slot-routed work", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Resolve the slot-suffixed target the way the CLI does, then sling it.
+	target, ok := resolveAgentIdentity(cfg, "saitoc/polecat-2", "")
+	if !ok {
+		t.Fatal("resolveAgentIdentity(saitoc/polecat-2) failed")
+	}
+	if target.QualifiedName() != "saitoc/polecat-2" {
+		t.Fatalf("resolved target QualifiedName = %q, want saitoc/polecat-2", target.QualifiedName())
+	}
+
+	opts := testOpts(target, created.ID)
+	code := doSling(opts, deps, &fakeQuerier{bead: created}, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("doSling returned %d; stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	routed, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get routed bead: %v", err)
+	}
+	if got := routed.Metadata["gc.routed_to"]; got != "saitoc/polecat" {
+		t.Fatalf("gc.routed_to = %q, want saitoc/polecat (slot suffix should be normalized away)", got)
 	}
 }
 
@@ -1063,6 +1246,9 @@ func TestBuiltInSlingPoolRouteContractUsesMetadataOnly(t *testing.T) {
 	if got := counts["saitoc/polecat"]; got != 0 {
 		t.Fatalf("polecat scale count after refinery handoff with stale pool label = %d, want 0", got)
 	}
+	// A pool-template assignee is not concrete ownership. Generic scale demand
+	// stays strictly unassigned+routed; callers that want pool demand must clear
+	// Assignee and set gc.routed_to.
 	if got := counts["saitoc/refinery"]; got != 0 {
 		t.Fatalf("refinery generic scale count for assigned handoff = %d, want 0", got)
 	}
@@ -3501,7 +3687,7 @@ func TestOnRootOnlyFormulaKeepsAttachedWispPrivate(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "root-only.formula.toml"), []byte(`
+	if err := os.WriteFile(filepath.Join(dir, "root-only.toml"), []byte(`
 formula = "root-only"
 description = "Private attached root"
 version = 1
@@ -3561,7 +3747,7 @@ func TestFormulaRootOnlyRoutesRunnableWispRoot(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "root-only.formula.toml"), []byte(`
+	if err := os.WriteFile(filepath.Join(dir, "root-only.toml"), []byte(`
 formula = "root-only"
 description = "Standalone root"
 version = 1
@@ -3699,7 +3885,7 @@ contract = "graph.v2"
 id = "step"
 title = "Do work"
 `
-	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.formula.toml"), []byte(graphFormula), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.toml"), []byte(graphFormula), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3820,7 +4006,7 @@ contract = "graph.v2"
 id = "step"
 title = "Do work"
 `
-	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.formula.toml"), []byte(graphFormula), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.toml"), []byte(graphFormula), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3878,7 +4064,7 @@ contract = "graph.v2"
 id = "step"
 title = "Do work"
 `
-	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.formula.toml"), []byte(graphFormula), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.toml"), []byte(graphFormula), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3939,7 +4125,7 @@ contract = "graph.v2"
 id = "step"
 title = "Do work"
 `
-	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.formula.toml"), []byte(graphFormula), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.toml"), []byte(graphFormula), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4210,7 +4396,7 @@ contract = "graph.v2"
 id = "step"
 title = "Do work"
 `
-	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.formula.toml"), []byte(graphFormula), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.FormulaLayers.City[0], "graph-work.toml"), []byte(graphFormula), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4431,7 +4617,7 @@ id = "do-work"
 title = "Do work for {{target_id}}"
 description = "Target: {{target_id}}, workspace: {{workspace}}"
 `
-	if err := os.WriteFile(filepath.Join(dir, "repro.formula.toml"), []byte(formulaBody), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "repro.toml"), []byte(formulaBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4480,7 +4666,7 @@ id = "do-work"
 title = "Do work for {{title}}"
 description = "Target: {{target_id}}, workspace: {{workspace}}"
 `
-	if err := os.WriteFile(filepath.Join(dir, "repro-mixed-vars.formula.toml"), []byte(formulaBody), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "repro-mixed-vars.toml"), []byte(formulaBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4552,7 +4738,7 @@ required = true
 id = "do-work"
 title = "Work in {{workspace}}"
 `
-	if err := os.WriteFile(filepath.Join(dir, "requires-workspace.formula.toml"), []byte(formulaBody), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "requires-workspace.toml"), []byte(formulaBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4794,7 +4980,7 @@ description = "Root title"
 id = "work"
 title = "Work"
 `
-	if err := os.WriteFile(filepath.Join(dir, "root-title-placeholder.formula.toml"), []byte(formulaBody), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "root-title-placeholder.toml"), []byte(formulaBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4885,7 +5071,7 @@ required = true
 id = "work"
 title = "Work {{issue}}"
 `
-	if err := os.WriteFile(filepath.Join(dir, "requires-issue.formula.toml"), []byte(formulaBody), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "requires-issue.toml"), []byte(formulaBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4929,7 +5115,7 @@ required = true
 id = "work"
 title = "Work {{workspace}}"
 `
-	if err := os.WriteFile(filepath.Join(dir, "batch-requires-workspace.formula.toml"), []byte(formulaBody), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "batch-requires-workspace.toml"), []byte(formulaBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5076,7 +5262,7 @@ id = "ship"
 title = "Ship"
 needs = ["prep"]
 `
-	if err := os.WriteFile(filepath.Join(dir, "multi-step.formula.toml"), []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "multi-step.toml"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5590,6 +5776,77 @@ func TestDryRunConvoyUsesTracksMembers(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Errorf("got %d runner calls, want 0: %v", len(runner.calls), runner.calls)
+	}
+}
+
+// TestDryRunLeafTaskViaBatchDispatchOnFormula is a regression test for
+// the dry-run mismatch where `gc sling --dry-run <pool> <leaf-task>
+// --on <formula>` rendered the batch ("container with zero children")
+// preview even though a real run would wrap-and-route the bead itself.
+//
+// The live CLI dispatches every sling invocation through
+// doSlingBatchWithJSON (cmd_sling.go calls it unconditionally from the
+// command handler). Inside, sling.DoSling decides single-vs-batch by
+// bead type. For non-container types (task, bug, feature, etc.) it
+// returns a single-bead result with ContainerType unset. The dry-run
+// rendering then has to honor that signal — otherwise it falls into
+// the batch preview and reports "Children (0 total, 0 open)" plus an
+// empty route list, which is the opposite of what the real run does.
+//
+// The fix in cmd_sling.go gates the dryRunBatch dispatch on
+// result.ContainerType being non-empty.
+func TestDryRunLeafTaskViaBatchDispatchOnFormula(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{
+		Name:              "polecat",
+		Dir:               "hw",
+		MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3),
+	}
+	q := newFakeChildQuerier()
+	q.beadsByID["BL-42"] = beads.Bead{ID: "BL-42", Type: "task", Status: "open", Title: "Implement login page"}
+	q.childrenOf["BL-42"] = []beads.Bead{} // no molecule children
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	deps.Store = seededStore("BL-42")
+	opts := testOpts(a, "BL-42")
+	opts.OnFormula = "code-review"
+	opts.DryRun = true
+	// Mirror the live CLI: every sling invocation goes through
+	// doSlingBatchWithJSON; the function decides single-vs-batch
+	// internally from the bead type.
+	code := doSlingBatch(opts, deps, q, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("dry-run returned %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	// Must render the single-bead preview, NOT the batch container preview.
+	if strings.Contains(out, "Children (0 total, 0 open)") {
+		t.Errorf("stdout rendered misleading container preview for a leaf task; got: %s", out)
+	}
+	if strings.Contains(out, "is a container bead that groups related work") {
+		t.Errorf("stdout claimed leaf task is a container; got: %s", out)
+	}
+	if strings.Contains(out, "Attach formula (per open child):") {
+		t.Errorf("stdout rendered per-child attach section for a leaf task; got: %s", out)
+	}
+	// Should render the single-bead attach + route preview.
+	if !strings.Contains(out, "Attach formula:") {
+		t.Errorf("stdout missing single-bead attach section: %s", out)
+	}
+	if !strings.Contains(out, "Would run: bd mol cook --formula=code-review --on=BL-42") {
+		t.Errorf("stdout missing cook command: %s", out)
+	}
+	if !strings.Contains(out, "bd update 'BL-42' --set-metadata gc.routed_to=hw/polecat") {
+		t.Errorf("stdout missing route command: %s", out)
+	}
+	if !strings.Contains(out, "No side effects executed (--dry-run).") {
+		t.Errorf("stdout missing footer: %s", out)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("got %d runner calls, want 0 (dry-run): %v", len(runner.calls), runner.calls)
 	}
 }
 
@@ -6834,7 +7091,7 @@ required = true
 id = "do-work"
 title = "Work in {{workspace}}"
 `
-	if err := os.WriteFile(filepath.Join(dir, "default-requires-workspace.formula.toml"), []byte(formulaBody), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "default-requires-workspace.toml"), []byte(formulaBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

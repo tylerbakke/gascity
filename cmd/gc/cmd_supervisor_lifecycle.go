@@ -669,6 +669,14 @@ func supervisorLogPath() string {
 	return filepath.Join(supervisor.DefaultHome(), "supervisor.log")
 }
 
+func ensureSupervisorServiceLogDir(logPath string) error {
+	dir := filepath.Dir(logPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("creating supervisor log dir %s: %w", dir, err)
+	}
+	return nil
+}
+
 type supervisorServiceData struct {
 	GCPath        string
 	LogPath       string
@@ -1456,11 +1464,20 @@ func installSupervisorLaunchd(data *supervisorServiceData, stdout, stderr io.Wri
 	legacyPresent := legacySupervisorTargetsCurrentHome(legacySupervisorLaunchdPlistPath())
 	existing, err := os.ReadFile(path)
 	hadCurrent := err == nil
+	contentUnchanged := hadCurrent && string(existing) == content
 	if err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(stderr, "gc supervisor install: reading existing plist: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if contentUnchanged && supervisorAliveHook() != 0 {
+		fmt.Fprintf(stdout, "Installed launchd service: %s\n", path) //nolint:errcheck // best-effort stdout
+		return 0
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if err := ensureSupervisorServiceLogDir(data.LogPath); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -1603,6 +1620,10 @@ func installSupervisorSystemd(data *supervisorServiceData, stdout, stderr io.Wri
 		return 1
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if err := ensureSupervisorServiceLogDir(data.LogPath); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}

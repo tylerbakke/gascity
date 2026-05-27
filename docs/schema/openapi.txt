@@ -2064,9 +2064,6 @@
             "$ref": "#/components/schemas/CityUnregisterSucceededPayload"
           },
           {
-            "$ref": "#/components/schemas/ControllerRestartPayload"
-          },
-          {
             "$ref": "#/components/schemas/GroupCreatedEventPayload"
           },
           {
@@ -2080,6 +2077,9 @@
           },
           {
             "$ref": "#/components/schemas/OutboundEventPayload"
+          },
+          {
+            "$ref": "#/components/schemas/PostgresCredentialResolvedPayload"
           },
           {
             "$ref": "#/components/schemas/ProjectIdentityStampedPayload"
@@ -4898,6 +4898,38 @@
         ],
         "type": "object"
       },
+      "PostgresCredentialResolvedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "string"
+          },
+          "scope_kind": {
+            "type": "string"
+          },
+          "scope_name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_kind",
+          "scope_name",
+          "source",
+          "host",
+          "port",
+          "user"
+        ],
+        "type": "object"
+      },
       "ProjectIdentityStampedPayload": {
         "additionalProperties": false,
         "properties": {
@@ -7514,7 +7546,6 @@
             "city.resumed": "#/components/schemas/TypedEventStreamEnvelopeCityResumed",
             "city.suspended": "#/components/schemas/TypedEventStreamEnvelopeCitySuspended",
             "city.unregister_requested": "#/components/schemas/TypedEventStreamEnvelopeCityUnregisterRequested",
-            "controller.restart": "#/components/schemas/TypedEventStreamEnvelopeControllerRestart",
             "controller.started": "#/components/schemas/TypedEventStreamEnvelopeControllerStarted",
             "controller.stopped": "#/components/schemas/TypedEventStreamEnvelopeControllerStopped",
             "convoy.closed": "#/components/schemas/TypedEventStreamEnvelopeConvoyClosed",
@@ -7539,6 +7570,7 @@
             "order.completed": "#/components/schemas/TypedEventStreamEnvelopeOrderCompleted",
             "order.failed": "#/components/schemas/TypedEventStreamEnvelopeOrderFailed",
             "order.fired": "#/components/schemas/TypedEventStreamEnvelopeOrderFired",
+            "pg.credential_resolved": "#/components/schemas/TypedEventStreamEnvelopePgCredentialResolved",
             "project.identity.stamped": "#/components/schemas/TypedEventStreamEnvelopeProjectIdentityStamped",
             "provider.swapped": "#/components/schemas/TypedEventStreamEnvelopeProviderSwapped",
             "request.failed": "#/components/schemas/TypedEventStreamEnvelopeRequestFailed",
@@ -7554,6 +7586,7 @@
             "session.max_age_killed": "#/components/schemas/TypedEventStreamEnvelopeSessionMaxAgeKilled",
             "session.quarantined": "#/components/schemas/TypedEventStreamEnvelopeSessionQuarantined",
             "session.stopped": "#/components/schemas/TypedEventStreamEnvelopeSessionStopped",
+            "session.stranded": "#/components/schemas/TypedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedEventStreamEnvelopeSessionSuspended",
             "session.undrained": "#/components/schemas/TypedEventStreamEnvelopeSessionUndrained",
             "session.updated": "#/components/schemas/TypedEventStreamEnvelopeSessionUpdated",
@@ -7586,9 +7619,6 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeCityUnregisterRequested"
-          },
-          {
-            "$ref": "#/components/schemas/TypedEventStreamEnvelopeControllerRestart"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeControllerStarted"
@@ -7663,6 +7693,9 @@
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeOrderFired"
           },
           {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopePgCredentialResolved"
+          },
+          {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeProjectIdentityStamped"
           },
           {
@@ -7706,6 +7739,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionStopped"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionStranded"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionSuspended"
@@ -8031,48 +8067,6 @@
         "title": "TypedEventStreamEnvelope city.unregister_requested",
         "type": "object"
       },
-      "TypedEventStreamEnvelopeControllerRestart": {
-        "additionalProperties": false,
-        "properties": {
-          "actor": {
-            "type": "string"
-          },
-          "message": {
-            "type": "string"
-          },
-          "payload": {
-            "$ref": "#/components/schemas/ControllerRestartPayload"
-          },
-          "seq": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "subject": {
-            "type": "string"
-          },
-          "ts": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "type": {
-            "const": "controller.restart",
-            "type": "string"
-          },
-          "workflow": {
-            "$ref": "#/components/schemas/WorkflowEventProjection"
-          }
-        },
-        "required": [
-          "seq",
-          "type",
-          "ts",
-          "actor",
-          "payload"
-        ],
-        "title": "TypedEventStreamEnvelope controller.restart",
-        "type": "object"
-      },
       "TypedEventStreamEnvelopeControllerStarted": {
         "additionalProperties": false,
         "properties": {
@@ -8277,6 +8271,7 @@
                 "session.suspended",
                 "session.updated",
                 "session.drain_acked_with_assigned_work",
+                "session.stranded",
                 "session.work_query_failed",
                 "bead.created",
                 "bead.closed",
@@ -8320,7 +8315,8 @@
                 "extmsg.outbound",
                 "events.rotated",
                 "gc.store.maintenance.done",
-                "gc.store.maintenance.failed"
+                "gc.store.maintenance.failed",
+                "pg.credential_resolved"
               ]
             },
             "type": "string"
@@ -9179,6 +9175,48 @@
         "title": "TypedEventStreamEnvelope order.fired",
         "type": "object"
       },
+      "TypedEventStreamEnvelopePgCredentialResolved": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PostgresCredentialResolvedPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "pg.credential_resolved",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope pg.credential_resolved",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeProjectIdentityStamped": {
         "additionalProperties": false,
         "properties": {
@@ -9809,6 +9847,48 @@
         "title": "TypedEventStreamEnvelope session.stopped",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeSessionStranded": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.stranded",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.stranded",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeSessionSuspended": {
         "additionalProperties": false,
         "properties": {
@@ -10156,7 +10236,6 @@
             "city.resumed": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityResumed",
             "city.suspended": "#/components/schemas/TypedTaggedEventStreamEnvelopeCitySuspended",
             "city.unregister_requested": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityUnregisterRequested",
-            "controller.restart": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerRestart",
             "controller.started": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerStarted",
             "controller.stopped": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerStopped",
             "convoy.closed": "#/components/schemas/TypedTaggedEventStreamEnvelopeConvoyClosed",
@@ -10181,6 +10260,7 @@
             "order.completed": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderCompleted",
             "order.failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderFailed",
             "order.fired": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderFired",
+            "pg.credential_resolved": "#/components/schemas/TypedTaggedEventStreamEnvelopePgCredentialResolved",
             "project.identity.stamped": "#/components/schemas/TypedTaggedEventStreamEnvelopeProjectIdentityStamped",
             "provider.swapped": "#/components/schemas/TypedTaggedEventStreamEnvelopeProviderSwapped",
             "request.failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestFailed",
@@ -10196,6 +10276,7 @@
             "session.max_age_killed": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled",
             "session.quarantined": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionQuarantined",
             "session.stopped": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStopped",
+            "session.stranded": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionSuspended",
             "session.undrained": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUndrained",
             "session.updated": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUpdated",
@@ -10228,9 +10309,6 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityUnregisterRequested"
-          },
-          {
-            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerRestart"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerStarted"
@@ -10305,6 +10383,9 @@
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderFired"
           },
           {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopePgCredentialResolved"
+          },
+          {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeProjectIdentityStamped"
           },
           {
@@ -10348,6 +10429,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStopped"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStranded"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionSuspended"
@@ -10701,52 +10785,6 @@
         "title": "TypedTaggedEventStreamEnvelope city.unregister_requested",
         "type": "object"
       },
-      "TypedTaggedEventStreamEnvelopeControllerRestart": {
-        "additionalProperties": false,
-        "properties": {
-          "actor": {
-            "type": "string"
-          },
-          "city": {
-            "type": "string"
-          },
-          "message": {
-            "type": "string"
-          },
-          "payload": {
-            "$ref": "#/components/schemas/ControllerRestartPayload"
-          },
-          "seq": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "subject": {
-            "type": "string"
-          },
-          "ts": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "type": {
-            "const": "controller.restart",
-            "type": "string"
-          },
-          "workflow": {
-            "$ref": "#/components/schemas/WorkflowEventProjection"
-          }
-        },
-        "required": [
-          "seq",
-          "type",
-          "ts",
-          "actor",
-          "payload",
-          "city"
-        ],
-        "title": "TypedTaggedEventStreamEnvelope controller.restart",
-        "type": "object"
-      },
       "TypedTaggedEventStreamEnvelopeControllerStarted": {
         "additionalProperties": false,
         "properties": {
@@ -10970,6 +11008,7 @@
                 "session.suspended",
                 "session.updated",
                 "session.drain_acked_with_assigned_work",
+                "session.stranded",
                 "session.work_query_failed",
                 "bead.created",
                 "bead.closed",
@@ -11013,7 +11052,8 @@
                 "extmsg.outbound",
                 "events.rotated",
                 "gc.store.maintenance.done",
-                "gc.store.maintenance.failed"
+                "gc.store.maintenance.failed",
+                "pg.credential_resolved"
               ]
             },
             "type": "string"
@@ -11953,6 +11993,52 @@
         "title": "TypedTaggedEventStreamEnvelope order.fired",
         "type": "object"
       },
+      "TypedTaggedEventStreamEnvelopePgCredentialResolved": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PostgresCredentialResolvedPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "pg.credential_resolved",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope pg.credential_resolved",
+        "type": "object"
+      },
       "TypedTaggedEventStreamEnvelopeProjectIdentityStamped": {
         "additionalProperties": false,
         "properties": {
@@ -12641,6 +12727,52 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.stopped",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionStranded": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.stranded",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.stranded",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionSuspended": {

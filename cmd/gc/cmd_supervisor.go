@@ -129,6 +129,62 @@ func newSupervisorStatusCmd(stdout, stderr io.Writer) *cobra.Command {
 	return cmd
 }
 
+// openSupervisorLogForTee opens the supervisor log file in append mode for
+// runSupervisor to tee output into.
+func openSupervisorLogForTee() (*os.File, error) {
+	f, err := os.OpenFile(supervisorLogPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("opening supervisor log %s: %w", supervisorLogPath(), err)
+	}
+	return f, nil
+}
+
+// shouldTeeSupervisorLog reports whether w is distinct from supervisor.log.
+// Service managers and manual background start can hand this process
+// fd-backed stdout/stderr that already append to supervisor.log while still
+// carrying cosmetic names like /dev/stdout. Compare open file identity instead
+// of names so those paths do not double-log.
+func shouldTeeSupervisorLog(w io.Writer, logFile *os.File) bool {
+	if w == nil || logFile == nil {
+		return false
+	}
+	wf, ok := fileWriterForSupervisorLog(w)
+	if !ok {
+		return true
+	}
+	same, err := sameOpenFile(wf, logFile)
+	if err != nil {
+		return true
+	}
+	return !same
+}
+
+func fileWriterForSupervisorLog(w io.Writer) (*os.File, bool) {
+	switch v := w.(type) {
+	case *os.File:
+		return v, true
+	case *switchableWriter:
+		if v == nil || v.target == nil {
+			return nil, false
+		}
+		return fileWriterForSupervisorLog(v.target)
+	default:
+		return nil, false
+	}
+}
+
+func sameOpenFile(a, b *os.File) (bool, error) {
+	aInfo, err := a.Stat()
+	if err != nil {
+		return false, err
+	}
+	bInfo, err := b.Stat()
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(aInfo, bInfo), nil
+}
+
 // acquireSupervisorLock takes an exclusive flock on the supervisor lock file.
 func acquireSupervisorLock() (*os.File, error) {
 	dir := supervisor.RuntimeDir()
@@ -215,6 +271,10 @@ const supervisorOmitProviderCredsEnv = "GC_SUPERVISOR_OMIT_PROVIDER_CREDS"
 var supervisorShutdownSettleDelay = 50 * time.Millisecond
 
 var supervisorSignalNotify = signal.Notify
+
+// supervisorLoadConfig follows the package's test-double convention; tests
+// that replace it must not run in parallel.
+var supervisorLoadConfig = supervisor.LoadConfig
 
 // supervisorHardExitCodeRepeatedShutdown is the exit code for repeated
 // destructive shutdown escalation. 130 approximates the shell SIGINT
@@ -444,7 +504,7 @@ func (s *shutdownState) finish(err error) {
 	close(s.done)
 }
 
-func startSupervisorSocket(sockPath string, requestShutdown func(supervisorShutdownMode, shutdownTrigger) bool, reconcileCh chan reconcileRequest, restartCityCh chan restartCityRequest, shut *shutdownState) (net.Listener, error) {
+func startSupervisorSocket(sockPath string, requestShutdown func(supervisorShutdownMode, shutdownTrigger) bool, reconcileCh chan reconcileRequest, shut *shutdownState) (net.Listener, error) {
 	os.Remove(sockPath) //nolint:errcheck // remove stale socket from previous crash
 	lis, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -462,7 +522,7 @@ func startSupervisorSocket(sockPath string, requestShutdown func(supervisorShutd
 				fmt.Fprintf(os.Stderr, "gc supervisor: socket accept: %v\n", err) //nolint:errcheck
 				continue
 			}
-			go handleSupervisorConn(conn, requestShutdown, reconcileCh, restartCityCh, shut)
+			go handleSupervisorConn(conn, requestShutdown, reconcileCh, shut)
 		}
 	}()
 	return lis, nil
@@ -478,7 +538,7 @@ func startSupervisorSocket(sockPath string, requestShutdown func(supervisorShutd
 // then — if the client keeps the connection open — blocks until shutdown
 // completes and sends a second line "done:ok\n" or "done:err:<detail>\n"
 // so --wait clients can distinguish clean shutdown from partial failure.
-func handleSupervisorConn(conn net.Conn, requestShutdown func(supervisorShutdownMode, shutdownTrigger) bool, reconcileCh chan reconcileRequest, restartCityCh chan restartCityRequest, shut *shutdownState) {
+func handleSupervisorConn(conn net.Conn, requestShutdown func(supervisorShutdownMode, shutdownTrigger) bool, reconcileCh chan reconcileRequest, shut *shutdownState) {
 	defer conn.Close()                                     //nolint:errcheck
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck
 	scanner := bufio.NewScanner(conn)
@@ -611,28 +671,15 @@ func stopSupervisor(stdout, stderr io.Writer) int {
 // stopSupervisorWithWait is stopSupervisor with an optional --wait phase
 // for surfacing per-city shutdown errors. Behavior summary:
 //
-//   - Always sends "stop" and waits for the supervisor process to exit
-//     before returning. When graceful drain exhausts the escalation
-//     budget (waitTimeout if >0, else supervisorStopKillTimeout), the
-//     CLI SIGKILLs the supervisor PID and waits supervisorStopKillGrace
-//     for it to die. If even SIGKILL leaves the process alive, stop
-//     returns non-zero with a clear "still alive" error — never claims
-//     "Supervisor stopped." while the process is still on the box.
-//     (ci-lg52n.)
-//   - With wait=true the function also reads the post-shutdown status
-//     line (done:ok / done:err:<detail>) so callers see city-level
-//     shutdown errors. The status read is best-effort; failure to read
-//     it never replaces the hard exit-wait above.
-//
-// It unloads the platform service (without removing the unit file)
-// after the supervisor acknowledges the destructive socket stop, so
-// launchd/systemd will not restart it when the process exits.
+// It also unloads the platform service (without removing the unit file) after
+// the supervisor acknowledges the destructive socket stop, so launchd/systemd
+// will not restart it when the process exits.
 func stopSupervisorWithWait(stdout, stderr io.Writer, wait bool, waitTimeout time.Duration) int {
 	return stopSupervisorWithWaitJSON(stdout, stderr, wait, waitTimeout, false)
 }
 
 func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout time.Duration, jsonOut bool) int {
-	sockPath, pid := runningSupervisorSocket() // pid needed for SIGKILL escalation (ci-lg52n)
+	sockPath, _ := runningSupervisorSocket()
 	if sockPath == "" {
 		fmt.Fprintln(stderr, "gc supervisor stop: supervisor is not running") //nolint:errcheck
 		return 1
@@ -655,6 +702,15 @@ func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout
 		fmt.Fprintln(stdout, "Supervisor stopping...") //nolint:errcheck
 	}
 	unloadSupervisorService()
+	if !wait {
+		if jsonOut {
+			return writeSupervisorStopSuccess(stdout, stderr, wait)
+		}
+		return 0
+	}
+	if waitTimeout <= 0 {
+		waitTimeout = 30 * time.Second
+	}
 
 	killTimeout := waitTimeout
 	if killTimeout <= 0 {
@@ -681,8 +737,14 @@ func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout
 				fmt.Fprintf(stderr, "gc supervisor stop: unexpected status %q\n", line) //nolint:errcheck
 				doneErr = fmt.Errorf("unexpected supervisor status: %s", line)
 			}
-		case errors.Is(statusErr, io.EOF):
-			// Older supervisor — no done:* line. Fall through to exit-wait.
+			if jsonOut {
+				return writeSupervisorStopSuccess(stdout, stderr, wait)
+			}
+			fmt.Fprintln(stdout, "Supervisor stopped.") //nolint:errcheck
+			return 0
+		case strings.HasPrefix(line, "done:err:"):
+			fmt.Fprintf(stderr, "gc supervisor stop: %s\n", strings.TrimPrefix(line, "done:err:")) //nolint:errcheck
+			return 1
 		default:
 			// Likely a read deadline; the exit-wait below will surface
 			// a clearer "process still alive" message if the supervisor
@@ -707,72 +769,6 @@ func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout
 	}
 	fmt.Fprintln(stdout, "Supervisor stopped.") //nolint:errcheck
 	return 0
-}
-
-// waitForSupervisorProcessExit polls until the supervisor process has
-// exited, escalating to SIGKILL if the graceful budget is exhausted.
-//
-// Liveness signals: the PID hint from the supervisor's ping reply is
-// the primary probe (kill(pid, 0) is the kernel's authoritative answer
-// to "is this process alive?"). The socket-poll path is a secondary
-// signal that lets us exit promptly when the listener closes ahead of
-// process death. When pid <= 0 (older supervisors, or empty ping reply)
-// the function falls back to socket-only polling — same shape as the
-// pre-fix code, just with a clearer error message.
-func waitForSupervisorProcessExit(pid int, sockPath string, killTimeout time.Duration, stderr io.Writer) error {
-	if killTimeout <= 0 {
-		killTimeout = supervisorStopKillTimeout
-	}
-
-	gracefulDeadline := time.Now().Add(killTimeout)
-	for time.Now().Before(gracefulDeadline) {
-		if pid > 0 && !supervisorStopProcessAlive(pid) {
-			return nil
-		}
-		// Cheap socket probe; capped to a small window so a wedged
-		// socket can't extend the poll past the kill deadline.
-		probeDeadline := time.Now().Add(200 * time.Millisecond)
-		if probeDeadline.After(gracefulDeadline) {
-			probeDeadline = gracefulDeadline
-		}
-		if supervisorAliveAtPathUntil(sockPath, probeDeadline) == 0 {
-			// Socket gone — if we have a PID, confirm the process is
-			// also gone before declaring victory. Otherwise trust the
-			// socket signal.
-			if pid <= 0 || !supervisorStopProcessAlive(pid) {
-				return nil
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	// No PID to escalate against: degrade to socket polling with the
-	// kill-grace budget so we at least return a clean timeout error.
-	if pid <= 0 {
-		return waitForSupervisorExitUntil(sockPath, time.Now().Add(supervisorStopKillGrace))
-	}
-
-	// Escalate to SIGKILL.
-	fmt.Fprintf(stderr, "gc supervisor stop: drain exceeded %s; sending SIGKILL to supervisor PID %d\n", killTimeout, pid) //nolint:errcheck
-	if err := supervisorStopKillProcess(pid, syscall.SIGKILL); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-		return fmt.Errorf("sending SIGKILL to supervisor PID %d: %w", pid, err)
-	}
-
-	killGrace := supervisorStopKillGrace
-	if killGrace <= 0 {
-		killGrace = 5 * time.Second
-	}
-	killDeadline := time.Now().Add(killGrace)
-	for time.Now().Before(killDeadline) {
-		if !supervisorStopProcessAlive(pid) {
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return fmt.Errorf("supervisor PID %d still alive %s after SIGKILL; manual intervention required", pid, killGrace)
 }
 
 func writeSupervisorStopSuccess(stdout, stderr io.Writer, wait bool) int {
@@ -1048,6 +1044,31 @@ func runSupervisor(stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// Ensure ~/.gc/ exists. doSupervisorStart does this when invoked
+	// manually (mkdir + open log file before spawning the child), but the
+	// systemd/launchd/container paths jump straight to `gc supervisor run`
+	// without that prep — which leaves operators with `gc supervisor logs`
+	// reporting "log file not found" and no way to see startup errors.
+	if err := os.MkdirAll(supervisor.DefaultHome(), 0o700); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor: ensuring home dir %s: %v\n", supervisor.DefaultHome(), err) //nolint:errcheck
+		return 1
+	}
+	// Always tee to ~/.gc/supervisor.log so `gc supervisor logs` works
+	// regardless of how the supervisor was invoked. We skip the tee when
+	// stdout/stderr already point at the same file (manual `gc supervisor
+	// start` path) to avoid double-logging.
+	if logFile, err := openSupervisorLogForTee(); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor: tee disabled: %v\n", err) //nolint:errcheck
+	} else {
+		defer logFile.Close() //nolint:errcheck // keep after later run-loop cleanup defers
+		if shouldTeeSupervisorLog(stdout, logFile) {
+			stdout = io.MultiWriter(stdout, logFile)
+		}
+		if shouldTeeSupervisorLog(stderr, logFile) {
+			stderr = io.MultiWriter(stderr, logFile)
+		}
+	}
+
 	lock, err := acquireSupervisorLock()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc supervisor: %v\n", err) //nolint:errcheck
@@ -1095,7 +1116,7 @@ func runSupervisor(stdout, stderr io.Writer) int {
 	}, stderr)
 
 	// Load supervisor config.
-	supCfg, err := supervisor.LoadConfig(supervisor.ConfigPath())
+	supCfg, err := supervisorLoadConfig(supervisor.ConfigPath())
 	if err != nil {
 		fmt.Fprintf(stderr, "gc supervisor: config: %v\n", err) //nolint:errcheck
 		return 1
@@ -1105,13 +1126,6 @@ func runSupervisor(stdout, stderr io.Writer) int {
 	if err := cleanupSupervisorWorkspaceServicesForSupervisorStart(supervisor.DefaultHome()); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor: workspace-service startup cleanup: %v\n", err) //nolint:errcheck
 		return 1
-	}
-	// Self-heal stale dolt.lock files from a prior supervisor crash so
-	// operators do not have to run `rm` by hand before `gc supervisor
-	// start`. Best-effort: log non-fatal so supervisor startup continues
-	// even when one city's cleanup fails.
-	if err := cleanupStaleManagedDoltLifecycleLocksForSupervisorStart(supervisor.DefaultHome()); err != nil {
-		fmt.Fprintf(stderr, "gc supervisor: managed dolt lock startup cleanup: %v\n", err) //nolint:errcheck
 	}
 
 	// Start API server with city-namespaced routing (Phase 2).
@@ -1170,7 +1184,7 @@ func runSupervisor(stdout, stderr io.Writer) int {
 		return 1
 	}
 	shut := newShutdownState()
-	lis, err := startSupervisorSocket(sockPath, requestShutdown, reconcileCh, restartCityCh, shut)
+	lis, err := startSupervisorSocket(sockPath, requestShutdown, reconcileCh, shut)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc supervisor: %v\n", err) //nolint:errcheck
 		return 1

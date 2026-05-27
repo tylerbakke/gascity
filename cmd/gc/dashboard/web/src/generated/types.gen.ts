@@ -754,7 +754,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorShutdownPayload | UnboundEventPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | PostgresCredentialResolvedPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorShutdownPayload | UnboundEventPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -1879,6 +1879,15 @@ export type PoolOverride = {
     Min: number | null;
     OnBoot: string | null;
     OnDeath: string | null;
+};
+
+export type PostgresCredentialResolvedPayload = {
+    host: string;
+    port: string;
+    scope_kind: string;
+    scope_name: string;
+    source: string;
+    user: string;
 };
 
 export type ProjectIdentityStampedPayload = {
@@ -3228,6 +3237,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeOrderFailed) | ({
     type: 'order.fired';
 } & TypedEventStreamEnvelopeOrderFired) | ({
+    type: 'pg.credential_resolved';
+} & TypedEventStreamEnvelopePgCredentialResolved) | ({
     type: 'project.identity.stamped';
 } & TypedEventStreamEnvelopeProjectIdentityStamped) | ({
     type: 'provider.swapped';
@@ -3258,6 +3269,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeSessionQuarantined) | ({
     type: 'session.stopped';
 } & TypedEventStreamEnvelopeSessionStopped) | ({
+    type: 'session.stranded';
+} & TypedEventStreamEnvelopeSessionStranded) | ({
     type: 'session.suspended';
 } & TypedEventStreamEnvelopeSessionSuspended) | ({
     type: 'session.undrained';
@@ -3726,6 +3739,20 @@ export type TypedEventStreamEnvelopeOrderFired = {
 };
 
 /**
+ * TypedEventStreamEnvelope pg.credential_resolved
+ */
+export type TypedEventStreamEnvelopePgCredentialResolved = {
+    actor: string;
+    message?: string;
+    payload: PostgresCredentialResolvedPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'pg.credential_resolved';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope project.identity.stamped
  */
 export type TypedEventStreamEnvelopeProjectIdentityStamped = {
@@ -3936,6 +3963,20 @@ export type TypedEventStreamEnvelopeSessionStopped = {
 };
 
 /**
+ * TypedEventStreamEnvelope session.stranded
+ */
+export type TypedEventStreamEnvelopeSessionStranded = {
+    actor: string;
+    message?: string;
+    payload: NoPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.stranded';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope session.suspended
  */
 export type TypedEventStreamEnvelopeSessionSuspended = {
@@ -4115,6 +4156,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeOrderFailed) | ({
     type: 'order.fired';
 } & TypedTaggedEventStreamEnvelopeOrderFired) | ({
+    type: 'pg.credential_resolved';
+} & TypedTaggedEventStreamEnvelopePgCredentialResolved) | ({
     type: 'project.identity.stamped';
 } & TypedTaggedEventStreamEnvelopeProjectIdentityStamped) | ({
     type: 'provider.swapped';
@@ -4145,6 +4188,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeSessionQuarantined) | ({
     type: 'session.stopped';
 } & TypedTaggedEventStreamEnvelopeSessionStopped) | ({
+    type: 'session.stranded';
+} & TypedTaggedEventStreamEnvelopeSessionStranded) | ({
     type: 'session.suspended';
 } & TypedTaggedEventStreamEnvelopeSessionSuspended) | ({
     type: 'session.undrained';
@@ -4645,6 +4690,21 @@ export type TypedTaggedEventStreamEnvelopeOrderFired = {
 };
 
 /**
+ * TypedTaggedEventStreamEnvelope pg.credential_resolved
+ */
+export type TypedTaggedEventStreamEnvelopePgCredentialResolved = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: PostgresCredentialResolvedPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'pg.credential_resolved';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedTaggedEventStreamEnvelope project.identity.stamped
  */
 export type TypedTaggedEventStreamEnvelopeProjectIdentityStamped = {
@@ -4866,6 +4926,21 @@ export type TypedTaggedEventStreamEnvelopeSessionStopped = {
     subject?: string;
     ts: string;
     type: 'session.stopped';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope session.stranded
+ */
+export type TypedTaggedEventStreamEnvelopeSessionStranded = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: NoPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.stranded';
     workflow?: WorkflowEventProjection;
 };
 
