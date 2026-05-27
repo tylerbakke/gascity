@@ -668,6 +668,13 @@ type startOps interface {
 // tmuxStartOps adapts [*Tmux] to the [startOps] interface.
 type tmuxStartOps struct{ tm *Tmux }
 
+const (
+	defaultReadyProbeTimeout = 15 * time.Second
+	minReadyProbeTimeout     = 5 * time.Second
+	maxReadyProbeTimeout     = 60 * time.Second
+	readyProbeSlack          = 5 * time.Second
+)
+
 func (o *tmuxStartOps) createSession(name, workDir, command string, env map[string]string) error {
 	if command != "" || len(env) > 0 {
 		return o.tm.NewSessionWithCommandAndEnv(name, workDir, command, env)
@@ -740,6 +747,37 @@ func (o *tmuxStartOps) runSetupCommand(ctx context.Context, cmd string, env map[
 	return c.Run()
 }
 
+func startupReadyProbeTimeout(cfg runtime.Config) time.Duration {
+	if cfg.ReadyDelayMs <= 0 {
+		if cfg.ReadyPromptPrefix != "" {
+			return defaultReadyProbeTimeout
+		}
+		return 0
+	}
+	timeout := time.Duration(cfg.ReadyDelayMs)*time.Millisecond + readyProbeSlack
+	if timeout < minReadyProbeTimeout {
+		timeout = minReadyProbeTimeout
+	}
+	if timeout > maxReadyProbeTimeout {
+		timeout = maxReadyProbeTimeout
+	}
+	return timeout
+}
+
+func ignoreDeadlineIfSessionAlive(ops startOps, name string, err error) error {
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	alive, hasErr := ops.hasSession(name)
+	if hasErr != nil {
+		return fmt.Errorf("verifying session after ready deadline: %w", hasErr)
+	}
+	if alive {
+		return nil
+	}
+	return err
+}
+
 // doStartSession is the pure startup orchestration logic.
 // Testable via fakeStartOps without a real tmux server.
 // The setupTimeout parameter controls the per-command timeout for
@@ -806,9 +844,9 @@ func doStartSession(ctx context.Context, ops startOps, name string, cfg runtime.
 			ReadyDelayMs:      cfg.ReadyDelayMs,
 			ProcessNames:      cfg.ProcessNames,
 		}}
-		_ = ops.waitForReady(ctx, name, rc, 60*time.Second) // best-effort
+		_ = ops.waitForReady(ctx, name, rc, startupReadyProbeTimeout(cfg)) // best-effort
 		if err := ctx.Err(); err != nil {
-			return err
+			return ignoreDeadlineIfSessionAlive(ops, name, err)
 		}
 	}
 
@@ -818,7 +856,7 @@ func doStartSession(ctx context.Context, ops startOps, name string, cfg runtime.
 	if shouldAcceptStartupDialogs(cfg) {
 		_ = ops.acceptStartupDialogs(ctx, name) // best-effort
 		if err := ctx.Err(); err != nil {
-			return err
+			return ignoreDeadlineIfSessionAlive(ops, name, err)
 		}
 	}
 
