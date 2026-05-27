@@ -504,7 +504,7 @@ func (s *shutdownState) finish(err error) {
 	close(s.done)
 }
 
-func startSupervisorSocket(sockPath string, requestShutdown func(supervisorShutdownMode, shutdownTrigger) bool, reconcileCh chan reconcileRequest, shut *shutdownState) (net.Listener, error) {
+func startSupervisorSocket(sockPath string, requestShutdown func(supervisorShutdownMode, shutdownTrigger) bool, reconcileCh chan reconcileRequest, restartCityCh chan restartCityRequest, shut *shutdownState) (net.Listener, error) {
 	os.Remove(sockPath) //nolint:errcheck // remove stale socket from previous crash
 	lis, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -522,7 +522,7 @@ func startSupervisorSocket(sockPath string, requestShutdown func(supervisorShutd
 				fmt.Fprintf(os.Stderr, "gc supervisor: socket accept: %v\n", err) //nolint:errcheck
 				continue
 			}
-			go handleSupervisorConn(conn, requestShutdown, reconcileCh, shut)
+			go handleSupervisorConn(conn, requestShutdown, reconcileCh, restartCityCh, shut)
 		}
 	}()
 	return lis, nil
@@ -538,7 +538,7 @@ func startSupervisorSocket(sockPath string, requestShutdown func(supervisorShutd
 // then — if the client keeps the connection open — blocks until shutdown
 // completes and sends a second line "done:ok\n" or "done:err:<detail>\n"
 // so --wait clients can distinguish clean shutdown from partial failure.
-func handleSupervisorConn(conn net.Conn, requestShutdown func(supervisorShutdownMode, shutdownTrigger) bool, reconcileCh chan reconcileRequest, shut *shutdownState) {
+func handleSupervisorConn(conn net.Conn, requestShutdown func(supervisorShutdownMode, shutdownTrigger) bool, reconcileCh chan reconcileRequest, restartCityCh chan restartCityRequest, shut *shutdownState) {
 	defer conn.Close()                                     //nolint:errcheck
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck
 	scanner := bufio.NewScanner(conn)
@@ -742,8 +742,8 @@ func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout
 			}
 			fmt.Fprintln(stdout, "Supervisor stopped.") //nolint:errcheck
 			return 0
-		case strings.HasPrefix(line, "done:err:"):
-			fmt.Fprintf(stderr, "gc supervisor stop: %s\n", strings.TrimPrefix(line, "done:err:")) //nolint:errcheck
+		case strings.HasPrefix(statusLine, "done:err:"):
+			fmt.Fprintf(stderr, "gc supervisor stop: %s\n", strings.TrimPrefix(statusLine, "done:err:")) //nolint:errcheck
 			return 1
 		default:
 			// Likely a read deadline; the exit-wait below will surface
@@ -755,7 +755,7 @@ func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout
 	// Always verify the process actually exited. ci-lg52n: without this
 	// check, the CLI returned 0 in production while the supervisor was
 	// still alive, requiring manual `kill -9`.
-	if exitErr := waitForSupervisorProcessExit(pid, sockPath, killTimeout, stderr); exitErr != nil {
+	if exitErr := waitForSupervisorExitUntil(sockPath, time.Now().Add(killTimeout)); exitErr != nil {
 		fmt.Fprintf(stderr, "gc supervisor stop: %v\n", exitErr) //nolint:errcheck
 		return 1
 	}
@@ -1184,7 +1184,7 @@ func runSupervisor(stdout, stderr io.Writer) int {
 		return 1
 	}
 	shut := newShutdownState()
-	lis, err := startSupervisorSocket(sockPath, requestShutdown, reconcileCh, shut)
+	lis, err := startSupervisorSocket(sockPath, requestShutdown, reconcileCh, restartCityCh, shut)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc supervisor: %v\n", err) //nolint:errcheck
 		return 1
