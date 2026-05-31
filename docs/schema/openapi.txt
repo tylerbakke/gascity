@@ -873,6 +873,10 @@
           },
           "title": {
             "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -2062,6 +2066,9 @@
           },
           {
             "$ref": "#/components/schemas/CityUnregisterSucceededPayload"
+          },
+          {
+            "$ref": "#/components/schemas/ControllerRestartPayload"
           },
           {
             "$ref": "#/components/schemas/GroupCreatedEventPayload"
@@ -7546,6 +7553,7 @@
             "city.resumed": "#/components/schemas/TypedEventStreamEnvelopeCityResumed",
             "city.suspended": "#/components/schemas/TypedEventStreamEnvelopeCitySuspended",
             "city.unregister_requested": "#/components/schemas/TypedEventStreamEnvelopeCityUnregisterRequested",
+            "controller.restart": "#/components/schemas/TypedEventStreamEnvelopeControllerRestart",
             "controller.started": "#/components/schemas/TypedEventStreamEnvelopeControllerStarted",
             "controller.stopped": "#/components/schemas/TypedEventStreamEnvelopeControllerStopped",
             "convoy.closed": "#/components/schemas/TypedEventStreamEnvelopeConvoyClosed",
@@ -7619,6 +7627,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeCityUnregisterRequested"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeControllerRestart"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeControllerStarted"
@@ -8065,6 +8076,48 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope city.unregister_requested",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeControllerRestart": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/ControllerRestartPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "controller.restart",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope controller.restart",
         "type": "object"
       },
       "TypedEventStreamEnvelopeControllerStarted": {
@@ -10236,6 +10289,7 @@
             "city.resumed": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityResumed",
             "city.suspended": "#/components/schemas/TypedTaggedEventStreamEnvelopeCitySuspended",
             "city.unregister_requested": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityUnregisterRequested",
+            "controller.restart": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerRestart",
             "controller.started": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerStarted",
             "controller.stopped": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerStopped",
             "convoy.closed": "#/components/schemas/TypedTaggedEventStreamEnvelopeConvoyClosed",
@@ -10309,6 +10363,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityUnregisterRequested"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerRestart"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeControllerStarted"
@@ -10783,6 +10840,52 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope city.unregister_requested",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeControllerRestart": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/ControllerRestartPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "controller.restart",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope controller.restart",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeControllerStarted": {

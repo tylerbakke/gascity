@@ -468,7 +468,7 @@ func buildDesiredStateWithSessionBeads(
 		if len(assignedWorkBeads) > 0 {
 			fmt.Fprintf(stderr, "assignedWorkBeads: %d beads found\n", len(assignedWorkBeads)) //nolint:errcheck
 			for _, wb := range assignedWorkBeads {
-				fmt.Fprintf(stderr, "  %s assignee=%s routed=%s status=%s\n", wb.ID, wb.Assignee, wb.Metadata["gc.routed_to"], wb.Status) //nolint:errcheck
+				fmt.Fprintf(stderr, "  %s assignee=%s routed=%s run_target=%s status=%s\n", wb.ID, wb.Assignee, wb.Metadata["gc.routed_to"], wb.Metadata["gc.run_target"], wb.Status) //nolint:errcheck
 			}
 		} else {
 			fmt.Fprintf(stderr, "assignedWorkBeads: 0 beads (rigStores=%d)\n", len(rigStores)) //nolint:errcheck
@@ -1040,7 +1040,12 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 			if strings.TrimSpace(b.Assignee) != "" {
 				continue
 			}
-			template := strings.TrimSpace(b.Metadata["gc.routed_to"])
+			// gc.run_target (per-step) takes precedence over gc.routed_to
+			// (convoy-wide default). See dispatch/fanout.go and adaf6ec.
+			template := strings.TrimSpace(b.Metadata["gc.run_target"])
+			if template == "" {
+				template = strings.TrimSpace(b.Metadata["gc.routed_to"])
+			}
 			if _, ok := group.templates[template]; !ok {
 				continue
 			}
@@ -1181,12 +1186,17 @@ func defaultNamedSessionDemand(targets []defaultScaleCheckTarget, cfg *config.Ci
 			}
 		}
 		for _, b := range ready {
-			// gc.routed_to is the authoritative wake signal for named on-demand
-			// sessions and is honored regardless of bead.assignee. Without this,
-			// a worker→named-session handoff that sets both assignee=<identity>
-			// and gc.routed_to=<identity> on the same bead would be missed when
-			// the legacy assignee-empty filter dropped it.
-			routedTo := strings.TrimSpace(b.Metadata["gc.routed_to"])
+			// gc.run_target (per-step) takes precedence over gc.routed_to
+			// (convoy-wide default). routed_to/run_target is the authoritative
+			// wake signal for named on-demand sessions and is honored regardless
+			// of bead.assignee: a worker->named-session handoff that sets both
+			// assignee and gc.routed_to on the same bead must not be dropped by
+			// the legacy assignee-empty filter. The assignee-empty case is the
+			// fallback handled below.
+			routedTo := strings.TrimSpace(b.Metadata["gc.run_target"])
+			if routedTo == "" {
+				routedTo = strings.TrimSpace(b.Metadata["gc.routed_to"])
+			}
 			assignee := strings.TrimSpace(b.Assignee)
 			if routedTo == "" {
 				// Fall back to assignee-only routing: if the bead is assigned
