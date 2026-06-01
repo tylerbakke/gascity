@@ -678,7 +678,7 @@ func stopSupervisorWithWait(stdout, stderr io.Writer, wait bool, waitTimeout tim
 }
 
 func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout time.Duration, jsonOut bool) int {
-	sockPath, _ := runningSupervisorSocket()
+	sockPath, pid := runningSupervisorSocket()
 	if sockPath == "" {
 		fmt.Fprintln(stderr, "gc supervisor stop: supervisor is not running") //nolint:errcheck
 		return 1
@@ -701,20 +701,12 @@ func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout
 		fmt.Fprintln(stdout, "Supervisor stopping...") //nolint:errcheck
 	}
 	unloadSupervisorService()
-	if !wait {
-		if jsonOut {
-			return writeSupervisorStopSuccess(stdout, stderr, wait)
-		}
-		return 0
-	}
-	if waitTimeout <= 0 {
-		waitTimeout = 30 * time.Second
-	}
 
 	killTimeout := waitTimeout
 	if killTimeout <= 0 {
 		killTimeout = supervisorStopKillTimeout
 	}
+
 	var doneErr error
 	if wait {
 		// Best-effort: read the post-shutdown status line so per-city
@@ -736,14 +728,8 @@ func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout
 				fmt.Fprintf(stderr, "gc supervisor stop: unexpected status %q\n", line) //nolint:errcheck
 				doneErr = fmt.Errorf("unexpected supervisor status: %s", line)
 			}
-			if jsonOut {
-				return writeSupervisorStopSuccess(stdout, stderr, wait)
-			}
-			fmt.Fprintln(stdout, "Supervisor stopped.") //nolint:errcheck
-			return 0
-		case strings.HasPrefix(statusLine, "done:err:"):
-			fmt.Fprintf(stderr, "gc supervisor stop: %s\n", strings.TrimPrefix(statusLine, "done:err:")) //nolint:errcheck
-			return 1
+		case errors.Is(statusErr, io.EOF):
+			// Older supervisor — no done:* line. Fall through to exit-wait.
 		default:
 			// Likely a read deadline; the exit-wait below will surface
 			// a clearer "process still alive" message if the supervisor
@@ -751,10 +737,11 @@ func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout
 		}
 	}
 
-	// Always verify the process actually exited. ci-lg52n: without this
-	// check, the CLI returned 0 in production while the supervisor was
-	// still alive, requiring manual `kill -9`.
-	if exitErr := waitForSupervisorExitUntil(sockPath, time.Now().Add(killTimeout)); exitErr != nil {
+	// Always verify the process actually exited, escalating to SIGKILL if
+	// the graceful budget is exhausted. ci-lg52n: without this check, the
+	// CLI returned 0 in production while the supervisor was still alive,
+	// requiring manual `kill -9`.
+	if exitErr := waitForSupervisorProcessExit(pid, sockPath, killTimeout, stderr); exitErr != nil {
 		fmt.Fprintf(stderr, "gc supervisor stop: %v\n", exitErr) //nolint:errcheck
 		return 1
 	}
@@ -768,6 +755,72 @@ func stopSupervisorWithWaitJSON(stdout, stderr io.Writer, wait bool, waitTimeout
 	}
 	fmt.Fprintln(stdout, "Supervisor stopped.") //nolint:errcheck
 	return 0
+}
+
+// waitForSupervisorProcessExit polls until the supervisor process has
+// exited, escalating to SIGKILL if the graceful budget is exhausted.
+//
+// Liveness signals: the PID hint from the supervisor's ping reply is
+// the primary probe (kill(pid, 0) is the kernel's authoritative answer
+// to "is this process alive?"). The socket-poll path is a secondary
+// signal that lets us exit promptly when the listener closes ahead of
+// process death. When pid <= 0 (older supervisors, or empty ping reply)
+// the function falls back to socket-only polling — same shape as the
+// pre-fix code, just with a clearer error message.
+func waitForSupervisorProcessExit(pid int, sockPath string, killTimeout time.Duration, stderr io.Writer) error {
+	if killTimeout <= 0 {
+		killTimeout = supervisorStopKillTimeout
+	}
+
+	gracefulDeadline := time.Now().Add(killTimeout)
+	for time.Now().Before(gracefulDeadline) {
+		if pid > 0 && !supervisorStopProcessAlive(pid) {
+			return nil
+		}
+		// Cheap socket probe; capped to a small window so a wedged
+		// socket can't extend the poll past the kill deadline.
+		probeDeadline := time.Now().Add(200 * time.Millisecond)
+		if probeDeadline.After(gracefulDeadline) {
+			probeDeadline = gracefulDeadline
+		}
+		if supervisorAliveAtPathUntil(sockPath, probeDeadline) == 0 {
+			// Socket gone — if we have a PID, confirm the process is
+			// also gone before declaring victory. Otherwise trust the
+			// socket signal.
+			if pid <= 0 || !supervisorStopProcessAlive(pid) {
+				return nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// No PID to escalate against: degrade to socket polling with the
+	// kill-grace budget so we at least return a clean timeout error.
+	if pid <= 0 {
+		return waitForSupervisorExitUntil(sockPath, time.Now().Add(supervisorStopKillGrace))
+	}
+
+	// Escalate to SIGKILL.
+	fmt.Fprintf(stderr, "gc supervisor stop: drain exceeded %s; sending SIGKILL to supervisor PID %d\n", killTimeout, pid) //nolint:errcheck
+	if err := supervisorStopKillProcess(pid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return fmt.Errorf("sending SIGKILL to supervisor PID %d: %w", pid, err)
+	}
+
+	killGrace := supervisorStopKillGrace
+	if killGrace <= 0 {
+		killGrace = 5 * time.Second
+	}
+	killDeadline := time.Now().Add(killGrace)
+	for time.Now().Before(killDeadline) {
+		if !supervisorStopProcessAlive(pid) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("supervisor PID %d still alive %s after SIGKILL; manual intervention required", pid, killGrace)
 }
 
 func writeSupervisorStopSuccess(stdout, stderr io.Writer, wait bool) int {
