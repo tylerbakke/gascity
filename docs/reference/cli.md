@@ -3386,6 +3386,24 @@ gc supervisor reload [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL summary |
 
+## gc supervisor restart-city
+
+Drain the named city's controller, wait for in-flight sessions to
+quiesce, then respawn the controller from the current on-disk gc
+binary. Sibling cities are untouched.
+
+Pass --force to skip the drain wait and SIGTERM the controller
+immediately. Pass --timeout to bound the graceful drain (default 5m).
+
+```
+gc supervisor restart-city <city-name> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--force` | bool |  | Skip drain wait and force the controller down immediately |
+| `--timeout` | duration | `5m0s` | Maximum time to wait for graceful drain |
+
 ## gc supervisor run
 
 Run the machine-wide supervisor in the foreground.
