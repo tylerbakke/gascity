@@ -1,6 +1,7 @@
 import { cityScope } from "./api";
 import { renderCityTabs } from "./panels/cities";
 import { renderStatus } from "./panels/status";
+import { renderFleetStatus } from "./panels/fleet-status";
 import { renderCrew, installCrewInteractions, closeLogDrawerExternal, resetCrewNoCity } from "./panels/crew";
 import { renderIssues, installIssueInteractions, resetIssuesNoCity } from "./panels/issues";
 import { renderMail, installMailInteractions, resetMailNoCity } from "./panels/mail";

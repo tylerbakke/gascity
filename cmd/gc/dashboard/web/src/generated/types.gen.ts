@@ -535,6 +535,14 @@ export type ConfigValidateOutputBody = {
     warnings: Array<string> | null;
 };
 
+export type ControllerRestartPayload = {
+    city: string;
+    drain_duration_ms: number;
+    forced: boolean;
+    new_binary_sha?: string;
+    old_binary_sha?: string;
+};
+
 export type ConversationGroupParticipant = {
     GroupID: string;
     Handle: string;
@@ -755,7 +763,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | PostgresCredentialResolvedPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorShutdownPayload | UnboundEventPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | ControllerRestartPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | PostgresCredentialResolvedPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorShutdownPayload | UnboundEventPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -1067,6 +1075,111 @@ export type FanoutPolicy = {
     Enabled: boolean;
     MaxPeerTriggeredPublishes: number;
     MaxTotalPeerDeliveries: number;
+};
+
+export type FleetHost = {
+    /**
+     * Configured primary address (Tailscale, LAN, or DNS).
+     */
+    address: string;
+    /**
+     * Address the probe actually reached (may differ from address when public-fallback fired).
+     */
+    address_used: string;
+    /**
+     * Free disk space in GiB on the host. Null when unreachable.
+     */
+    disk_free_gb: number | null;
+    /**
+     * Running dolt server count on the host. Null when unreachable.
+     */
+    dolt_servers: number | null;
+    /**
+     * Probe error string for unreachable hosts. Null on success.
+     */
+    error: string | null;
+    /**
+     * Bus event name the snapshot row came from (e.g. "fleet.host").
+     */
+    event: string;
+    /**
+     * gc binary version reported by the host. Null when unreachable or not installed.
+     */
+    gc_version: string | null;
+    /**
+     * Logical host name (matches the fleet inventory).
+     */
+    host: string;
+    /**
+     * Free memory in GiB on the host. Null when unreachable.
+     */
+    mem_free_gb: number | null;
+    /**
+     * True when the probe successfully completed.
+     */
+    reachable: boolean;
+    /**
+     * Host role label (e.g. primary-control-plane, worker, dr-target).
+     */
+    role: string;
+    /**
+     * Active session count on the host. Null when unreachable.
+     */
+    sessions_active: number | null;
+    /**
+     * True when a gc supervisor is running on the host. Null when unreachable.
+     */
+    supervisor_running: boolean | null;
+    /**
+     * Transport the probe used (local, tailscale, public-fallback, unreachable).
+     */
+    via: string;
+};
+
+export type FleetStatusBody = {
+    /**
+     * Age of the snapshot in seconds, computed from generated_at.
+     */
+    age_sec: number;
+    /**
+     * When the snapshot was written by the fleet-status order.
+     */
+    generated_at: string;
+    /**
+     * Per-host probe rows from the snapshot.
+     */
+    hosts: Array<FleetHost> | null;
+    /**
+     * True when the snapshot is older than the freshness window (30 minutes). The data is still returned so the dashboard can render an honest "last seen" rather than disappearing.
+     */
+    stale: boolean;
+    /**
+     * Aggregated fleet summary from the snapshot.
+     */
+    summary: FleetSummary;
+};
+
+export type FleetSummary = {
+    /**
+     * Bus event name (e.g. "fleet.summary").
+     */
+    event: string;
+    /**
+     * When the snapshot was written.
+     */
+    generated_at: string;
+    /**
+     * Number of hosts the probe successfully reached.
+     */
+    reachable: number;
+    /**
+     * Total host count probed.
+     */
+    total: number;
+    /**
+     * Number of hosts the probe could not reach.
+     */
+    unreachable: number;
 };
 
 export type FormulaDetailResponse = {
@@ -3190,6 +3303,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeCitySuspended) | ({
     type: 'city.unregister_requested';
 } & TypedEventStreamEnvelopeCityUnregisterRequested) | ({
+    type: 'controller.restart';
+} & TypedEventStreamEnvelopeControllerRestart) | ({
     type: 'controller.started';
 } & TypedEventStreamEnvelopeControllerStarted) | ({
     type: 'controller.stopped';
@@ -3386,6 +3501,20 @@ export type TypedEventStreamEnvelopeCityUnregisterRequested = {
     subject?: string;
     ts: string;
     type: 'city.unregister_requested';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope controller.restart
+ */
+export type TypedEventStreamEnvelopeControllerRestart = {
+    actor: string;
+    message?: string;
+    payload: ControllerRestartPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'controller.restart';
     workflow?: WorkflowEventProjection;
 };
 
@@ -4109,6 +4238,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeCitySuspended) | ({
     type: 'city.unregister_requested';
 } & TypedTaggedEventStreamEnvelopeCityUnregisterRequested) | ({
+    type: 'controller.restart';
+} & TypedTaggedEventStreamEnvelopeControllerRestart) | ({
     type: 'controller.started';
 } & TypedTaggedEventStreamEnvelopeControllerStarted) | ({
     type: 'controller.stopped';
@@ -4312,6 +4443,21 @@ export type TypedTaggedEventStreamEnvelopeCityUnregisterRequested = {
     subject?: string;
     ts: string;
     type: 'city.unregister_requested';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope controller.restart
+ */
+export type TypedTaggedEventStreamEnvelopeControllerRestart = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: ControllerRestartPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'controller.restart';
     workflow?: WorkflowEventProjection;
 };
 
@@ -7652,6 +7798,36 @@ export type PostV0CityByCityNameExtmsgUnbindResponses = {
 };
 
 export type PostV0CityByCityNameExtmsgUnbindResponse = PostV0CityByCityNameExtmsgUnbindResponses[keyof PostV0CityByCityNameExtmsgUnbindResponses];
+
+export type GetV0CityByCityNameFleetStatusData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/fleet/status';
+};
+
+export type GetV0CityByCityNameFleetStatusErrors = {
+    /**
+     * Error
+     */
+    default: ErrorModel;
+};
+
+export type GetV0CityByCityNameFleetStatusError = GetV0CityByCityNameFleetStatusErrors[keyof GetV0CityByCityNameFleetStatusErrors];
+
+export type GetV0CityByCityNameFleetStatusResponses = {
+    /**
+     * OK
+     */
+    200: FleetStatusBody;
+};
+
+export type GetV0CityByCityNameFleetStatusResponse = GetV0CityByCityNameFleetStatusResponses[keyof GetV0CityByCityNameFleetStatusResponses];
 
 export type GetV0CityByCityNameFormulaByNameData = {
     body?: never;
