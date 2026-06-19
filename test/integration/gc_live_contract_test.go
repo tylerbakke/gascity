@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/pb33f/libopenapi"
 	openapivalidator "github.com/pb33f/libopenapi-validator"
 )
@@ -221,7 +222,7 @@ func TestGCLiveContract_BeadsAndEvents(t *testing.T) {
 	}](t, baseURL, validator, http.MethodPost, cityBase+"/sling", map[string]any{
 		"rig":    rigName,
 		"target": targetAgent,
-		"bead":   rootBead.ID,
+		"bead":   cityScopedBead.ID,
 		"force":  true,
 	}, http.StatusOK)
 	formulaName := "real-world-app-contract-work"
@@ -401,9 +402,14 @@ description = "Read and complete {{issue}}."
 	list := liveContractJSON[struct {
 		Items []beads.Bead `json:"items"`
 		Total int          `json:"total"`
-	}](t, baseURL, validator, http.MethodGet, cityBase+"/beads?label=real-world-app-contract&limit=50&rig="+url.QueryEscape(rigName), nil, http.StatusOK)
-	if list.Total < 3 || !beadListContains(list.Items, rootBead.ID) || !beadListContains(list.Items, siblingBead.ID) {
-		t.Fatalf("filtered beads = %+v, want root and sibling", list)
+	}](t, baseURL, validator, http.MethodGet, cityBase+"/beads?label=real-world-app-contract&limit=50&all=true&rig="+url.QueryEscape(rigName), nil, http.StatusOK)
+	if list.Total < 3 || !beadListContains(list.Items, rootBead.ID) || !beadListContains(list.Items, childBead.ID) || !beadListContains(list.Items, siblingBead.ID) {
+		t.Fatalf("filtered beads = %+v, want root, child, and sibling", list)
+	}
+	if listedChild, ok := findLiveContractBead(list.Items, childBead.ID); !ok {
+		t.Fatalf("filtered beads = %+v, want child %s", list, childBead.ID)
+	} else if listedChild.Status != "in_progress" {
+		t.Fatalf("filtered child status = %q, want in_progress", listedChild.Status)
 	}
 	if listedSibling, ok := findLiveContractBead(list.Items, siblingBead.ID); ok && listedSibling.ParentID != rootBead.ID {
 		t.Fatalf("filtered sibling parent = %q, want %q", listedSibling.ParentID, rootBead.ID)
@@ -709,6 +715,10 @@ func closeLiveContractRigSessions(t *testing.T, baseURL string, v openapivalidat
 				continue
 			}
 			if sess.Rig != rigName && !strings.HasPrefix(sess.Template, rigName+"/") {
+				continue
+			}
+			if sess.Template == config.ControlDispatcherAgentName ||
+				strings.HasSuffix(sess.Template, "/"+config.ControlDispatcherAgentName) {
 				continue
 			}
 			remaining++
@@ -1618,6 +1628,8 @@ func liveContractProbeSkipReason(pathTemplate string) string {
 		return "requires a real session/conversation identity"
 	case strings.HasSuffix(pathTemplate, "/orders/history"):
 		return "requires a scoped order name fixture"
+	case strings.Contains(pathTemplate, "/maintenance"):
+		return "requires [maintenance.dolt] enabled=true in city.toml"
 	default:
 		return ""
 	}

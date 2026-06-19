@@ -30,33 +30,22 @@ Describe what this agent should do here.
 // in cmd_config.go and cmd_start.go that intentionally use config.Load to
 // discover remote packs before fetching them.
 func loadCityConfig(cityPath string, warningWriter ...io.Writer) (*config.City, error) {
-	tomlPath := filepath.Join(cityPath, "city.toml")
-	extras, err := builtinPackIncludesForConfigLoad(fsys.OSFS{}, tomlPath, resolveLoadCityConfigWarningWriter(warningWriter...))
-	if err != nil {
-		return nil, err
-	}
-	cfg, prov, err := config.LoadWithIncludes(fsys.OSFS{}, tomlPath, extras...)
-	if err != nil {
-		return nil, err
-	}
-	emitLoadCityConfigWarnings(resolveLoadCityConfigWarningWriter(warningWriter...), prov)
-	applyFeatureFlags(cfg)
-	return cfg, nil
+	return loadCityConfigFS(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"), warningWriter...)
 }
 
 // loadCityConfigFS is the testable variant of loadCityConfig that accepts a
 // filesystem implementation. Used by functions that take an fsys.FS parameter
 // for unit testing.
 func loadCityConfigFS(fs fsys.FS, tomlPath string, warningWriter ...io.Writer) (*config.City, error) {
-	extras, err := builtinPackIncludesForConfigLoad(fs, tomlPath, resolveLoadCityConfigWarningWriter(warningWriter...))
-	if err != nil {
+	if err := ensureBuiltinPacksForConfigLoad(fs, tomlPath, resolveLoadCityConfigWarningWriter(warningWriter...)); err != nil {
 		return nil, err
 	}
-	cfg, prov, err := config.LoadWithIncludes(fs, tomlPath, extras...)
+	cfg, prov, err := config.LoadWithIncludes(fs, tomlPath)
 	if err != nil {
 		return nil, err
 	}
 	emitLoadCityConfigWarnings(resolveLoadCityConfigWarningWriter(warningWriter...), prov)
+	warnMissingRequiredBuiltinImports(fs, cfg, tomlPath, resolveLoadCityConfigWarningWriter(warningWriter...))
 	applyFeatureFlags(cfg)
 	return cfg, nil
 }
@@ -67,11 +56,7 @@ func loadCityConfigFS(fs fsys.FS, tomlPath string, warningWriter ...io.Writer) (
 // briefly reflect stale builtin-pack content after an upgrade until a normal
 // gc command refreshes the generated packs.
 func loadCityConfigWithoutBuiltinPackRefreshFS(fs fsys.FS, tomlPath string, warningWriter ...io.Writer) (*config.City, error) {
-	var extras []string
-	if usesOSFS(fs) {
-		extras = builtinPackIncludes(filepath.Dir(tomlPath))
-	}
-	cfg, prov, err := config.LoadWithIncludes(fs, tomlPath, extras...)
+	cfg, prov, err := config.LoadWithIncludes(fs, tomlPath)
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +105,9 @@ func emitLoadCityConfigWarnings(w io.Writer, prov *config.Provenance) {
 // default tables are ambiguous even after normalization.
 func isNonFatalLoadConfigWarning(warning string) bool {
 	if config.IsLegacyV1SurfaceWarning(warning) {
+		return true
+	}
+	if config.IsDisabledNamedSessionWarning(warning) {
 		return true
 	}
 	if config.IsLegacyWorkspaceFieldWarning(warning) {
@@ -195,9 +183,16 @@ func loadCityPackConfigForEditFS(fs fsys.FS, packPath string) (*initPackConfig, 
 		return nil, err
 	}
 	cfg := initPackConfig{}
-	if _, err := toml.Decode(string(data), &cfg); err != nil {
+	md, err := toml.Decode(string(data), &cfg)
+	if err != nil {
 		return nil, fmt.Errorf("loading pack config %q: %w", packPath, err)
 	}
+	// Fold the legacy [agents] alias into [agent_defaults] before any rewrite:
+	// marshalInitPackConfig emits only [agent_defaults], so without this the
+	// suspend/resume rewrite would silently drop an [agents] table even though
+	// the key-loss guard recognizes it. Mirrors parse-time normalization.
+	config.FoldAgentDefaultsAlias(&cfg.AgentDefaults, cfg.AgentsDefaults, md)
+	cfg.AgentsDefaults = config.AgentDefaults{}
 	return &cfg, nil
 }
 
@@ -209,7 +204,19 @@ func writeCityPackConfigForEditFS(fs fsys.FS, packPath string, cfg *initPackConf
 	if err != nil {
 		return err
 	}
-	return fsys.WriteFileIfChangedAtomic(fs, packPath, content, 0o644)
+	// Resolve before the rename: a symlinked pack.toml must keep its
+	// link, with the write landing in the checked-in target.
+	writePath, err := fsys.ResolveSymlinks(fs, packPath)
+	if err != nil {
+		return err
+	}
+	// Refuse the rewrite when the on-disk pack.toml carries keys this binary
+	// does not recognize: marshalInitPackConfig round-trips a reduced struct
+	// and would silently drop newer or manual keys at the checked-in target.
+	if err := config.GuardRewriteKeyLoss[initPackConfig](fs, writePath); err != nil {
+		return err
+	}
+	return fsys.WriteFileIfChangedAtomic(fs, writePath, content, 0o644)
 }
 
 func updateRootPackAgentSuspended(fs fsys.FS, cityPath string, cityCfg *config.City, name string, suspended bool) (bool, error) {
@@ -504,7 +511,7 @@ func agentListItems(cfg *config.City) []AgentListItem {
 			Provider:             a.Provider,
 			Session:              a.Session,
 			Suspended:            a.Suspended,
-			WorkQuery:            a.EffectiveWorkQuery(),
+			WorkQuery:            a.EffectiveWorkQueryForBeads(cfg.Beads),
 			SlingQuery:           a.EffectiveSlingQuery(),
 			ConfiguredWorkQuery:  a.WorkQuery,
 			ConfiguredSlingQuery: a.SlingQuery,

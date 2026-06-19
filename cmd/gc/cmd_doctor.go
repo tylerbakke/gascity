@@ -1,18 +1,22 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/pathutil"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/spf13/cobra"
 )
 
@@ -32,10 +36,13 @@ func newDoctorCmd(stdout, stderr io.Writer) *cobra.Command {
 
 Checks city structure, config validity, binary dependencies (tmux, git,
 bd, dolt), controller status, agent sessions, zombie/orphan sessions,
-bead stores, Dolt server health, event log integrity, and per-rig
-health. Use --fix for the canonical remediation path, including any
-safe mechanical PackV1-to-PackV2 rewrites that are available on this
-branch.`,
+bead stores, Dolt server health, event log integrity, formula compiler
+requirements (deprecated contract = "graph.v2" opt-ins, missing
+[requires] formula_compiler = ">=2.0.0" declarations, and requirements
+the host's [daemon] formula_v2 setting cannot satisfy), v2 config
+deprecations such as legacy [formulas].dir, and per-rig health. Use
+--fix for the canonical remediation path, including any safe mechanical
+legacy-to-current pack rewrites that are available on this branch.`,
 		Example: `  gc doctor
   gc doctor --fix
   gc doctor --verbose
@@ -158,8 +165,23 @@ func (c *doltTopologyCheck) Fix(_ *doctor.CheckContext) error { return nil }
 type buildDoctorChecksOpts struct {
 	Stderr               io.Writer
 	ControllerRunning    bool
+	SupervisorRunning    bool
 	SkipCityDoltCheck    bool
 	SkipManagedDoltCheck bool
+}
+
+func doctorOrderFiringCurrentLastRunFunc(cityPath string, cfg *config.City, stderr io.Writer) doctor.OrderFiringCurrentLastRunFunc {
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	resolveStores := cachedOrderHistoryStoresResolver(cityPath, cfg, stderr)
+	return func(order orders.Order) (time.Time, error) {
+		stores, err := resolveStores(order)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return orders.LastRunAcrossStores(stores...)(order.ScopedName())
+	}
 }
 
 func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts buildDoctorChecksOpts) []doctor.Check {
@@ -179,6 +201,8 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	for _, c := range v2DeprecationChecks() {
 		register(c)
 	}
+	register(newProviderCatalogDoctorCheck(cityPath))
+	register(newProviderCatalogReadinessAdvisoryCheck(cityPath))
 	register(expandedConfigLoadCheck{})
 	register(&doctor.ImplicitImportCacheCheck{})
 	register(&doctor.DeprecatedAttachmentFieldsCheck{})
@@ -192,6 +216,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 			register(newDoltDriftCheck(cityPath, cfg))
 		}
 		register(doctor.NewConfigValidCheck(cfg))
+		register(doctor.NewLegacySuspendedFieldCheck(cfg))
 		register(doctor.NewConfigRefsCheck(cfg, cityPath))
 		register(doctor.NewStaleLocalPackDirCheck(cfg.Packs, cfg.Imports, cfg.DefaultRigImports, cityPath, cfg.Rigs...))
 		register(doctor.NewPreStartScriptsCheck(cfg))
@@ -199,15 +224,19 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(doctor.NewConfigSemanticsCheck(cfg, filepath.Join(cityPath, "city.toml")))
 		register(doctor.NewDurationRangeCheck(cfg))
 		register(doctor.NewProviderParityCheck(cfg))
+		register(doctor.NewFormulaRequirementsCheck(cfg, cityPath))
+		register(doctor.NewNamedAlwaysMinConflictCheck(cfg))
 		register(doctor.NewInstructionsFileCheck(cfg, cityPath))
+		register(doctor.NewServiceSecretsPermsCheck(cfg, cityPath))
 		register(doctor.NewSkillCollisionCheck(cfg, cityPath))
-		register(doctor.NewOrderFiringCurrentCheck(cfg, cityPath))
+		register(doctor.NewOrderFiringCurrentCheck(cfg, cityPath, doctor.WithOrderFiringCurrentLastRunFunc(doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, opts.Stderr))))
 		register(newCodexHooksDriftCheck(codexHookWorkDirs(cityPath, cfg)))
 		register(doctor.NewRigPackCoverageCheck(cfg, cityPath))
 		register(newMCPConfigDoctorCheck(cityPath, cfg, exec.LookPath))
 		register(newMCPSharedTargetDoctorCheck(cityPath, cfg, exec.LookPath))
 	}
 	if _, rawCfgErr := loadCityConfigForEditFS(fsys.OSFS{}, filepath.Join(cityPath, "city.toml")); rawCfgErr == nil {
+		register(newBuiltinImportDoctorCheck(cityPath))
 		register(newImportStateDoctorCheck(cityPath))
 		register(newJsonlArchiveDoctorCheck(cityPath))
 	}
@@ -236,9 +265,10 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(&doctor.BeadsRoleCheck{})
 	}
 
-	// Controller check + session checks (gated by controller state).
+	// Controller check + supervisor HTTP check + session checks (gated by controller state).
 	controllerRunning := opts.ControllerRunning
 	register(doctor.NewControllerCheck(cityPath, controllerRunning))
+	register(doctor.NewSupervisorHTTPCheck(opts.SupervisorRunning))
 
 	if cfgErr == nil && cfg != nil && !controllerRunning {
 		cityName := loadedCityName(cfg, cityPath)
@@ -257,9 +287,17 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(doctor.NewBDSplitStoreCheck(cityPath))
 		register(doctor.NewBeadsStoreCheck(cityPath, storeFactory))
 		register(newV2RoutedToNamespaceCheck(cfg, cityPath, storeFactory))
+		register(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
+		register(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))
+		register(newBacklogDepthCheck(cityPath, storeFactory))
+		register(newOrderTrackingRetentionCheck(cityPath, storeFactory))
 		register(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
 	}
 	register(newDoctorDoltServerCheck(cityPath, opts.SkipCityDoltCheck))
+	// Host-level fork-rate watch: surfaces the per-command data-plane fork storm
+	// (gc -> bd.real -> dolt) that operators routinely misread as CPU saturation.
+	// Advisory + read-only (/proc/stat); no config needed.
+	register(newForkRateCheck())
 	if cfgErr == nil && doctorWorkspaceHasPostgresScope(cityPath, cfg) {
 		register(doctor.NewPostgresAuthCheck(cityPath, cfg))
 	}
@@ -269,6 +307,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// managed bd scope. The version check follows the same gate so file-backed
 	// and external Dolt workspaces do not get irrelevant local-binary warnings.
 	register(doctor.NewDoltNomsSizeCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
+	register(doctor.NewDoltJournalSizeCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
 	register(doctor.NewDoltConfigCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
 	register(doctor.NewScopedDoltVersionCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
 	register(&doctor.EventsLogCheck{})
@@ -278,6 +317,10 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// invocation without retention. This check warns before the directory
 	// fills the disk and cascades into broken dolt writes.
 	register(doctor.NewBdBackupSizeCheckForConfig(cityPath, cfg, cfgErr))
+	// Stale bd backup state: corrupt-store quarantines that were never
+	// reclaimed and dolt-backup.json registrations pointing at deleted
+	// paths (ga-yfbs28).
+	register(doctor.NewBdBackupStateCheckForConfig(cityPath, cfg, cfgErr))
 	// Worktree checks deliberately run even when cfgErr != nil — they
 	// only need the city path, and a broken city.toml is exactly when
 	// silent disk-fill is most likely. The zero-value DoctorConfig
@@ -292,11 +335,12 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// Custom types check — city store.
 	register(doctor.NewCustomTypesCheck(cityPath, "city"))
 
-	// Per-rig checks. Skip suspended rigs — opening their bead store
-	// triggers bd auto-start of orphan Dolt servers (ga-wzk).
+	// Per-rig checks. Skip effectively-suspended rigs — opening their
+	// bead store triggers bd auto-start of orphan Dolt servers (ga-wzk).
 	if cfgErr == nil && cfg != nil {
+		suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
 		for _, rig := range cfg.Rigs {
-			if rig.Suspended {
+			if suspensionstate.EffectiveRigSuspended(suspState, rig.Name, rig.EffectiveSuspendedOnStart()) {
 				continue
 			}
 			if strings.TrimSpace(rig.Path) == "" {
@@ -304,6 +348,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 			}
 			register(doctor.NewRigPathCheck(rig))
 			register(doctor.NewRigGitCheck(rig))
+			register(doctor.NewRigRootBranchCheck(rig))
 			register(doctor.NewRigBDSplitStoreCheck(cityPath, rig))
 			register(doctor.NewRigBeadsCheck(cityPath, rig, storeFactory))
 			register(newDoctorRigDoltServerCheck(cityPath, rig, !rigUsesManagedBdStoreContract(cityPath, rig) || gcDoltSkip()))
@@ -355,11 +400,13 @@ func doDoctor(fix, verbose, jsonOut, explainPostgresAuth bool, stdout, stderr io
 		resolveRigPaths(cityPath, cfg.Rigs)
 	}
 	controllerRunning := doctor.IsControllerRunning(cityPath)
+	supervisorRunning := supervisorAliveHook() != 0
 	skipCityDoltCheck := gcDoltSkip() || (!scopeUsesManagedBdStoreContract(cityPath, cityPath) && !workspaceNeedsCityDoltCheck(cityPath, cfg))
 	skipManagedDoltCheck := managedDoltOpsCheckSkip(cityPath, cfg, cfgErr)
 	for _, check := range buildDoctorChecks(cityPath, cfg, cfgErr, buildDoctorChecksOpts{
 		Stderr:               stderr,
 		ControllerRunning:    controllerRunning,
+		SupervisorRunning:    supervisorRunning,
 		SkipCityDoltCheck:    skipCityDoltCheck,
 		SkipManagedDoltCheck: skipManagedDoltCheck,
 	}) {
@@ -398,10 +445,21 @@ func (expandedConfigLoadCheck) Run(ctx *doctor.CheckContext) *doctor.CheckResult
 	if _, err := loadCityConfig(ctx.CityPath, io.Discard); err != nil {
 		return errorCheck("expanded-config-load",
 			fmt.Sprintf("expanded config load error: %v", err),
-			"fix the reported config, include, import, or pack-layout error and rerun gc doctor",
+			expandedConfigLoadFixHint(err),
 			nil)
 	}
 	return okCheck("expanded-config-load", "expanded config loaded")
+}
+
+func expandedConfigLoadFixHint(err error) string {
+	var providerErr *config.ProviderCatalogError
+	if errors.As(err, &providerErr) {
+		return "run `gc doctor --fix` to add missing builtin provider aliases; add custom providers manually"
+	}
+	if config.IsFragmentLegacyV1SurfaceError(err) {
+		return "move fragment-authored legacy surfaces by hand; `gc doctor --fix` only rewrites root city.toml/pack.toml surfaces"
+	}
+	return "fix the reported config, include, import, or pack-layout error and rerun gc doctor"
 }
 
 func registerLocalDoctorChecks(d *doctor.Doctor, cityPath string, checks []config.LocalDoctorCheck) {

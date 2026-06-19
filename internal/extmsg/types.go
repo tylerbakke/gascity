@@ -97,11 +97,18 @@ const (
 )
 
 // SessionBindingRecord links a conversation to a session.
+//
+// SessionID is the session bead ID this binding currently resolves to. It is
+// volatile: a session that crashes and respawns under the same name gets a
+// fresh bead ID. SessionName is the stable identity the binding was created
+// under; it survives respawn and lets ResolveByConversation and the binding
+// reaper re-point the binding at the session's current live bead.
 type SessionBindingRecord struct {
 	ID                string
 	SchemaVersion     int
 	Conversation      ConversationRef
 	SessionID         string
+	SessionName       string
 	Status            BindingStatus
 	BoundAt           time.Time
 	ExpiresAt         *time.Time
@@ -339,13 +346,19 @@ type ConversationGroupRecord struct {
 }
 
 // ConversationGroupParticipant represents a participant in a conversation group.
+//
+// SessionID is the volatile session bead ID this participant currently resolves
+// to. SessionName is the stable identity the participant was registered under;
+// it survives session respawn and lets ResolveInbound/ResolveOutbound re-point
+// at the current live bead via resolveLiveSessionID.
 type ConversationGroupParticipant struct {
-	ID        string
-	GroupID   string
-	Handle    string
-	SessionID string
-	Public    bool
-	Metadata  map[string]string
+	ID          string
+	GroupID     string
+	Handle      string
+	SessionID   string
+	SessionName string
+	Public      bool
+	Metadata    map[string]string
 }
 
 // GroupRouteMatch classifies how a message was routed within a group.
@@ -478,12 +491,27 @@ type RemoveMembershipInput struct {
 	Now          time.Time
 }
 
+// TranscriptOrder controls the sort order of listed transcript entries by sequence.
+type TranscriptOrder string
+
+const (
+	// TranscriptOrderAsc returns entries oldest-first (ascending sequence). Default.
+	TranscriptOrderAsc TranscriptOrder = "asc"
+	// TranscriptOrderDesc returns entries newest-first (descending sequence),
+	// letting callers fetch the most recent entries without walking the whole
+	// stream on busy conversations.
+	TranscriptOrderDesc TranscriptOrder = "desc"
+)
+
 // ListTranscriptInput is the input for listing transcript entries.
 type ListTranscriptInput struct {
 	Caller        Caller
 	Conversation  ConversationRef
 	AfterSequence int64
 	Limit         int
+	// Order controls newest-first vs oldest-first traversal. Empty defaults to
+	// TranscriptOrderAsc for backwards compatibility.
+	Order TranscriptOrder
 }
 
 // ListBackfillInput is the input for listing backfill entries for a member.

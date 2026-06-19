@@ -13,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
 func prependDoctorJSONStubBinaries(t *testing.T, names ...string) {
@@ -36,6 +37,7 @@ func TestDoctorJSONSuccessIsParseableJSONOnly(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeBuiltinImportsFixture(t, cityDir, "core")
 	if err := os.WriteFile(filepath.Join(cityDir, ".gc", "site.toml"), []byte("workspace_name = \"demo\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -491,6 +493,7 @@ dolt_port = "3308"
 }
 
 func TestDoDoctorRegistersStaleLocalPackDirCheck(t *testing.T) {
+	skipSlowCmdGCTest(t, "starts real Dolt lifecycle")
 	cityDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
@@ -528,6 +531,7 @@ func TestDoDoctorRegistersStaleLocalPackDirCheckForRemoteImport(t *testing.T) {
 	cityDir := t.TempDir()
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
 	source := "https://github.com/gastownhall/gc-actual-packs"
 	commit := writeDoctorRemotePackFixture(t, homeDir, source)
 
@@ -542,6 +546,9 @@ name = "demo"
 
 [beads]
 provider = "file"
+
+[session]
+provider = "fake"
 
 [imports.actual]
 source = "https://github.com/gastownhall/gc-actual-packs"
@@ -563,6 +570,7 @@ func TestDoDoctorRegistersStaleLocalPackDirCheckForRigRemoteImport(t *testing.T)
 	cityDir := t.TempDir()
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
 	source := "https://github.com/gastownhall/gc-actual-packs"
 	commit := writeDoctorRemotePackFixture(t, homeDir, source)
 
@@ -580,6 +588,9 @@ name = "demo"
 
 [beads]
 provider = "file"
+
+[session]
+provider = "fake"
 
 [[rigs]]
 name = "demo-rig"
@@ -602,6 +613,7 @@ source = "https://github.com/gastownhall/gc-actual-packs"
 }
 
 func TestDoDoctorRegistersStaleLocalPackDirCheckForDefaultRigRemoteImport(t *testing.T) {
+	skipSlowCmdGCTest(t, "starts real Dolt lifecycle")
 	cityDir := t.TempDir()
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -619,6 +631,9 @@ name = "demo"
 
 [beads]
 provider = "file"
+
+[session]
+provider = "fake"
 
 [defaults.rig.imports.actual]
 source = "https://github.com/gastownhall/gc-actual-packs"
@@ -879,13 +894,13 @@ func TestDoctorSkipsSuspendedRigChecks(t *testing.T) {
 
 	rigs := []config.Rig{
 		{Name: "active-rig", Path: activeDir},
-		{Name: "suspended-rig", Path: suspendedDir, Suspended: true},
+		{Name: "suspended-rig", Path: suspendedDir, SuspendedOnStart: true},
 	}
 
 	// Mirror the per-rig registration logic from doDoctor.
 	d := &doctor.Doctor{}
 	for _, rig := range rigs {
-		if rig.Suspended {
+		if suspensionstate.EffectiveRigSuspended(suspensionstate.State{}, rig.Name, rig.SuspendedOnStart) {
 			continue
 		}
 		d.Register(doctor.NewRigPathCheck(rig))

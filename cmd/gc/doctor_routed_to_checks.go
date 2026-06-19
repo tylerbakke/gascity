@@ -5,9 +5,12 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
+	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
 type v2RoutedToNamespaceCheck struct {
@@ -36,8 +39,9 @@ func (c *v2RoutedToNamespaceCheck) Run(_ *doctor.CheckContext) *doctor.CheckResu
 	var skipped []string
 	c.scanScope(&findings, &skipped, aliases, "city", c.cityPath)
 	if c.cfg != nil {
+		suspState, _ := loadSuspensionState(fsys.OSFS{}, c.cityPath)
 		for _, rig := range c.cfg.Rigs {
-			if rig.Suspended || strings.TrimSpace(rig.Path) == "" {
+			if suspensionstate.EffectiveRigSuspended(suspState, rig.Name, rig.EffectiveSuspendedOnStart()) || strings.TrimSpace(rig.Path) == "" {
 				continue
 			}
 			c.scanScope(&findings, &skipped, aliases, "rig "+rig.Name, rig.Path)
@@ -85,7 +89,7 @@ func (c *v2RoutedToNamespaceCheck) scanScope(findings, skipped *[]string, aliase
 	sort.Strings(routes)
 	for _, route := range routes {
 		items, err := store.List(beads.ListQuery{
-			Metadata: map[string]string{"gc.routed_to": route},
+			Metadata: map[string]string{beadmeta.RoutedToMetadataKey: route},
 		})
 		if err != nil {
 			*skipped = append(*skipped, fmt.Sprintf("%s skipped: listing beads: %v", label, err))
@@ -102,7 +106,7 @@ func (c *v2RoutedToNamespaceCheck) scanScope(findings, skipped *[]string, aliase
 }
 
 func (c *v2RoutedToNamespaceCheck) scanRoutedToBead(findings *[]string, aliases map[string][]string, label string, bead beads.Bead) {
-	route := strings.TrimSpace(bead.Metadata["gc.routed_to"])
+	route := strings.TrimSpace(bead.Metadata[beadmeta.RoutedToMetadataKey])
 	if route == "" {
 		return
 	}

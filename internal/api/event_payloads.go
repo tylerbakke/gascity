@@ -14,6 +14,10 @@ import (
 	// so the import exists solely to fire the registration before the registry-
 	// coverage tests run.
 	_ "github.com/gastownhall/gascity/internal/pgauth"
+
+	// Blank import: emergency's init() registers emergency.Record as the payload
+	// type for EmergencySignaled and EmergencyAcked events.
+	_ "github.com/gastownhall/gascity/internal/emergency"
 )
 
 // API-layer event payload types. Every API emitter takes one of these
@@ -126,6 +130,18 @@ type RequestFailedPayload struct {
 // IsEventPayload marks RequestFailedPayload as an events.Payload variant.
 func (RequestFailedPayload) IsEventPayload() {}
 
+// SupervisorStartedPayload classifies how the previous supervisor
+// instance exited, recorded once per supervisor startup. The cause is
+// derived from the clean-shutdown handoff token the previous instance's
+// STOPPING path leaves behind (and which every startup consumes), so
+// flap alerts can distinguish a crash loop from deploy restarts.
+type SupervisorStartedPayload struct {
+	PreviousExit string `json:"previous_exit" enum:"clean,crash,unknown" doc:"How the previous supervisor instance exited: clean (it completed its STOPPING path and left the shutdown handoff token), crash (a prior instance ran but left no token), or unknown (no evidence of a prior instance)."`
+}
+
+// IsEventPayload marks SupervisorStartedPayload as an events.Payload variant.
+func (SupervisorStartedPayload) IsEventPayload() {}
+
 // SupervisorShutdownPayload attributes a supervisor shutdown trigger so
 // operators can diagnose why the supervisor exited without scraping
 // macOS unified log or launchd state. Recorded immediately before the
@@ -140,6 +156,23 @@ type SupervisorShutdownPayload struct {
 // IsEventPayload marks SupervisorShutdownPayload as an events.Payload variant.
 func (SupervisorShutdownPayload) IsEventPayload() {}
 
+// SupervisorRequestPayload is a bounded audit record for the machine-wide
+// supervisor API. It intentionally omits request bodies, query strings, raw
+// remote addresses, and origins.
+type SupervisorRequestPayload struct {
+	Method          string `json:"method" doc:"HTTP method."`
+	Path            string `json:"path" doc:"Request path with query string omitted and length bounded."`
+	Status          int    `json:"status" doc:"HTTP response status code. Start-phase records use 0 before the final response status is known."`
+	DurationMs      int64  `json:"duration_ms" doc:"Handler duration in milliseconds."`
+	RemoteAddrClass string `json:"remote_addr_class" enum:"loopback,private,public,unknown" doc:"Network class of the remote address, not the raw address."`
+	Host            string `json:"host,omitempty" doc:"Canonical Host header without port."`
+	OriginAllowed   bool   `json:"origin_allowed" doc:"Whether the Origin header, if present, matched CORS policy."`
+	Phase           string `json:"phase" enum:"start,complete" doc:"Audit phase. Long-lived event streams emit a start record immediately after Host validation, then a complete record when the handler returns. Non-stream requests emit complete only."`
+}
+
+// IsEventPayload marks SupervisorRequestPayload as an events.Payload variant.
+func (SupervisorRequestPayload) IsEventPayload() {}
+
 // CityLifecyclePayload is the shape of non-terminal city.created and
 // city.unregister_requested events recorded in the per-city event log
 // during init/unregister for diagnostics.
@@ -152,9 +185,9 @@ type CityLifecyclePayload struct {
 func (CityLifecyclePayload) IsEventPayload() {}
 
 // BeadEventPayload is the shape of every bead.* event payload
-// (BeadCreated, BeadUpdated, BeadClosed). The payload carries a full
-// snapshot of the bead as of the event; it is emitted by bd hooks and by
-// the beads CachingStore's reconcile loop when external changes are detected.
+// (BeadCreated, BeadUpdated, BeadClosed, BeadDeleted). The payload carries a
+// full snapshot of the bead as of the event; it is emitted by bd hooks and the
+// beads CachingStore for local writes and reconcile-detected external changes.
 type BeadEventPayload struct {
 	Bead beads.Bead `json:"bead"`
 }
@@ -436,6 +469,35 @@ func SessionDrainAckedWithAssignedWorkPayloadJSON(sessionID, beadID, template, b
 	return b
 }
 
+// SessionStrandedPayload carries the machine-readable context for a
+// session.stranded event: a pool session whose runtime exited while open or
+// in-progress work beads still held it as assignee. The envelope Message
+// renders the same facts as operator text (ID list truncated past ten);
+// this payload is the untruncated machine contract so pack-level recovery
+// subscribers can act on the stranded work without parsing message text.
+type SessionStrandedPayload struct {
+	SessionID   string   `json:"session_id" doc:"Canonical session bead ID for the stranded pool session (also the envelope Subject)."`
+	SessionName string   `json:"session_name,omitempty" doc:"Runtime session name from the session bead metadata, when set."`
+	Template    string   `json:"template,omitempty" doc:"Pool template name when known at the emission site."`
+	WorkBeadIDs []string `json:"work_bead_ids,omitempty" doc:"IDs of the open/in-progress work beads still assigned to the session. Never truncated, unlike the envelope Message. Empty when the work-collection query failed at emission time."`
+}
+
+// IsEventPayload marks SessionStrandedPayload as an events.Payload variant.
+func (SessionStrandedPayload) IsEventPayload() {}
+
+// SessionStrandedPayloadJSON builds the JSON wire form for attachment to an
+// events.Event.Payload field. SessionName, Template, and WorkBeadIDs are
+// emitted only when non-empty.
+func SessionStrandedPayloadJSON(sessionID, sessionName, template string, workBeadIDs []string) json.RawMessage {
+	b, _ := json.Marshal(SessionStrandedPayload{
+		SessionID:   sessionID,
+		SessionName: sessionName,
+		Template:    template,
+		WorkBeadIDs: workBeadIDs,
+	})
+	return b
+}
+
 func init() {
 	// mail.* — all seven types share one payload shape.
 	events.RegisterPayload(events.MailSent, MailEventPayload{})
@@ -450,6 +512,7 @@ func init() {
 	events.RegisterPayload(events.BeadCreated, BeadEventPayload{})
 	events.RegisterPayload(events.BeadUpdated, BeadEventPayload{})
 	events.RegisterPayload(events.BeadClosed, BeadEventPayload{})
+	events.RegisterPayload(events.BeadDeleted, BeadEventPayload{})
 
 	// session.* / convoy.* / controller.* / city.* / order.* /
 	// provider.* — these events carry no structured payload today;
@@ -468,14 +531,18 @@ func init() {
 	events.RegisterPayload(events.SessionSuspended, events.NoPayload{})
 	events.RegisterPayload(events.SessionUpdated, events.NoPayload{})
 	events.RegisterPayload(events.SessionDrainAckedWithAssignedWork, SessionDrainAckedWithAssignedWorkPayload{})
-	events.RegisterPayload(events.SessionStranded, events.NoPayload{})
+	events.RegisterPayload(events.SessionStranded, SessionStrandedPayload{})
+	events.RegisterPayload(events.SessionResetStalled, events.SessionResetStalledPayload{})
 	events.RegisterPayload(events.SessionWorkQueryFailed, SessionLifecyclePayload{})
+	events.RegisterPayload(events.SessionColdStartTimeout, events.NoPayload{})
 	events.RegisterPayload(events.ConvoyCreated, events.NoPayload{})
 	events.RegisterPayload(events.ConvoyClosed, events.NoPayload{})
 	events.RegisterPayload(events.ControllerStarted, events.NoPayload{})
 	events.RegisterPayload(events.ControllerStopped, events.NoPayload{})
 	events.RegisterPayload(events.ControllerRestart, ControllerRestartPayload{})
+	events.RegisterPayload(events.SupervisorStarted, SupervisorStartedPayload{})
 	events.RegisterPayload(events.SupervisorShutdownRequested, SupervisorShutdownPayload{})
+	events.RegisterPayload(events.SupervisorRequest, SupervisorRequestPayload{})
 	events.RegisterPayload(events.CitySuspended, events.NoPayload{})
 	events.RegisterPayload(events.CityResumed, events.NoPayload{})
 	// Typed async request result events.
@@ -500,4 +567,8 @@ func init() {
 	// gc.store.maintenance.* — supervisor StoreMaintenanceLoop outcomes.
 	events.RegisterPayload(events.StoreMaintenanceDone, events.StoreMaintenanceDonePayload{})
 	events.RegisterPayload(events.StoreMaintenanceFailed, events.StoreMaintenanceFailedPayload{})
+
+	// gc.store.disk_* — ENOSPC pre-flight events emitted before CALL DOLT_GC.
+	events.RegisterPayload(events.StoreDiskWarn, events.StoreDiskWarnPayload{})
+	events.RegisterPayload(events.StoreDiskCritical, events.StoreDiskCriticalPayload{})
 }

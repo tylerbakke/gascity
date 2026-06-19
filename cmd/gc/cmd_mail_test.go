@@ -572,9 +572,13 @@ func TestCmdMailSendDefaultSenderFallsBackToGCAliasWhenSessionIDMissing(t *testi
 	if err != nil {
 		t.Fatalf("openCityStoreAt after send: %v", err)
 	}
-	all, err := storeAfter.ListOpen()
+	all, err := storeAfter.List(beads.ListQuery{
+		Type:     "message",
+		Status:   "open",
+		TierMode: beads.TierBoth,
+	})
 	if err != nil {
-		t.Fatalf("ListOpen: %v", err)
+		t.Fatalf("List messages: %v", err)
 	}
 	var msg beads.Bead
 	found := false
@@ -640,9 +644,13 @@ func TestCmdMailSendFromControllerCreatesMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openCityStoreAt after send: %v", err)
 	}
-	all, err := storeAfter.ListOpen()
+	all, err := storeAfter.List(beads.ListQuery{
+		Type:     "message",
+		Status:   "open",
+		TierMode: beads.TierBoth,
+	})
 	if err != nil {
-		t.Fatalf("ListOpen: %v", err)
+		t.Fatalf("List messages: %v", err)
 	}
 	var msg beads.Bead
 	found := false
@@ -711,14 +719,73 @@ func TestCmdMailSendToControllerRecipientIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openCityStoreAt after send: %v", err)
 	}
-	all, err := storeAfter.ListOpen()
+	all, err := storeAfter.List(beads.ListQuery{
+		Type:      "message",
+		Status:    "open",
+		TierMode:  beads.TierBoth,
+		AllowScan: true,
+	})
 	if err != nil {
-		t.Fatalf("ListOpen: %v", err)
+		t.Fatalf("List messages: %v", err)
 	}
 	for _, b := range all {
 		if b.Type == "message" {
 			t.Fatalf("message bead should not be created for reserved controller recipient: %#v", b)
 		}
+	}
+}
+
+// TestCmdMailSendTrailingSlashHumanRecipientResolvesToHuman pins the default
+// escalation recipient contract: pack scripts address the reserved human
+// mailbox, and the trailing-slash target form must resolve to it instead of
+// falling through to live-session resolution.
+func TestCmdMailSendTrailingSlashHumanRecipientResolvesToHuman(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	if sender, ok := reservedMailSenderIdentity("human/"); !ok || sender != "human" {
+		t.Fatalf("reservedMailSenderIdentity(human/) = %q, %v; want human, true", sender, ok)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"human/"}, false, false, "controller", "", "ESCALATION: test", "escalation body", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend(human/) = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	all, err := store.List(beads.ListQuery{
+		Type:      "message",
+		Status:    "open",
+		TierMode:  beads.TierBoth,
+		AllowScan: true,
+	})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	var messages []beads.Bead
+	for _, b := range all {
+		if b.Type == "message" {
+			messages = append(messages, b)
+		}
+	}
+	if len(messages) != 1 {
+		t.Fatalf("message beads = %d, want 1: %#v", len(messages), messages)
+	}
+	if messages[0].Assignee != "human" {
+		t.Fatalf("message Assignee = %q, want human", messages[0].Assignee)
 	}
 }
 
@@ -1000,6 +1067,9 @@ name = "test-city"
 name = "mayor"
 provider = "missing-provider"
 
+[providers.missing-provider]
+command = "missing-provider"
+
 [[named_session]]
 template = "mayor"
 `
@@ -1026,6 +1096,9 @@ name = "test-city"
 name = "witness"
 dir = "demo"
 provider = "missing-provider"
+
+[providers.missing-provider]
+command = "missing-provider"
 
 [[named_session]]
 template = "witness"
@@ -2517,6 +2590,58 @@ func TestMailArchiveMultiSuccess(t *testing.T) {
 	}
 }
 
+func TestMailArchiveManyJSONEmitsBatchShape(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	for i := 0; i < 3; i++ {
+		if _, err := mp.Send("human", "mayor", "", "batch"); err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailArchiveManyJSON(mp, events.Discard, []string{"gc-1", "gc-2", "gc-3"}, true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailArchiveManyJSON = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if stderr.Len() > 0 {
+		t.Errorf("unexpected stderr: %q", stderr.String())
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &raw); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if _, ok := raw["id"]; ok {
+		t.Fatalf("batch archive JSON included singular id field: %s", stdout.String())
+	}
+
+	var got struct {
+		SchemaVersion string   `json:"schema_version"`
+		OK            bool     `json:"ok"`
+		Command       string   `json:"command"`
+		Action        string   `json:"action"`
+		IDs           []string `json:"ids"`
+		Count         int      `json:"count"`
+		AlreadyDone   bool     `json:"already_done"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal JSON result: %v", err)
+	}
+	if got.SchemaVersion != "1" || !got.OK || got.Command != "mail.archive" || got.Action != "archive" {
+		t.Fatalf("unexpected envelope: %+v", got)
+	}
+	if strings.Join(got.IDs, ",") != "gc-1,gc-2,gc-3" {
+		t.Fatalf("ids = %v, want [gc-1 gc-2 gc-3]", got.IDs)
+	}
+	if got.Count != 3 {
+		t.Fatalf("count = %d, want 3", got.Count)
+	}
+	if got.AlreadyDone {
+		t.Fatal("already_done = true, want false")
+	}
+}
+
 func TestMailArchiveMultiPartialFailure(t *testing.T) {
 	mp := mail.NewFake()
 	m1, _ := mp.Send("human", "mayor", "", "one")
@@ -2600,6 +2725,56 @@ func TestMailArchiveSelectedIsFilteredAndBounded(t *testing.T) {
 	for _, id := range []string{second.ID, readMatch.ID, nonMatch.ID, otherRecipient.ID} {
 		if got := status(id); got != "open" {
 			t.Fatalf("message %s status = %q, want open", id, got)
+		}
+	}
+}
+
+func TestMailArchiveSelectedAllRecipientsEmptyBody(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	first, err := mp.Send("system", "session-a", "context cycle", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := mp.Send("system", "session-b", "context cycle", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonEmpty, err := mp.Send("system", "session-c", "context cycle", "handoff context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherSubject, err := mp.Send("system", "session-d", "operator note", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailArchiveSelected(mp, events.Discard, mailArchiveSelectOptions{
+		AllRecipients:   true,
+		SubjectPrefix:   "context cycle",
+		EmptyBody:       true,
+		Limit:           10,
+		CaseInsensitive: true,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailArchiveSelected = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	for _, id := range []string{first.ID, second.ID} {
+		if !strings.Contains(stdout.String(), "Archived message "+id) {
+			t.Fatalf("stdout = %q, want archive confirmation for %s", stdout.String(), id)
+		}
+		if _, err := store.Get(id); !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("Get(%s) err = %v, want ErrNotFound", id, err)
+		}
+	}
+	for _, id := range []string{nonEmpty.ID, otherSubject.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "open" {
+			t.Fatalf("message %s status = %q, want open", id, got.Status)
 		}
 	}
 }
@@ -3157,6 +3332,80 @@ func TestMailCheckInjectDoesNotCloseBeads(t *testing.T) {
 	}
 }
 
+func TestMailCheckInjectArchivesAutoHandoffMessages(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	ordinary, err := mp.Send("human", "mayor", "ordinary", "still open")
+	if err != nil {
+		t.Fatalf("Send ordinary: %v", err)
+	}
+	auto, err := store.Create(beads.Bead{
+		Title:    "context cycle",
+		Type:     "message",
+		Assignee: "mayor",
+		From:     "mayor",
+		Labels:   []string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel},
+	})
+	if err != nil {
+		t.Fatalf("Create auto handoff: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailCheck(mp, "mayor", true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailCheck = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), auto.ID) {
+		t.Fatalf("injected output missing auto handoff id %s:\n%s", auto.ID, stdout.String())
+	}
+	if _, err := store.Get(auto.ID); !errors.Is(err, beads.ErrNotFound) {
+		t.Fatalf("auto handoff mail should be archived after injection, got err=%v", err)
+	}
+	b, err := store.Get(ordinary.ID)
+	if err != nil {
+		t.Fatalf("ordinary mail should remain: %v", err)
+	}
+	if b.Status != "open" {
+		t.Fatalf("ordinary mail status = %q, want open", b.Status)
+	}
+}
+
+func TestMailCheckInjectLeavesTruncatedAutoHandoffMessages(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	for i := 0; i < mailInjectMaxMessages; i++ {
+		if _, err := mp.Send("human", "mayor", fmt.Sprintf("ordinary-%d", i), "still open"); err != nil {
+			t.Fatalf("Send ordinary %d: %v", i, err)
+		}
+	}
+	auto, err := store.Create(beads.Bead{
+		Title:    "context cycle",
+		Type:     "message",
+		Assignee: "mayor",
+		From:     "mayor",
+		Labels:   []string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel},
+	})
+	if err != nil {
+		t.Fatalf("Create auto handoff: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailCheck(mp, "mayor", true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailCheck = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), auto.ID) {
+		t.Fatalf("auto handoff id %s should not appear in truncated injection:\n%s", auto.ID, stdout.String())
+	}
+	b, err := store.Get(auto.ID)
+	if err != nil {
+		t.Fatalf("truncated auto handoff mail should remain: %v", err)
+	}
+	if b.Status != "open" {
+		t.Fatalf("truncated auto handoff status = %q, want open", b.Status)
+	}
+}
+
 func TestMailCheckInjectFiltersCorrectly(t *testing.T) {
 	store := beads.NewMemStore()
 	mp := beadmail.New(store)
@@ -3388,6 +3637,40 @@ func okMailCheckHandler(_ *testing.T) http.Handler {
 	})
 }
 
+func partialStoreSlowMailCheckHandler(_ *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-GC-Cache-Age-S", "2")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"items": []map[string]any{
+				{"id": "msg-1", "from": "alice", "to": "mayor", "subject": "hi", "body": "hello", "created_at": "2026-04-23T10:00:00Z", "read": false},
+			},
+			"total":   1,
+			"partial": true,
+			"partial_errors": []string{
+				"mail provider slow: store_slow: mail read timed out after 8s",
+			},
+		})
+	})
+}
+
+func partialProviderErrorMailCheckHandler(_ *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-GC-Cache-Age-S", "2")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"items": []map[string]any{
+				{"id": "msg-1", "from": "alice", "to": "mayor", "subject": "hi", "body": "hello", "created_at": "2026-04-23T10:00:00Z", "read": false},
+			},
+			"total":   1,
+			"partial": true,
+			"partial_errors": []string{
+				"mail provider beta: disk unavailable",
+			},
+		})
+	})
+}
+
 func okMailPeekHandler(_ *testing.T) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("X-GC-Cache-Age-S", "2")
@@ -3409,6 +3692,21 @@ func okMailCountHandler(_ *testing.T) http.Handler {
 		w.Header().Set("X-GC-Cache-Age-S", "2")
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"total": 3, "unread": 1}) //nolint:errcheck
+	})
+}
+
+func partialStoreSlowMailCountHandler(_ *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-GC-Cache-Age-S", "2")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"total":   3,
+			"unread":  1,
+			"partial": true,
+			"partial_errors": []string{
+				"mail provider slow: store_slow: mail read timed out after 8s",
+			},
+		})
 	})
 }
 
@@ -3555,6 +3853,203 @@ func TestRouteMailCheck_SixRowMatrix(t *testing.T) {
 				t.Errorf("stdout missing %q:\n%s", tc.wantStdout, stdout.String())
 			}
 		})
+	}
+}
+
+func TestRouteMailCountPartialStoreSlowHumanReturnsError(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	srv := httptest.NewServer(partialStoreSlowMailCountHandler(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCount(cityPath, []string{"mayor"}, c, "", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "error")
+	if !strings.Contains(stderr.String(), "store_slow: mail read timed out after 8s") {
+		t.Fatalf("stderr missing store_slow partial detail:\n%s", stderr.String())
+	}
+}
+
+func TestRouteMailCountPartialStoreSlowJSONReturnsError(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	srv := httptest.NewServer(partialStoreSlowMailCountHandler(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCount(cityPath, []string{"mayor"}, c, "", true, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "error")
+	if !strings.Contains(stderr.String(), "store_slow: mail read timed out after 8s") {
+		t.Fatalf("stderr missing store_slow partial detail:\n%s", stderr.String())
+	}
+}
+
+func TestRouteMailCheckInjectStoreSlowEmitsDegradedNotice(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	srv := httptest.NewServer(mailProblemHandler(http.StatusServiceUnavailable, "store_slow: mail read timed out after 8s")(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCheck(cityPath, []string{"mayor"}, true, "", c, "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if got, want := stdout.String(), expectedMailCheckDegradedInjectOutput(); got != want {
+		t.Fatalf("stdout = %q, want exact degraded notice %q", got, want)
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "error")
+	if strings.Contains(stderr.String(), "gc mail check:") {
+		t.Fatalf("inject mode surfaced store_slow as stderr error:\n%s", stderr.String())
+	}
+}
+
+func TestRouteMailCheckPartialStoreSlowInjectEmitsDegradedNotice(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	srv := httptest.NewServer(partialStoreSlowMailCheckHandler(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCheck(cityPath, []string{"mayor"}, true, "", c, "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if got, want := stdout.String(), expectedMailCheckDegradedInjectOutput(); got != want {
+		t.Fatalf("stdout = %q, want exact degraded notice %q", got, want)
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "error")
+}
+
+func TestRouteMailCheckPartialStoreSlowNonInjectReturnsError(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	srv := httptest.NewServer(partialStoreSlowMailCheckHandler(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCheck(cityPath, []string{"mayor"}, false, "", c, "", &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "error")
+	if !strings.Contains(stderr.String(), "store_slow: mail read timed out after 8s") {
+		t.Fatalf("stderr missing store_slow partial detail:\n%s", stderr.String())
+	}
+}
+
+func TestRouteMailCheckPartialProviderErrorInjectEmitsDegradedNotice(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	srv := httptest.NewServer(partialProviderErrorMailCheckHandler(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCheck(cityPath, []string{"mayor"}, true, "", c, "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if got, want := stdout.String(), expectedMailCheckPartialDegradedInjectOutput(); got != want {
+		t.Fatalf("stdout = %q, want exact degraded notice %q", got, want)
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "error")
+	if strings.Contains(stderr.String(), "gc mail check:") {
+		t.Fatalf("inject mode surfaced partial read as stderr error:\n%s", stderr.String())
+	}
+}
+
+func TestRouteMailCheckPartialProviderErrorNonInjectReturnsError(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	srv := httptest.NewServer(partialProviderErrorMailCheckHandler(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCheck(cityPath, []string{"mayor"}, false, "", c, "", &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "error")
+	if !strings.Contains(stderr.String(), "mail provider beta: disk unavailable") {
+		t.Fatalf("stderr missing partial provider detail:\n%s", stderr.String())
+	}
+}
+
+func TestRouteMailCheckStoreSlowNonInjectReturnsError(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	srv := httptest.NewServer(mailProblemHandler(http.StatusServiceUnavailable, "store_slow: mail read timed out after 8s")(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCheck(cityPath, []string{"mayor"}, false, "", c, "", &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "error")
+	if !strings.Contains(stderr.String(), "store_slow: mail read timed out after 8s") {
+		t.Fatalf("stderr missing store_slow detail:\n%s", stderr.String())
+	}
+}
+
+func expectedMailCheckDegradedInjectOutput() string {
+	return "<system-reminder>\n" + mailCheckDegradedNotice + "\n</system-reminder>\n"
+}
+
+func expectedMailCheckPartialDegradedInjectOutput() string {
+	return "<system-reminder>\n" + mailCheckPartialDegradedNotice + "\n</system-reminder>\n"
+}
+
+func TestRouteMailPeekStoreSlowDoesNotFallback(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	srv := httptest.NewServer(mailProblemHandler(http.StatusServiceUnavailable, "store_slow: mail read timed out after 8s")(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailPeek(cityPath, []string{"msg-1"}, c, "", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "error")
+	if strings.Contains(stderr.String(), "route=fallback") {
+		t.Fatalf("store_slow peek fell back to local store:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "store_slow: mail read timed out after 8s") {
+		t.Fatalf("stderr missing store_slow detail:\n%s", stderr.String())
 	}
 }
 
@@ -3758,15 +4253,78 @@ func TestRouteMailCheck_StaleBannerOver30s(t *testing.T) {
 	}
 }
 
+func TestRouteMailCheckInjectUsesLocalPathForArchiveSideEffects(t *testing.T) {
+	clearInheritedBeadsEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	t.Setenv("GC_CITY_PATH", cityPath)
+	t.Setenv("GC_DEBUG", "1")
+	t.Setenv("GC_ALIAS", "mayor")
+	t.Setenv("GC_SESSION_NAME", "mayor")
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   "session",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "mayor",
+		},
+	}); err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	auto, err := store.Create(beads.Bead{
+		Title:    "context cycle",
+		Type:     "message",
+		Assignee: "mayor",
+		From:     "mayor",
+		Labels:   []string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel},
+	})
+	if err != nil {
+		t.Fatalf("Create auto handoff: %v", err)
+	}
+	srv := httptest.NewServer(okMailCheckHandler(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	if code := routeMailCheck(cityPath, nil, true, "", c, "", &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "fallback", "inject-local-side-effects")
+	if !strings.Contains(stdout.String(), auto.ID) {
+		t.Fatalf("injected output missing local auto handoff id %s:\n%s", auto.ID, stdout.String())
+	}
+	if strings.Contains(stdout.String(), "msg-1") {
+		t.Fatalf("inject path used API inbox instead of local provider:\n%s", stdout.String())
+	}
+	if _, err := store.Get(auto.ID); !errors.Is(err, beads.ErrNotFound) {
+		t.Fatalf("auto handoff mail should be archived after local injection, got err=%v", err)
+	}
+}
+
 func TestRenderMailCheckFromAPIInjectCodexUsesUserPromptSubmit(t *testing.T) {
-	cr := api.CachedRead[[]mail.Message]{
-		Body: []mail.Message{{
-			ID:        "msg-1",
-			From:      "human",
-			To:        "mayor",
-			Body:      "review this",
-			CreatedAt: time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC),
-		}},
+	cr := api.CachedRead[api.MailListView]{
+		Body: api.MailListView{
+			Items: []mail.Message{{
+				ID:        "msg-1",
+				From:      "human",
+				To:        "mayor",
+				Body:      "review this",
+				CreatedAt: time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC),
+			}},
+		},
 	}
 
 	var stdout bytes.Buffer
@@ -3833,5 +4391,150 @@ func TestRouteMailCount_StaleBannerOver30s(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "cache age:") {
 		t.Errorf("stdout missing stale banner:\n%s", stdout.String())
+	}
+}
+
+// --- cmdMailSend positional body regression tests (#3331) ---
+
+// mailSendTestCity creates a temp city and registers a session bead with the
+// given alias so it can act as a mail recipient. Returns the city path.
+func mailSendTestCity(t *testing.T, alias string) string {
+	t.Helper()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			namedSessionIdentityMetadata: "test-city/" + alias,
+			"alias":                      alias,
+			"session_name":               alias + "-session",
+		},
+	}); err != nil {
+		t.Fatalf("Create session bead for %q: %v", alias, err)
+	}
+	return cityPath
+}
+
+// mailSendTestFindMessage lists message beads in the city store and returns the
+// first one found, failing if none exist.
+func mailSendTestFindMessage(t *testing.T, cityPath string) beads.Bead {
+	t.Helper()
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := store.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	if len(all) > 0 {
+		return all[0]
+	}
+	t.Fatalf("message bead not found; total beads = %d", len(all))
+	return beads.Bead{}
+}
+
+func TestCmdMailSendPositionalBodyHonouredWhenSubjectFlagSet(t *testing.T) {
+	// Regression for #3331: positional body after recipient was silently dropped
+	// when -s was set but -m was absent.
+	cityPath := mailSendTestCity(t, "mayor")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"mayor/", "positional body"}, false, false, "controller", "", "subject", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	msg := mailSendTestFindMessage(t, cityPath)
+	if msg.Title != "subject" {
+		t.Errorf("Title = %q, want %q", msg.Title, "subject")
+	}
+	if msg.Description != "positional body" {
+		t.Errorf("Description = %q, want %q (positional body was dropped)", msg.Description, "positional body")
+	}
+}
+
+func TestCmdMailSendFlagBodyWinsOverPositional(t *testing.T) {
+	// When both -m and a positional body are present, -m wins.
+	cityPath := mailSendTestCity(t, "mayor")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"mayor/", "positional body"}, false, false, "controller", "", "subject", "flag body", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	msg := mailSendTestFindMessage(t, cityPath)
+	if msg.Description != "flag body" {
+		t.Errorf("Description = %q, want %q (-m flag body should win)", msg.Description, "flag body")
+	}
+}
+
+func TestCmdMailSendNoBodyStillWorks(t *testing.T) {
+	// No positional body and no -m flag: empty body is valid.
+	cityPath := mailSendTestCity(t, "mayor")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"mayor/"}, false, false, "controller", "", "subject", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	msg := mailSendTestFindMessage(t, cityPath)
+	if msg.Title != "subject" {
+		t.Errorf("Title = %q, want %q", msg.Title, "subject")
+	}
+	if msg.Description != "" {
+		t.Errorf("Description = %q, want empty", msg.Description)
+	}
+}
+
+func TestCmdMailSendAllPositionalBodyHonouredWhenSubjectFlagSet(t *testing.T) {
+	// Regression for #3331 --all arm: positional body dropped when -s set but -m absent.
+	cityPath := mailSendTestCity(t, "worker")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"positional body"}, false, true, "controller", "", "subject", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend --all = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	msg := mailSendTestFindMessage(t, cityPath)
+	if msg.Title != "subject" {
+		t.Errorf("Title = %q, want %q", msg.Title, "subject")
+	}
+	if msg.Description != "positional body" {
+		t.Errorf("Description = %q, want %q (--all positional body was dropped)", msg.Description, "positional body")
+	}
+}
+
+func TestCmdMailSendAllFlagBodyWinsOverPositional(t *testing.T) {
+	// When both -m and a positional body are present with --all, -m wins.
+	cityPath := mailSendTestCity(t, "worker")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"positional body"}, false, true, "controller", "", "subject", "flag body", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend --all = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	msg := mailSendTestFindMessage(t, cityPath)
+	if msg.Description != "flag body" {
+		t.Errorf("Description = %q, want %q (--all -m flag body should win over positional)", msg.Description, "flag body")
 	}
 }

@@ -384,6 +384,41 @@ func TestParserHonorsSetSourceForLoadByName(t *testing.T) {
 	}
 }
 
+func TestParserHonorsSetSourceForDescriptionFile(t *testing.T) {
+	gitOK(t)
+	root := initRepo(t)
+	formulaDir := filepath.Join(root, "formulas")
+	if err := os.MkdirAll(filepath.Join(formulaDir, "descriptions"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	commitFile(t, root, "formulas/mol.toml", "formula = \"mol\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\ndescription_file = \"descriptions/work.md\"\n")
+	commitFile(t, root, "formulas/descriptions/work.md", "COMMITTED")
+	commitOnBranch(t, root, "main", "init")
+
+	runGit(t, root, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(formulaDir, "descriptions", "work.md"), []byte("FEATURE-DRAFT"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fsParser := NewParser(formulaDir)
+	fsFormula, err := fsParser.LoadByName("mol")
+	if err != nil {
+		t.Fatalf("FSSource LoadByName: %v", err)
+	}
+	if got := fsFormula.Steps[0].Description; got != "FEATURE-DRAFT" {
+		t.Fatalf("FSSource description = %q, want FEATURE-DRAFT", got)
+	}
+
+	refParser := NewParser(formulaDir).SetSource(NewGitRefSource("main"))
+	refFormula, err := refParser.LoadByName("mol")
+	if err != nil {
+		t.Fatalf("GitRefSource LoadByName: %v", err)
+	}
+	if got := refFormula.Steps[0].Description; got != "COMMITTED" {
+		t.Fatalf("GitRefSource description = %q, want COMMITTED", got)
+	}
+}
+
 // TestResolveWithSourcePrecedence verifies the layered last-wins
 // semantic is preserved when Source is parameterized. Highest-priority
 // layer that contains a Stat-hit wins, exactly as the legacy Resolve
@@ -413,6 +448,55 @@ func TestResolveWithSourcePrecedence(t *testing.T) {
 	}
 	if got != "/mid/mol.toml" {
 		t.Fatalf("got %q, want /mid/mol.toml (fallthrough)", got)
+	}
+}
+
+// TestGitRefSourceIgnoresPoisonedGitEnv proves the GitRefSource subprocesses
+// resolve against the repository that contains the queried path even when the
+// process environment leaks GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE from a parent
+// repo or a pre-commit hook. Without git.SanitizedEnv() assigned to each
+// subprocess, the leaked GIT_DIR redirects git away from the intended repo and
+// every lookup misses. Regression guard for gastownhall/gascity#3343 (review
+// attempt-8 blocker on unsanitized formula git subprocesses).
+func TestGitRefSourceIgnoresPoisonedGitEnv(t *testing.T) {
+	gitOK(t)
+	root := initRepo(t)
+	commitFile(t, root, "formulas/demo.toml", "formula = \"demo\"\n")
+	commitOnBranch(t, root, "main", "add demo formula")
+
+	// Poison the environment the way a pre-commit hook or nested worktree
+	// would. These all point away from the repo that holds the formula, so an
+	// unsanitized subprocess would resolve the wrong (or no) repository. Set
+	// them only after repo setup so the setup commands stay clean.
+	t.Setenv("GIT_DIR", filepath.Join(t.TempDir(), "poison.git"))
+	t.Setenv("GIT_WORK_TREE", t.TempDir())
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(t.TempDir(), "poison.index"))
+
+	src := NewGitRefSource("HEAD")
+	target := filepath.Join(root, "formulas", "demo.toml")
+
+	if !src.Stat(target) {
+		t.Fatal("Stat reported the committed formula as absent under poisoned GIT_* env")
+	}
+	data, err := src.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile under poisoned GIT_* env: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != `formula = "demo"` {
+		t.Fatalf("ReadFile = %q, want %q", got, `formula = "demo"`)
+	}
+	names, err := src.ListDir(filepath.Join(root, "formulas"))
+	if err != nil {
+		t.Fatalf("ListDir under poisoned GIT_* env: %v", err)
+	}
+	found := false
+	for _, n := range names {
+		if n == "demo.toml" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ListDir = %v, want it to contain demo.toml", names)
 	}
 }
 

@@ -442,6 +442,7 @@ trigger = "manual"
 func TestV2LegacyOrderLayoutReportsRemoteImportedPackEvaluatedByLoader(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
 
 	cityDir := t.TempDir()
 	source := "https://github.com/example/orders-pack.git"
@@ -1092,7 +1093,7 @@ path = "`+orphanPath+`"
 	}
 }
 
-func TestV2DeprecationChecksWarnOnDeferredPackAgentFormat(t *testing.T) {
+func TestV2DeprecationChecksErrorsOnRootPackAgentFormat(t *testing.T) {
 	t.Parallel()
 
 	cityDir := t.TempDir()
@@ -1115,14 +1116,57 @@ name = "helper"
 	d.Run(&doctor.CheckContext{CityPath: cityDir, Verbose: true}, &buf, false)
 
 	out := buf.String()
-	if !strings.Contains(out, "⚠ v2-agent-format") {
-		t.Fatalf("doctor output missing deferred pack agent warning:\n%s", out)
+	if !strings.Contains(out, "✗ v2-agent-format") {
+		t.Fatalf("doctor output missing pack agent error:\n%s", out)
 	}
 	if !strings.Contains(out, "pack.toml") {
 		t.Fatalf("doctor output missing pack.toml detail:\n%s", out)
 	}
-	if !strings.Contains(out, "enforcement is deferred") {
-		t.Fatalf("doctor output missing deferral guidance:\n%s", out)
+	if !strings.Contains(out, "gc doctor --fix") || !strings.Contains(out, "agents/<name>/agent.toml") {
+		t.Fatalf("doctor output missing root pack remediation guidance:\n%s", out)
+	}
+}
+
+func TestDoctorFixMigratesRootPackAgentFormat(t *testing.T) {
+	cityDir := t.TempDir()
+	writeDoctorFile(t, cityDir, "city.toml", `
+[workspace]
+name = "legacy-city"
+`)
+	writeDoctorFile(t, cityDir, "pack.toml", `
+[pack]
+name = "legacy-city"
+schema = 2
+
+[[agent]]
+name = "helper"
+provider = "claude"
+prompt_template = "prompts/helper.md"
+`)
+	writeDoctorFile(t, cityDir, "prompts/helper.md", "You are helper.\n")
+	t.Setenv("GC_CITY_PATH", cityDir)
+	t.Setenv("GC_BEADS", "file")
+	prependDoctorJSONStubBinaries(t, "tmux", "git", "jq", "pgrep", "lsof")
+
+	var stdout, stderr bytes.Buffer
+	code := doDoctor(true, false, false, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("gc doctor --fix = %d, want 0; stdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+
+	packToml, err := os.ReadFile(filepath.Join(cityDir, "pack.toml"))
+	if err != nil {
+		t.Fatalf("ReadFile(pack.toml): %v", err)
+	}
+	if strings.Contains(string(packToml), "[[agent]]") {
+		t.Fatalf("pack.toml still contains inline agent after doctor --fix:\n%s", packToml)
+	}
+	agentToml, err := os.ReadFile(filepath.Join(cityDir, "agents", "helper", "agent.toml"))
+	if err != nil {
+		t.Fatalf("ReadFile(agents/helper/agent.toml): %v", err)
+	}
+	if !strings.Contains(string(agentToml), `provider = "claude"`) {
+		t.Fatalf("agent.toml missing migrated provider:\n%s", agentToml)
 	}
 }
 
@@ -1131,7 +1175,7 @@ func TestExpandedConfigLoadCheckReportsSchema2FragmentErrors(t *testing.T) {
 
 	cityDir := t.TempDir()
 	writeDoctorFile(t, cityDir, "city.toml", `
-include = ["fragments/legacy.toml"]
+include = ["conf/legacy.toml"]
 
 [workspace]
 name = "fragment-city"
@@ -1141,7 +1185,7 @@ name = "fragment-city"
 name = "fragment-city"
 schema = 2
 `)
-	writeDoctorFile(t, cityDir, "fragments/legacy.toml", `
+	writeDoctorFile(t, cityDir, "conf/legacy.toml", `
 [workspace]
 includes = ["legacy-pack"]
 `)
@@ -1152,12 +1196,52 @@ includes = ["legacy-pack"]
 	}
 	for _, want := range []string{
 		"expanded config load error",
-		"fragments/legacy.toml",
+		"conf/legacy.toml",
 		"unsupported PackV1 workspace.includes",
 	} {
 		if !strings.Contains(got.Message, want) {
 			t.Fatalf("message = %q, want substring %q", got.Message, want)
 		}
+	}
+	for _, want := range []string{
+		"fragment-authored legacy surfaces",
+		"by hand",
+		"gc doctor --fix",
+		"root city.toml/pack.toml",
+	} {
+		if !strings.Contains(got.FixHint, want) {
+			t.Fatalf("fix hint = %q, want substring %q", got.FixHint, want)
+		}
+	}
+}
+
+func TestExpandedConfigLoadCheckDoesNotInferFragmentFromRootPath(t *testing.T) {
+	t.Parallel()
+
+	cityDir := filepath.Join(t.TempDir(), "fragment-root-city")
+	if err := os.MkdirAll(cityDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	writeDoctorFile(t, cityDir, "city.toml", `
+[workspace]
+name = "root-city"
+includes = ["legacy-pack"]
+`)
+	writeDoctorFile(t, cityDir, "pack.toml", `
+[pack]
+name = "root-city"
+schema = 2
+`)
+
+	got := expandedConfigLoadCheck{}.Run(&doctor.CheckContext{CityPath: cityDir})
+	if got.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want error; message=%q", got.Status, got.Message)
+	}
+	if !strings.Contains(got.Message, "unsupported PackV1 workspace.includes") {
+		t.Fatalf("message = %q, want root legacy workspace.includes error", got.Message)
+	}
+	if strings.Contains(got.FixHint, "fragment-authored legacy surfaces") || strings.Contains(got.FixHint, "by hand") {
+		t.Fatalf("fix hint = %q, want generic root guidance", got.FixHint)
 	}
 }
 
@@ -1366,6 +1450,86 @@ prefix = "lc"
 	}
 }
 
+// Regression test for ga-lurp5d: the workspace-identity fix rewrites
+// city.toml; when city.toml is a symlink (e.g., into a checked-out repo)
+// the rewrite must write through the link instead of replacing it with a
+// regular file.
+func TestV2WorkspaceNameFixWritesThroughCityTomlSymlink(t *testing.T) {
+	t.Parallel()
+
+	cityDir := t.TempDir()
+	checkoutDir := filepath.Join(cityDir, "checkout")
+	if err := os.MkdirAll(checkoutDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(checkoutDir, "city.toml")
+	if err := os.WriteFile(target, []byte("[workspace]\nname = \"legacy-city\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(cityDir, "city.toml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	d := &doctor.Doctor{}
+	registerV2DeprecationChecks(d)
+	d.Run(&doctor.CheckContext{CityPath: cityDir, Verbose: true}, &buf, true)
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat link: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("city.toml symlink was replaced by a %v entry; fix must write through the link", info.Mode())
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile target: %v", err)
+	}
+	if strings.Contains(string(data), "legacy-city") {
+		t.Fatalf("workspace identity should be migrated out of the symlink target:\n%s", data)
+	}
+}
+
+func TestV2FormulasDirFixWritesThroughCityTomlSymlink(t *testing.T) {
+	t.Parallel()
+
+	cityDir := t.TempDir()
+	checkoutDir := filepath.Join(cityDir, "checkout")
+	if err := os.MkdirAll(checkoutDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(checkoutDir, "city.toml")
+	if err := os.WriteFile(target, []byte("[formulas]\ndir = \"formulas\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(cityDir, "city.toml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	d := &doctor.Doctor{}
+	registerV2DeprecationChecks(d)
+	d.Run(&doctor.CheckContext{CityPath: cityDir, Verbose: true}, &buf, true)
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat link: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("city.toml symlink was replaced by a %v entry; fix must write through the link", info.Mode())
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile target: %v", err)
+	}
+	if strings.Contains(string(data), `dir = "formulas"`) {
+		t.Fatalf("default formulas dir declaration should be stripped from the symlink target:\n%s", data)
+	}
+}
+
 func TestV2DeprecationChecksWarnOnLegacyTemplateSuffix(t *testing.T) {
 	t.Parallel()
 
@@ -1465,10 +1629,10 @@ prompt_template = "prompts/mayor.md"
 
 // TestV2DeprecationFixSurfacesMigrateWarnings guards the codex review
 // finding on PR #1880: when migrate.Apply emits warnings about
-// behavior-affecting fields it had to drop (e.g. legacy [[agent]] entries
-// with fallback = true), doctor --fix must surface them. Without this,
-// the next gc doctor run sees a green check and the manual follow-up is
-// lost forever.
+// behavior-affecting fields it had to drop (e.g. a legacy [formulas].dir
+// override), doctor --fix must surface them. Without this, the next
+// gc doctor run sees a green check and the manual follow-up is lost
+// forever.
 func TestV2DeprecationFixSurfacesMigrateWarnings(t *testing.T) {
 	t.Parallel()
 
@@ -1477,10 +1641,12 @@ func TestV2DeprecationFixSurfacesMigrateWarnings(t *testing.T) {
 [workspace]
 name = "legacy-city"
 
+[formulas]
+dir = "my-formulas"
+
 [[agent]]
 name = "mayor"
 prompt_template = "prompts/mayor.md"
-fallback = true
 `)
 	writeDoctorFile(t, cityDir, "prompts/mayor.md", "Hello {{.Agent}}\n")
 
@@ -1490,11 +1656,11 @@ fallback = true
 	}
 
 	got := sink.String()
-	if !strings.Contains(got, "fallback") {
-		t.Fatalf("expected migrate warnings about dropped fallback field to be surfaced; got:\n%s", got)
+	if !strings.Contains(got, "formulas.dir") {
+		t.Fatalf("expected migrate warnings about dropped formulas.dir to be surfaced; got:\n%s", got)
 	}
-	if !strings.Contains(got, "mayor") {
-		t.Fatalf("expected the agent name to appear in the warning; got:\n%s", got)
+	if !strings.Contains(got, "my-formulas") {
+		t.Fatalf("expected the dropped value to appear in the warning; got:\n%s", got)
 	}
 }
 
@@ -1506,10 +1672,12 @@ func TestV2DeprecationDoctorFixSurfacesMigrateWarningsInOutput(t *testing.T) {
 [workspace]
 name = "legacy-city"
 
+[formulas]
+dir = "my-formulas"
+
 [[agent]]
 name = "mayor"
 prompt_template = "prompts/mayor.md"
-fallback = true
 `)
 	writeDoctorFile(t, cityDir, "prompts/mayor.md", "Hello {{.Agent}}\n")
 
@@ -1519,7 +1687,7 @@ fallback = true
 	d.Run(&doctor.CheckContext{CityPath: cityDir, Verbose: true}, &buf, true)
 
 	got := buf.String()
-	if !strings.Contains(got, "fallback") {
+	if !strings.Contains(got, "formulas.dir") {
 		t.Fatalf("expected doctor --fix output to include migrate warning; got:\n%s", got)
 	}
 	if !strings.Contains(got, "✓ v2-agent-format") {

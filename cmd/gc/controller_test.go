@@ -1801,6 +1801,7 @@ func readSessionCircuitResetSocketReply(t *testing.T, conn net.Conn) sessionCirc
 }
 
 func TestControllerReloadInvalidConfig(t *testing.T) {
+	skipSlowCmdGCTest(t, "starts real Dolt lifecycle")
 	old := debounceDelay
 	debounceDelay = 5 * time.Millisecond
 	t.Cleanup(func() { debounceDelay = old })
@@ -1878,6 +1879,7 @@ func TestControllerReloadInvalidConfig(t *testing.T) {
 }
 
 func TestControllerReloadCityNameChange(t *testing.T) {
+	skipSlowCmdGCTest(t, "starts real Dolt lifecycle")
 	old := debounceDelay
 	debounceDelay = 5 * time.Millisecond
 	t.Cleanup(func() { debounceDelay = old })
@@ -2198,10 +2200,10 @@ func (osFS) Rename(oldpath, newpath string) error                 { return os.Re
 func (osFS) Remove(name string) error                             { return os.Remove(name) }
 
 // TestTryReloadConfig_IncludesBuiltinPackOrders verifies that the controller's
-// config reload path includes builtin pack formula layers so the order
-// dispatcher sees orders from all embedded packs (core, maintenance, bd, dolt).
+// config reload path composes the explicit builtin pack includes so the order
+// dispatcher sees orders from all embedded packs (core, bd, dolt).
 // Regression test for gc-4624: dolt pack orders never fired because
-// tryReloadConfig did not pass builtinPackIncludes to LoadWithIncludes.
+// tryReloadConfig dropped the builtin pack formula layers.
 func TestTryReloadConfig_IncludesBuiltinPackOrders(t *testing.T) {
 	configureTestDoltIdentityEnv(t)
 	t.Setenv("GC_BEADS", "")
@@ -2211,9 +2213,10 @@ func TestTryReloadConfig_IncludesBuiltinPackOrders(t *testing.T) {
 	if err := os.WriteFile(tomlPath, []byte("[workspace]\nname = \"test\"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile(city.toml): %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte("[pack]\nname = \"test\"\nschema = 1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte("[pack]\nname = \"test\"\nschema = 2\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile(pack.toml): %v", err)
 	}
+	writeBuiltinImportsFixture(t, dir, "core", "bd")
 
 	result, err := tryReloadConfig(tomlPath, "test", dir)
 	if err != nil {
@@ -2231,10 +2234,10 @@ func TestTryReloadConfig_IncludesBuiltinPackOrders(t *testing.T) {
 		names[a.Name] = true
 	}
 
-	// Maintenance pack orders (always included).
+	// Core pack housekeeping orders (explicit core include).
 	for _, want := range []string{"gate-sweep", "wisp-compact"} {
 		if !names[want] {
-			t.Errorf("missing maintenance order %q; got %v", want, names)
+			t.Errorf("missing core order %q; got %v", want, names)
 		}
 	}
 	// Dolt pack orders (included transitively via bd pack).

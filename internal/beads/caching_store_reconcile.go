@@ -8,6 +8,8 @@ import (
 	"math"
 	"sort"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
 // cacheLatencyWindowSize is the size of the rolling window of bd-list
@@ -27,6 +29,38 @@ const cacheLatencyWindowSize = 10
 // a quarter of the small cadence is evidence of sustained backend
 // pressure.
 const cacheLatencyHighWaterMark = cacheReconcileIntervalSmall / 4
+
+// cacheReconcileScanWarnThreshold is the active-bead count at which a
+// reconcile full scan emits beads.cache.scan_large telemetry. Sits between
+// the bead-count cadence thresholds (MEDIUM at 1000, LARGE at 5000): healthy
+// large rigs above the MEDIUM floor stay quiet, while a store drifting toward
+// LARGE warns before every cycle pays multi-second, multi-MB bd round-trips
+// (ga-698fl2: a dev store silently reached 3,272 active beads / ~11MB of
+// JSON / ~2s bd latency per cycle).
+const cacheReconcileScanWarnThreshold = 2500
+
+// recordCacheScanLarge emits the over-threshold scan-size telemetry; a var so
+// internal tests can intercept emission. Swaps are unsynchronized: tests that
+// replace it must stay sequential (no t.Parallel) and must not leave a
+// reconcile loop running across the swap.
+var recordCacheScanLarge = telemetry.RecordCacheScanLarge
+
+// cacheFullScanQuery is the single query shape Prime and the reconciler use
+// to load the cache's authoritative snapshot. The reconcile diff treats the
+// result as the COMPLETE active universe: any cached bead absent from it is
+// re-verified per ID (recoverMissingFromList) and then evicted with a
+// synthetic bead.closed event. Two bounds follow from that authority:
+//
+//   - Limit must stay unset (0). A bounded list would route every active
+//     bead beyond the limit through the per-bead Get recovery path on every
+//     cycle — O(active−limit) bd round-trips — and synthesize false
+//     bead.closed evictions whenever those Gets degrade.
+//   - IncludeClosed is pinned false. The scan cost is O(active beads) by
+//     design; closed history grows without bound and would multiply the
+//     per-cycle bd payload without changing the diff result.
+func cacheFullScanQuery() ListQuery {
+	return ListQuery{AllowScan: true, SkipLabels: true, IncludeClosed: false, TierMode: TierBoth}
+}
 
 func (c *CachingStore) reconcileLoop(ctx context.Context, stagger time.Duration) {
 	if stagger > 0 {
@@ -94,9 +128,10 @@ func beadCountCadence(total int) time.Duration {
 	}
 }
 
-// recordReconcileLatencyLocked appends a bd-list duration sample to the
-// rolling latency window, dropping the oldest sample once the window is
-// full. Caller must hold c.mu (write lock).
+// recordReconcileLatencyLocked appends a reconcile read sample to the rolling
+// latency window, dropping the oldest sample once the window is full. Success
+// samples include backing.List plus ready-projection enrichment. Caller must
+// hold c.mu (write lock).
 func (c *CachingStore) recordReconcileLatencyLocked(d time.Duration) {
 	if len(c.latencyWindow) < cacheLatencyWindowSize {
 		c.latencyWindow = append(c.latencyWindow, d)
@@ -256,9 +291,9 @@ func (c *CachingStore) runReconciliation() {
 	c.mu.RUnlock()
 
 	bdStart := time.Now()
-	fresh, err := c.backing.List(ListQuery{AllowScan: true, SkipLabels: true})
-	bdLatency := time.Since(bdStart)
+	fresh, err := c.backing.List(cacheFullScanQuery())
 	if err != nil {
+		bdLatency := time.Since(bdStart)
 		c.mu.Lock()
 		c.syncFailures++
 		if (IsPartialResult(err) || c.syncFailures >= maxCacheSyncFailures) && (c.state == cacheLive || c.state == cachePartial) {
@@ -271,15 +306,27 @@ func (c *CachingStore) runReconciliation() {
 		c.mu.Unlock()
 		return
 	}
+	if len(fresh) >= cacheReconcileScanWarnThreshold {
+		recordCacheScanLarge(context.Background(), c.idPrefix, len(fresh),
+			cacheReconcileScanWarnThreshold, time.Since(bdStart))
+	}
+	enriched, enrichErr := c.enrichReadyProjectionForCache(fresh)
+	bdLatency := time.Since(bdStart)
+	projectionFailed := enrichErr != nil
+	if enrichErr != nil {
+		c.recordProblem("reconcile ready projection", enrichErr)
+	} else {
+		fresh = enriched
+	}
 
 	freshByID := make(map[string]Bead, len(fresh))
 	for _, b := range fresh {
 		freshByID[b.ID] = cloneBead(b)
 	}
 
-	c.recoverMissingFromList(freshByID)
+	confirmedClosed := c.recoverMissingFromList(freshByID)
 
-	depMap, depsComplete, depErr := c.fetchDepsForIDs(beadIDs(freshByID))
+	depMap, depsComplete, depErr := c.fetchDepsForBeads(freshByID)
 	if depErr != nil {
 		c.recordProblem("refresh dep cache during reconcile", depErr)
 	}
@@ -287,6 +334,9 @@ func (c *CachingStore) runReconciliation() {
 
 	c.mu.Lock()
 	now := time.Now()
+	if projectionFailed {
+		c.preserveCachedReadyProjectionLocked(freshByID, depMap, useFreshDeps)
+	}
 	if c.mutationSeq != startSeq {
 		var adds, removes, updates int64
 		notifications := make([]cacheNotification, 0, len(freshByID))
@@ -355,6 +405,9 @@ func (c *CachingStore) runReconciliation() {
 			if old.Status != "closed" {
 				closed := cloneBead(old)
 				closed.Status = "closed"
+				if freshClosed, ok := confirmedClosed[id]; ok {
+					closed = cloneBead(freshClosed)
+				}
 				notifications = append(notifications, cacheNotification{
 					eventType: "bead.closed",
 					bead:      closed,
@@ -371,9 +424,7 @@ func (c *CachingStore) runReconciliation() {
 		c.syncFailures = 0
 		c.depsComplete = nextDepsComplete
 		c.primePartialErr = nil
-		if c.state == cacheDegraded {
-			c.state = cacheLive
-		}
+		c.promoteLiveLocked()
 		durMs := float64(time.Since(start).Microseconds()) / 1000.0
 		c.stats.LastReconcileAt = now
 		c.stats.LastReconcileMs = durMs
@@ -404,12 +455,10 @@ func (c *CachingStore) runReconciliation() {
 	for id, freshBead := range freshByID {
 		beadForCache := freshBead
 		preservedRecentLocal := false
-		if recentLocalMutation(c.localBeadAt[id], now) {
-			c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt)
-		}
 		if current, keep := c.recentLocalBeadConflictLocked(id, freshBead, now, true); keep {
 			beadForCache = current
 			preservedRecentLocal = true
+			c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt)
 		}
 		freshDeps := c.depsForReconcileLocked(id, freshBead, depMap, useFreshDeps)
 		nextBeads[id] = cloneBead(beadForCache)
@@ -454,6 +503,9 @@ func (c *CachingStore) runReconciliation() {
 			}
 			closed := cloneBead(old)
 			closed.Status = "closed"
+			if freshClosed, ok := confirmedClosed[id]; ok {
+				closed = cloneBead(freshClosed)
+			}
 			notifications = append(notifications, cacheNotification{
 				eventType: "bead.closed",
 				bead:      closed,
@@ -470,9 +522,7 @@ func (c *CachingStore) runReconciliation() {
 	c.deletedSeq = make(map[string]uint64)
 	c.syncFailures = 0
 	c.primePartialErr = nil
-	if c.state == cacheDegraded {
-		c.state = cacheLive
-	}
+	c.promoteLiveLocked()
 
 	durMs := float64(time.Since(start).Microseconds()) / 1000.0
 	c.stats.LastReconcileAt = now
@@ -490,6 +540,21 @@ func (c *CachingStore) runReconciliation() {
 		log.Print(logLine)
 	}
 	c.notifyChanges(notifications)
+}
+
+// promoteLiveLocked marks the cache live after a clean full-scan
+// reconciliation. A successful reconcile loads the same complete active
+// snapshot (identical ListQuery and dep fetch) a successful Prime would,
+// so it promotes unconditionally — not just degraded→live but also
+// partial/uninitialized→live. This makes the reconciler a convergence
+// path for stores whose initial full prime failed or never ran: without
+// it such a store serves its PrimeActive-era snapshot indefinitely while
+// only event-bus writes update it, and storage-level state created
+// before the controller started (e.g. routed pool work awaiting pickup)
+// stays invisible until something happens to touch the bead. Caller must
+// hold c.mu (write lock).
+func (c *CachingStore) promoteLiveLocked() {
+	c.state = cacheLive
 }
 
 // reconcileSuccessLogLocked composes the per-reconcile success log line
@@ -544,11 +609,13 @@ func (c *CachingStore) depsForReconcileLocked(id string, freshBead Bead, depMap 
 // synthesize a spurious bead.closed event for it.
 //
 // On ErrNotFound the bead is left absent so the diff path can emit
-// bead.closed as before. On any other error the cached entry is merged
-// back conservatively, deferring the close to a later scan when the
-// backing store's state is unambiguous. Callers must own freshByID and not
-// access it concurrently while recovery is running.
-func (c *CachingStore) recoverMissingFromList(freshByID map[string]Bead) {
+// bead.closed as before. When Get confirms a closed bead, the returned map
+// carries that fresh row so the diff path can emit an authoritative close
+// payload instead of a stale cached status flip. On any other error the cached
+// entry is merged back conservatively, deferring the close to a later scan
+// when the backing store's state is unambiguous. Callers must own freshByID
+// and not access it concurrently while recovery is running.
+func (c *CachingStore) recoverMissingFromList(freshByID map[string]Bead) map[string]Bead {
 	c.mu.RLock()
 	candidates := make(map[string]Bead)
 	for id, b := range c.beads {
@@ -562,8 +629,9 @@ func (c *CachingStore) recoverMissingFromList(freshByID map[string]Bead) {
 	}
 	c.mu.RUnlock()
 	if len(candidates) == 0 {
-		return
+		return nil
 	}
+	var confirmedClosed map[string]Bead
 	var recoveredAlive int64
 	var deferredClose int64
 	for id, cached := range candidates {
@@ -580,6 +648,10 @@ func (c *CachingStore) recoverMissingFromList(freshByID map[string]Bead) {
 				continue
 			}
 			if bead.Status == "closed" {
+				if confirmedClosed == nil {
+					confirmedClosed = make(map[string]Bead)
+				}
+				confirmedClosed[id] = cloneBead(bead)
 				continue
 			}
 			freshByID[id] = cloneBead(bead)
@@ -601,4 +673,46 @@ func (c *CachingStore) recoverMissingFromList(freshByID map[string]Bead) {
 		c.stats.ReconcileCloseDeferrals += deferredClose
 		c.mu.Unlock()
 	}
+	return confirmedClosed
+}
+
+func (c *CachingStore) preserveCachedReadyProjectionLocked(items map[string]Bead, depMap map[string][]Dep, useFreshDeps bool) {
+	for id, item := range items {
+		if item.IsBlocked != nil {
+			continue
+		}
+		cached, ok := c.beads[id]
+		if !ok || cached.IsBlocked == nil {
+			continue
+		}
+		freshDeps := c.depsForReconcileLocked(id, item, depMap, useFreshDeps)
+		if depsChanged(c.deps[id], freshDeps) {
+			continue
+		}
+		if c.readyBlockingDependencyTargetStatusChangedLocked(freshDeps, items) {
+			continue
+		}
+		item.IsBlocked = cloneBoolPtr(cached.IsBlocked)
+		items[id] = item
+	}
+}
+
+func (c *CachingStore) readyBlockingDependencyTargetStatusChangedLocked(deps []Dep, items map[string]Bead) bool {
+	for _, dep := range deps {
+		if !isReadyBlockingDependencyType(dep.Type) {
+			continue
+		}
+		cachedTarget, cachedOK := c.beads[dep.DependsOnID]
+		freshTarget, freshOK := items[dep.DependsOnID]
+		if !freshOK {
+			continue
+		}
+		if !cachedOK {
+			return true
+		}
+		if cachedTarget.Status != freshTarget.Status {
+			return true
+		}
+	}
+	return false
 }

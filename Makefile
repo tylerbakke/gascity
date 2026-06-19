@@ -21,7 +21,50 @@ LDFLAGS := -X main.version=$(VERSION) \
            -X main.commit=$(COMMIT) \
            -X main.date=$(BUILD_TIME)
 
-.PHONY: build check check-all check-bd check-docker check-docs check-dolt check-routed-test-rows check-version-tag lint lint-full lint-new lint-changed fmt-check fmt vet test test-fast-parallel test-fsys-darwin-compile test-pack-registry-live test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-worker-core test-worker-core-phase2 test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mcp-mail test-docker test-k8s test-cover cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-smoke
+unique_words = $(if $1,$(firstword $1) $(call unique_words,$(filter-out $(firstword $1),$1)))
+
+# macOS: icu4c (a transitive Dolt / go-icu-regex CGO build dependency) is
+# keg-only under Homebrew, so its headers/libs are not on the default CGO
+# search path. Point CGO at them when icu4c is present. This is a no-op on
+# Linux and other platforms (where system ICU, e.g. libicu-dev, is found
+# normally) and a no-op on macOS when icu4c is not installed.
+ifeq ($(shell uname),Darwin)
+ICU_PREFIX := $(shell brew --prefix icu4c 2>/dev/null)
+ifneq ($(ICU_PREFIX),)
+CGO_CPPFLAGS += -I$(ICU_PREFIX)/include
+CGO_LDFLAGS += -L$(ICU_PREFIX)/lib
+export CGO_CPPFLAGS
+export CGO_LDFLAGS
+endif
+endif
+
+# Linux: some non-system compilers (Nix, Flox, etc.) don't search /usr/include
+# or /usr/lib by default. If system ICU headers exist but the compiler doesn't
+# see them, intentionally let system paths participate in the whole CGO build.
+# Set SYS_USR_CGO_FALLBACK=0 to disable this fallback for hermetic or cross-CGO
+# builds.
+ifeq ($(shell uname),Linux)
+SYS_USR_CGO_FALLBACK ?= 1
+ifneq ($(SYS_USR_CGO_FALLBACK),0)
+SYS_USR_INCLUDE ?= /usr/include
+SYS_USR_LIB_ROOT ?= /usr/lib
+SYS_USR_LIB64_ROOT ?= /usr/lib64
+ifneq ($(wildcard $(SYS_USR_INCLUDE)/unicode/uregex.h),)
+ifeq ($(shell $(CC) -E -Wp,-v -x c /dev/null 2>&1 | sed 's/^[[:space:]]*//' | grep -F -x -q "$(SYS_USR_INCLUDE)" && echo yes),)
+SYS_USR_MULTIARCH_CANDIDATES := $(strip $(shell dpkg-architecture -q DEB_HOST_MULTIARCH 2>/dev/null) $(shell $(CC) -print-multiarch 2>/dev/null))
+SYS_USR_LIB_CANDIDATES := $(foreach arch,$(SYS_USR_MULTIARCH_CANDIDATES),$(SYS_USR_LIB_ROOT)/$(arch)) $(SYS_USR_LIB64_ROOT) $(SYS_USR_LIB_ROOT)
+SYS_USR_LIB_DIRS := $(strip $(call unique_words,$(strip $(foreach dir,$(SYS_USR_LIB_CANDIDATES),$(if $(wildcard $(dir)),$(dir))))))
+$(info Linux system CGO fallback active: adding -I$(SYS_USR_INCLUDE) $(addprefix -L,$(SYS_USR_LIB_DIRS)); set SYS_USR_CGO_FALLBACK=0 to disable)
+CGO_CPPFLAGS += -I$(SYS_USR_INCLUDE)
+CGO_LDFLAGS += $(addprefix -L,$(SYS_USR_LIB_DIRS))
+export CGO_CPPFLAGS
+export CGO_LDFLAGS
+endif
+endif
+endif
+endif
+
+.PHONY: build check check-all check-bd check-docker check-docs check-dolt check-gomod-replace check-native-dependency-surface check-routed-test-rows check-version-tag lint lint-full lint-new lint-changed fmt-check fmt vet test test-fast-parallel test-fsys-darwin-compile test-pack-registry-live test-native-doltlite-beads test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-worker-core test-worker-core-phase2 test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mail-wisp-insert test-mcp-mail test-docker test-k8s test-cover cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-smoke
 
 ## build: compile gc binary with version metadata
 build:
@@ -58,7 +101,7 @@ generate:
 
 ## check-schema: verify generated docs are up to date
 check-schema: generate
-	@git diff --exit-code docs/schema/ docs/reference/ || \
+	@git diff --exit-code docs/reference/ || \
 		(echo "Error: generated docs stale. Run 'make generate'" && exit 1)
 
 ## clean: remove build artifacts
@@ -74,6 +117,17 @@ check: fmt-check lint vet check-routed-test-rows test
 ## api-404-error, controller-down, escape-hatch).
 check-routed-test-rows:
 	./scripts/check-routed-test-rows.sh
+
+## check-gomod-replace: block unreleased replace directives (pseudo-version, local path, git ref)
+## Tripwire for the 2026-06-11 incident where PR #3489 shipped a pseudo-version replace
+## (=> v1.0.5-0.20260611054652-dc0561af28e9) that violated the public-project release policy.
+## Policy: only released semver tags allowed; human-operator bypass required for exceptions.
+check-gomod-replace:
+	bash scripts/check-gomod-replace.sh go.mod
+
+## check-native-dependency-surface: guard native beads dependency and binary growth
+check-native-dependency-surface:
+	bash scripts/check-native-dependency-surface.sh
 
 ## check-bd: verify bd (beads CLI) is installed
 check-bd:
@@ -188,6 +242,14 @@ vet:
 ## tests and corrupt live cities. Only the allowlist below survives. To opt
 ## extra vars through, set EXTRA_TEST_ENV='FOO=bar BAZ=qux' on the make line.
 ## See PR #746.
+##
+## Load-bearing: GC_DOLT_PORT and BEADS_DOLT_SERVER_PORT are deliberately NOT in
+## the allowlist below. They point bd at the live shared city Dolt server, so
+## letting them reach `go test` makes every bd-forking test write to PRODUCTION
+## Dolt — 18+ parallel workers pegged the shared server and stalled bd writes
+## city-wide (ga-w2kh1r). Do not add them. For a bare `go test` that bypasses
+## this wrapper, internal/testenv scrubs these vars at test-binary init in every
+## covered package (enforced by TestRequiresDedicatedTestenvImportFile).
 GOPATH_VAL    := $(shell go env GOPATH)
 GOCACHE_VAL   := $(shell go env GOCACHE)
 GOMODCACHE_VAL := $(shell go env GOMODCACHE)
@@ -203,6 +265,7 @@ TEST_ENV = env -i \
 	TMPDIR="$${TMPDIR:-/tmp}" \
 	OBSERVABLE_TEST_LOG="$${OBSERVABLE_TEST_LOG-}" \
 	OBSERVABLE_FAILURE_LINES="$${OBSERVABLE_FAILURE_LINES-}" \
+	GC_TEST_NO_SLICE="$${GC_TEST_NO_SLICE-}" \
 	XDG_RUNTIME_DIR="$$XDG_RUNTIME_DIR" \
 	GOPATH="$(GOPATH_VAL)" \
 	GOCACHE="$(GOCACHE_VAL)" \
@@ -231,6 +294,8 @@ TEST_ENV = env -i \
 	CLAUDE_CODE_EFFORT_LEVEL="$${CLAUDE_CODE_EFFORT_LEVEL-}" \
 	CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="$${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-}" \
 	OLLAMA_API_KEY="$${OLLAMA_API_KEY-}" \
+	CGO_CPPFLAGS="$${CGO_CPPFLAGS-}" \
+	CGO_LDFLAGS="$${CGO_LDFLAGS-}" \
 	$(EXTRA_TEST_ENV)
 
 ## test: run fast unit tests (skip integration-tagged and GC_FAST_UNIT-gated process tests)
@@ -242,7 +307,7 @@ TEST_ENV = env -i \
 ## cache input hashes over local working files.
 ## Wrapped in $(TEST_ENV) — see comment above for why.
 test: test-fsys-darwin-compile
-	$(TEST_ENV) GC_FAST_UNIT=1 scripts/go-test-observable test -- -p=4 -count=1 ./...
+	$(TEST_ENV) GC_FAST_UNIT=1 scripts/go-test-observable test -- -p=4 -count=1 -timeout 15m ./...
 
 LOCAL_TEST_JOBS ?= $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
 
@@ -260,11 +325,22 @@ test-fsys-darwin-compile:
 ## test-pack-registry-live: run the opt-in gascity-packs registry canary
 test-pack-registry-live:
 	@if [ -z "$${GC_TEST_GASCITY_PACKS_REGISTRY:-}" ]; then \
-		echo "Set GC_TEST_GASCITY_PACKS_REGISTRY to a gascity-packs registry.toml source"; \
-		echo "Example: GC_TEST_GASCITY_PACKS_REGISTRY=/Users/dbox/repos/gc/wt/gascity-packs-public-builtins/registry.toml make test-pack-registry-live"; \
+		echo "Set GC_TEST_GASCITY_PACKS_REGISTRY to main or a gascity-packs registry.toml source"; \
+		echo "Example: GC_TEST_GASCITY_PACKS_REGISTRY=main make test-pack-registry-live"; \
 		exit 2; \
 	fi
-	$(TEST_ENV) GC_TEST_GASCITY_PACKS_REGISTRY="$${GC_TEST_GASCITY_PACKS_REGISTRY}" go test ./cmd/gc -run '^TestPackRegistryLiveGascityPacksCatalog$$' -count=1
+	@# Keep the live canary portable on runners and local machines that do not
+	@# have the optional ICU C headers needed by the default CGO build path.
+	$(TEST_ENV) CGO_ENABLED=0 GC_TEST_GASCITY_PACKS_REGISTRY="$${GC_TEST_GASCITY_PACKS_REGISTRY}" go test ./cmd/gc -run '^TestPackRegistryLiveGascityPacksCatalog$$' -count=1
+	$(TEST_ENV) CGO_ENABLED=0 GC_TEST_GASCITY_PACKS_REGISTRY="$${GC_TEST_GASCITY_PACKS_REGISTRY}" go test -tags acceptance_a -timeout 10m ./test/acceptance -run '^TestPackRegistryLiveImportsEveryCatalogPack$$' -count=1
+
+## update-bundled-gastown-pack: pin the gastown module/constants/example to the latest registry release
+update-bundled-gastown-pack:
+	scripts/update-bundled-gastown-pack
+
+## test-native-doltlite-beads: compile and run the native DoltLite read-store suite
+test-native-doltlite-beads:
+	$(TEST_ENV) CGO_ENABLED=0 go test -tags gascity_native_beads ./internal/beads -count=1
 
 ## test-cmd-gc-process: run the full non-short cmd/gc suite, including the
 ## process-backed lifecycle coverage routed out of the default fast loop
@@ -273,6 +349,7 @@ test-cmd-gc-process:
 
 CMD_GC_PROCESS_SHARD ?= 1
 CMD_GC_PROCESS_TOTAL ?= 6
+CMD_GC_COVER_TOTAL ?= 6
 test-cmd-gc-process-shard:
 	$(TEST_ENV) GC_FAST_UNIT=0 GO_TEST_COUNT=1 GO_TEST_TIMEOUT=20m ./scripts/test-go-test-shard ./cmd/gc $(CMD_GC_PROCESS_SHARD) $(CMD_GC_PROCESS_TOTAL)
 
@@ -307,17 +384,17 @@ test-worker-inference:
 ## test-worker-inference-phase3: alias for the live worker inference conformance package
 test-worker-inference-phase3: test-worker-inference
 
-## test-acceptance: run acceptance tests (Tier A — fast, <5 min, every PR).
-## ACCEPTANCE_TIMEOUT overrides the go-test timeout (defaults to 5m on
-## Linux; Mac CI bumps it because launchd-mediated supervisor start is
-## noticeably slower than systemd).
-ACCEPTANCE_TIMEOUT ?= 5m
+## test-acceptance: run acceptance tests (Tier A — command-level PR gate).
+## ACCEPTANCE_TIMEOUT overrides the go-test timeout. The unsharded local/CI
+## target runs the command-heavy Tier A package serially; RC gate shards it.
+ACCEPTANCE_TIMEOUT ?= 15m
 test-acceptance:
 	$(TEST_ENV) go test -tags acceptance_a -timeout $(ACCEPTANCE_TIMEOUT) ./test/acceptance/...
 
 ## test-acceptance-b: run Tier B acceptance tests (lifecycle, ~5 min, nightly)
+ACCEPTANCE_B_TIMEOUT ?= 10m
 test-acceptance-b:
-	$(TEST_ENV) go test -tags acceptance_b -timeout 10m -v ./test/acceptance/tier_b/...
+	$(TEST_ENV) go test -tags acceptance_b -timeout $(ACCEPTANCE_B_TIMEOUT) -v ./test/acceptance/tier_b/...
 
 ## test-acceptance-c: run Tier C acceptance tests (real inference, ~30-40 min, manual/nightly)
 test-acceptance-c:
@@ -468,13 +545,23 @@ check-docs:
 # Packages for coverage — exclude noise:
 #   session/tmux: integration-test-only, not meaningful for unit coverage
 #   beadstest: conformance helper, runs under internal/beads coverage
-UNIT_COVER_PKGS := $(shell go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v -e /session/tmux -e /beadstest)
+# cmd/gc excluded: it runs sharded below in test-cover to stay under per-package timeout
+UNIT_COVER_PKGS_NONCMDGC = $(shell go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v -e /session/tmux -e /beadstest -e '/cmd/gc$$')
 
-## test-cover: run fast unit-test coverage without the integration-tagged package sweep
+## test-cover: run fast unit-test coverage without the integration-tagged package sweep.
+## cmd/gc is sharded CMD_GC_COVER_TOTAL (default 6) ways via test-go-test-shard so each
+## shard lands well under the per-package timeout; profiles are merged via merge-coverprofiles.
 ## The skipped cmd/gc process-backed scenarios remain covered by
 ## `make test-cmd-gc-process` locally and the CI `cmd/gc process suite` job.
 test-cover: test-fsys-darwin-compile
-	$(TEST_ENV) GC_FAST_UNIT=1 go test -timeout 8m -coverprofile=coverage.txt $(UNIT_COVER_PKGS)
+	$(TEST_ENV) GC_FAST_UNIT=1 go test -timeout 10m -coverprofile=coverage.noncmdgc.txt $(UNIT_COVER_PKGS_NONCMDGC)
+	@rm -f coverage.cmdgc.*.txt
+	@for s in $$(seq 1 $(CMD_GC_COVER_TOTAL)); do \
+		$(TEST_ENV) GO_TEST_COVERPROFILE="coverage.cmdgc.$$s.txt" \
+		GC_FAST_UNIT=1 GO_TEST_COUNT=1 GO_TEST_TIMEOUT=10m \
+		./scripts/test-go-test-shard ./cmd/gc "$$s" $(CMD_GC_COVER_TOTAL) || exit 1; \
+	done
+	./scripts/merge-coverprofiles coverage.txt coverage.noncmdgc.txt coverage.cmdgc.*.txt
 
 ## cover: run tests and show coverage report
 cover: test-cover
@@ -531,6 +618,14 @@ install-buildx:
 	install -m 0755 "$$tmp" $(HOME)/.docker/cli-plugins/docker-buildx
 	@echo "Installed docker-buildx v$(BUILDX_VERSION)"
 
+## test-mail-wisp-insert: run the beads version-skew regression tests for gc mail send (wisp_events INSERT path)
+## Tripwire for the 2026-06-11 P0: covers both NativeDoltStore and BdStore → Dolt paths.
+test-mail-wisp-insert:
+	@echo "=== NativeDoltStore ephemeral mail (go.mod beads library) ==="
+	$(TEST_ENV) go test -tags integration ./internal/beads/ -run TestNativeDoltStoreEphemeralMailSend -v -count=1
+	@echo "=== BdStore mail wisp INSERT (bd CLI → Dolt SQL) ==="
+	$(TEST_ENV) go test -tags integration ./test/integration/ -run TestBdStoreMailWispInsert -v -count=1
+
 ## test-mcp-mail: run mcp_agent_mail live conformance test (auto-starts server)
 test-mcp-mail:
 	$(TEST_ENV) GC_TEST_MCP_MAIL=1 go test ./internal/mail/exec/ -run TestMCPMailConformanceLive -v -count=1
@@ -562,7 +657,7 @@ diagrams-excalidraw:
 		out="$$out_dir/$$base.svg"; \
 		if [ ! -e "$$out" ] || [ "$$f" -nt "$$out" ]; then \
 			echo "excalidraw -> $$out"; \
-			npx -y @swiftlysingh/excalidraw-cli convert "$$f" --format svg --output "$$out"; \
+			npx -y @swiftlysingh/excalidraw-cli convert "$$f" --format svg --padding 16 --output "$$out"; \
 			rendered=$$((rendered+1)); \
 		fi; \
 	done; \
@@ -611,15 +706,15 @@ dashboard-ci: dashboard-check
 	fi
 
 ## spec-ci: regenerate the OpenAPI spec + generated Go client, fail on drift.
-## Used by CI to enforce that internal/api/openapi.json, docs/schema JSON
+## Used by CI to enforce that internal/api/openapi.json, docs/reference/schema JSON
 ## artifacts, compatibility .txt mirrors, and internal/api/genclient/client_gen.go
 ## are all in lock-step with Huma.
 spec-ci: install-oapi-codegen
 	go run ./cmd/genspec
 	go generate ./internal/api/genclient
-	@if ! git diff --quiet -- internal/api/openapi.json docs/schema/openapi.json docs/schema/openapi.txt docs/schema/events.json docs/schema/events.txt internal/api/genclient/client_gen.go; then \
+	@if ! git diff --quiet -- internal/api/openapi.json docs/reference/schema/openapi.json docs/reference/schema/openapi.txt docs/reference/schema/events.json docs/reference/schema/events.txt internal/api/genclient/client_gen.go; then \
 		echo "ERROR: spec/client artifacts drifted — run 'make spec-ci' locally and commit." >&2; \
-		git --no-pager diff --stat -- internal/api/openapi.json docs/schema/openapi.json docs/schema/openapi.txt docs/schema/events.json docs/schema/events.txt internal/api/genclient/client_gen.go; \
+		git --no-pager diff --stat -- internal/api/openapi.json docs/reference/schema/openapi.json docs/reference/schema/openapi.txt docs/reference/schema/events.json docs/reference/schema/events.txt internal/api/genclient/client_gen.go; \
 		exit 1; \
 	fi
 

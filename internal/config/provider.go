@@ -305,6 +305,14 @@ func (rp *ResolvedProvider) ProviderSessionCreateTransport() string {
 		// the non-interactive tool trust contract required by coding agents.
 		return ""
 	}
+	if family == "mimocode" {
+		// MiMo Code supports explicit ACP sessions, but --never-ask-questions
+		// — the flag that suppresses the question/plan gates headless runs
+		// require — is not taken by the `mimo acp` subcommand, and ACPArgs
+		// replaces Args, so an ACP default would compose a launch without it.
+		// Live conformance coverage exists only on the CLI transport.
+		return ""
+	}
 	if strings.TrimSpace(rp.ACPCommand) != "" || rp.ACPArgs != nil {
 		return SessionTransportACP
 	}
@@ -397,7 +405,6 @@ func BuiltinProviderOrder() []string {
 }
 
 // BuiltinProviders returns the built-in provider presets.
-// These are available without any [providers] section in city.toml.
 func BuiltinProviders() map[string]ProviderSpec {
 	specs := workerbuiltin.BuiltinProviders()
 	out := make(map[string]ProviderSpec, len(specs))
@@ -405,6 +412,13 @@ func BuiltinProviders() map[string]ProviderSpec {
 		out[name] = providerSpecFromWorker(spec)
 	}
 	return out
+}
+
+// BuiltinProviderAlias returns the thin explicit catalog entry used to expose
+// a built-in provider under its canonical key.
+func BuiltinProviderAlias(name string) ProviderSpec {
+	base := BasePrefixBuiltin + strings.TrimSpace(name)
+	return ProviderSpec{Base: &base}
 }
 
 func providerSpecFromWorker(spec workerbuiltin.BuiltinProviderSpec) ProviderSpec {

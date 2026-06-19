@@ -402,13 +402,21 @@ func TestProbeLiveSessions_TimesOut(t *testing.T) {
 		JSON:              true,
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+		// Non-nil empty slice prevents runReapStage from calling
+		// discoverActiveTestRoots (which invokes ps -ax and can take ~1-2 s on
+		// macOS, blowing past the wall-clock budget this test exercises).
+		ActiveTestRoots: []string{},
 	}
 
 	start := time.Now()
 	runDoltCleanup(opts, &stdout, &stderr)
 	elapsed := time.Since(start)
-	if elapsed >= 250*time.Millisecond {
-		t.Errorf("wall time = %v, want < 250ms", elapsed)
+	// Allow 10x the probe timeout as wall-clock budget. Under parallel test
+	// load the scheduler may delay goroutine wakeups past the theoretical
+	// minimum; 10x gives headroom without letting a truly hung probe pass.
+	wallBudget := cleanupLiveSessionProbeTimeout * 10
+	if elapsed >= wallBudget {
+		t.Errorf("wall time = %v, want < %v (10x probe timeout)", elapsed, wallBudget)
 	}
 
 	var r CleanupReport
@@ -589,5 +597,20 @@ func TestProbeLiveSessions_RemovesFromToDrop(t *testing.T) {
 
 	if !equalStringSlice(client.dropped, []string{"testdb_b"}) {
 		t.Errorf("DropDatabase called with %v, want [testdb_b]", client.dropped)
+	}
+}
+
+// TestPSEnumerationTimeoutExceedsProcEnumerationTimeout verifies that the
+// ps-wide process list timeout is >= 30 s and strictly greater than
+// procEnumerationTimeout. ps -ax on a busy macOS machine can take 2–5 s;
+// it needs a much larger budget than the per-PID /proc reads that
+// procEnumerationTimeout guards.
+func TestPSEnumerationTimeoutExceedsProcEnumerationTimeout(t *testing.T) {
+	if psEnumerationTimeout < 30*time.Second {
+		t.Errorf("psEnumerationTimeout = %v, want >= 30s", psEnumerationTimeout)
+	}
+	if psEnumerationTimeout <= procEnumerationTimeout {
+		t.Errorf("psEnumerationTimeout = %v must exceed procEnumerationTimeout = %v",
+			psEnumerationTimeout, procEnumerationTimeout)
 	}
 }

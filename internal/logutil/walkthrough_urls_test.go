@@ -10,7 +10,7 @@ import (
 var expectedWalkthroughURLs = map[string]string{
 	"bd_op_init_timeout":   "https://docs.gascityhall.com/troubleshooting/gc-start-walkthrough#bd-op-init-timeout",
 	"pack_schema_mismatch": "https://docs.gascityhall.com/troubleshooting/gc-start-walkthrough#pack-schema-mismatch",
-	"duplicate_name_v1v2":  "https://docs.gascityhall.com/guides/migrating-to-pack-vnext#agents",
+	"duplicate_name_v1v2":  "https://docs.gascityhall.com/troubleshooting/gc-start-walkthrough#duplicate-name",
 	"duplicate_name_other": "https://docs.gascityhall.com/troubleshooting/gc-start-walkthrough#duplicate-name",
 	"unknown_field":        "https://docs.gascityhall.com/troubleshooting/gc-start-walkthrough#unknown-field-agent-pool",
 	"rig_path_required":    "https://docs.gascityhall.com/troubleshooting/gc-start-walkthrough#rig-path-required",
@@ -44,9 +44,12 @@ func TestWalkthroughURLStringsStayInContractFile(t *testing.T) {
 			switch d.Name() {
 			case ".git", ".gc", "node_modules":
 				return filepath.SkipDir
-			default:
-				return nil
 			}
+			// Skip git worktrees embedded in the repo (have a .git file, not dir).
+			if fi, serr := os.Stat(filepath.Join(path, ".git")); serr == nil && !fi.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if !strings.HasSuffix(path, ".go") {
 			return nil

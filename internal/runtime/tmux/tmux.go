@@ -37,7 +37,16 @@ import (
 
 const pollInterval = 100 * time.Millisecond
 
-var providersSkippingEscapeBeforeEnter = []string{"claude", "codex", "copilot", "gemini", "kimi", "opencode", "pi"}
+// grok's TUI treats Escape as "clear input"/mode-toggle, so synthesizing an
+// Escape between the pasted prompt and the submit Enter (the default for
+// non-listed providers) prevents the Enter from submitting — the worker then
+// idles at grok's welcome screen forever. Skip the pre-Enter Escape for grok
+// (like the other send-keys-driven TUIs). See ga-3xu / grok-engagement follow-up.
+// The list doubles as a process-name fallback when the pane lacks a
+// GC_PROVIDER env var; mimocode's binary names differ from its provider
+// name ("mimo" wrapper, ".mimocode" compiled child), so both are listed
+// alongside the family name.
+var providersSkippingEscapeBeforeEnter = []string{"claude", "codex", "copilot", "gemini", "grok", "kimi", "mimocode", "mimo", ".mimocode", "opencode", "pi", "antigravity"}
 
 // Config holds configurable timeouts and intervals for the tmux provider.
 // All fields have sensible defaults matching the original hardcoded values.
@@ -212,9 +221,38 @@ type Tmux struct {
 	exec                 executor
 	interactionDedup     *approvalDedup
 	interactionDedupOnce sync.Once
+	configureOnce        sync.Once
 	hiddenAttachMu       sync.Mutex
 	hiddenAttachClients  map[string]*hiddenAttachClient
+
+	// pokeMu guards pokes, which tracks gc's own send-keys per session so
+	// GetSessionActivity can discount activity that is only our poke's echo
+	// (see discountPokeActivity).
+	pokeMu sync.Mutex
+	pokes  map[string]pokeInfo
+
+	// agentSlice wraps pane commands in a transient systemd user scope when
+	// GC_AGENT_SLICE is set (see AgentSliceEnv in agent_slice.go).
+	agentSlice agentSliceWrapper
 }
+
+// pokeInfo records a gc-initiated send-keys ("poke", e.g. a wake or nudge) to a
+// session: when it happened, and the genuine session activity observed just
+// before it.
+type pokeInfo struct {
+	at    time.Time // when gc sent the keystrokes
+	prior time.Time // genuine GetSessionActivity immediately before the poke
+}
+
+const (
+	// pokeEcho is the window within which raw tmux activity is treated as the
+	// poke's own keystroke echo rather than agent output.
+	pokeEcho = 3 * time.Second
+	// pokeGrace is how long a just-poked agent still counts as active, so a
+	// responsive agent about to reply is not flipped to idle. After it elapses
+	// with no agent output, the poke is discounted.
+	pokeGrace = 15 * time.Second
+)
 
 type hiddenAttachClient struct {
 	cancel  context.CancelFunc
@@ -348,6 +386,7 @@ func (t *Tmux) NewSession(name, workDir string) error {
 	if err != nil {
 		return err
 	}
+	_ = t.ConfigureServer()
 	// tmux 3.3+ sets window-size=manual on detached sessions, locking them
 	// at 80x24 even after a client attaches. Reset to "latest" so the window
 	// adapts to the largest attached client.
@@ -372,11 +411,12 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 		args = append(args, "-c", workDir)
 	}
 	// Add the command as the last argument - tmux runs it as the pane's initial process
-	args = append(args, command)
+	args = append(args, t.wrapPaneCommand(command))
 	_, err := t.run(args...)
 	if err != nil {
 		return err
 	}
+	_ = t.ConfigureServer()
 	// tmux 3.3+: reset window-size from manual to latest (see NewSession).
 	t.run("set-option", "-wt", name, "window-size", "latest") //nolint:errcheck // best-effort
 	return nil
@@ -399,17 +439,6 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	if err := t.probeServerAlive(); err != nil {
 		return err
 	}
-	// Disable mouse mode and monitor-activity before creating the session.
-	// With mouse on, tmux sends SGR mouse tracking sequences (\x1b[<...M)
-	// into panes. When the gc controller polls tmux state (list-panes,
-	// capture-pane, display-message), these sequences can arrive as stray
-	// ESC bytes on the agent's stdin. Claude Code's TUI misinterprets lone
-	// ESC as an Escape keypress, triggering "Interrupted" mid-tool-call.
-	// Automated agents don't need mouse input, so disabling is safe.
-	defer func() {
-		t.run("set-option", "-t", name, "mouse", "off")             //nolint:errcheck
-		t.run("set-option", "-wt", name, "monitor-activity", "off") //nolint:errcheck
-	}()
 	args := []string{"new-session", "-d", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
@@ -442,11 +471,12 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 		command = "env" + prefix + " " + command
 	}
 	// Add the command as the last argument
-	args = append(args, command)
+	args = append(args, t.wrapPaneCommand(command))
 	_, err := t.run(args...)
 	if err != nil {
 		return err
 	}
+	_ = t.ConfigureServer()
 	// tmux 3.3+: reset window-size from manual to latest (see NewSession).
 	t.run("set-option", "-wt", name, "window-size", "latest") //nolint:errcheck // best-effort
 	return nil
@@ -910,6 +940,21 @@ func (t *Tmux) KillServer() error {
 	return err
 }
 
+// ConfigureServer sets tmux server options required for Gas City lifecycle
+// ownership. It is idempotent per Tmux instance.
+func (t *Tmux) ConfigureServer() error {
+	var err error
+	t.configureOnce.Do(func() {
+		err = t.SetExitEmpty(false)
+	})
+	return err
+}
+
+// TeardownServer terminates the tmux server after all sessions are drained.
+func (t *Tmux) TeardownServer() error {
+	return t.KillServer()
+}
+
 // SetExitEmpty controls the tmux exit-empty server option.
 // When on (default), the server exits when there are no sessions.
 // When off, the server stays running even with no sessions.
@@ -1078,6 +1123,24 @@ func (t *Tmux) ListSessionIDs() (map[string]string, error) {
 	return result, nil
 }
 
+// cancelCopyModeIfParked exits copy-mode on the target session's active pane
+// before key delivery. The ga-c4w WheelUpPane binding parks an interactive
+// pane in copy-mode on wheel-up; tmux then routes subsequent send-keys into
+// copy-mode and the controller's keystrokes (nudges, prompts, mail, the 1/2/3
+// interaction responses) are silently dropped. Probing #{pane_in_mode} and
+// canceling only when parked keeps the happy path untouched (no spurious
+// cancel) and is a no-op for headless agent panes, which stay mouse-off and
+// are never wheel-parked. Probe and cancel errors are deliberately swallowed:
+// a copy-mode guard must never abort delivery on a pane that simply is not in
+// a mode.
+func (t *Tmux) cancelCopyModeIfParked(session string) {
+	inMode, err := t.run("display-message", "-t", session, "-p", "#{pane_in_mode}")
+	if err != nil || strings.TrimSpace(inMode) != "1" {
+		return
+	}
+	_, _ = t.run("send-keys", "-t", session, "-X", "cancel")
+}
+
 // SendKeys sends keystrokes to a session and presses Enter.
 // Always sends Enter as a separate command for reliability.
 // Uses a debounce delay between paste and Enter to ensure paste completes.
@@ -1089,6 +1152,14 @@ func (t *Tmux) SendKeys(session, keys string) error {
 // The debounceMs parameter controls how long to wait after paste before sending Enter.
 // This prevents race conditions where Enter arrives before paste is processed.
 func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) error {
+	// A human may have scrolled this pane into copy-mode (the ga-c4w wheel
+	// binding); exit it first so the keystrokes reach the program instead of
+	// being swallowed by copy-mode.
+	t.cancelCopyModeIfParked(session)
+	// Record this poke (and the genuine activity just before it) so that
+	// GetSessionActivity can later discount our own keystroke echo for an
+	// agent that never actually responds. See discountPokeActivity.
+	t.recordPoke(session)
 	// Send text using literal mode (-l) to handle special chars
 	if _, err := t.run("send-keys", "-t", session, "-l", keys); err != nil {
 		return err
@@ -1565,6 +1636,14 @@ func (t *Tmux) NudgeSession(session, message string) error {
 		target = agentPane
 	}
 
+	// Wake a detached pane BEFORE the first send. A fully-detached pool TUI
+	// (e.g. grok, never observed by a client) may not be servicing its event
+	// loop, so the initial paste is silently dropped at the application layer
+	// even though tmux delivers the bytes (no error). SIGWINCH kicks the
+	// render/input loop so the paste is actually consumed. The post-send wake
+	// below remains for the submit Enter.
+	t.WakePaneIfDetached(session)
+
 	// 1. Send text in literal mode with retry on transient errors
 	if err := t.sendKeysLiteralWithRetry(target, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
@@ -1789,15 +1868,16 @@ func (t *Tmux) FindAgentPane(session string) (string, error) {
 			}
 		}
 
-		// Shell with agent descendant
-		for _, shell := range supportedShells {
-			if paneCmd == shell && hasDescendantWithNames(panePID, processNames, 0) {
-				return paneID, nil
-			}
-		}
-
 		// Version-as-argv[0] (e.g., "2.1.30") — check real binary name
 		if processMatchesNames(panePID, processNames) {
+			return paneID, nil
+		}
+
+		// Descendant walk: agents under shells ("bash -c 'exec claude'")
+		// or wrapper roots (systemd-run when GC_AGENT_SLICE is set) keep
+		// the shell/wrapper as pane_current_command — same unconditional
+		// descendant fallback as IsRuntimeRunning.
+		if hasDescendantWithNames(panePID, processNames, 0) {
 			return paneID, nil
 		}
 	}
@@ -1918,13 +1998,37 @@ func (t *Tmux) IsSessionRunning(session string) bool {
 	return !dead
 }
 
-// GetSessionActivity returns the last meaningful activity time for a session.
+// GetSessionActivity returns the last genuine agent activity time for a session.
+//
+// It is built on tmux per-window activity (rawSessionActivity) but discounts
+// activity that is only gc's own send-keys echo. gc wakes/nudges agents by
+// sending keystrokes into the pane, which advances #{window_activity} even when
+// the agent never runs a turn (the park-on-wake loop). Without discounting, a
+// woken-but-unresponsive agent looks perpetually active, misleading last_active
+// and the idle / auto-suspend / reconciler logic keyed off it. See
+// discountPokeActivity. This is LLM-agnostic: purely gc input vs pane output, so
+// it holds for Claude Code, Codex, or any agent CLI running in the pane.
+func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
+	wa, err := t.rawSessionActivity(session)
+	if err != nil {
+		return time.Time{}, err
+	}
+	t.pokeMu.Lock()
+	pk, ok := t.pokes[session]
+	t.pokeMu.Unlock()
+	if !ok {
+		return wa, nil
+	}
+	return discountPokeActivity(wa, pk, time.Now()), nil
+}
+
+// rawSessionActivity returns the most recent tmux per-window activity timestamp.
 //
 // For detached agent sessions, tmux's #{session_activity} does not advance on
 // pane I/O — it effectively sticks to creation/attach time. Query per-window
 // activity instead and take the most recent timestamp so detached output and
-// send-keys both count as activity.
-func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
+// send-keys both count.
+func (t *Tmux) rawSessionActivity(session string) (time.Time, error) {
 	out, err := t.run("list-windows", "-t", session, "-F", "#{window_activity}")
 	if err != nil {
 		return time.Time{}, err
@@ -1935,6 +2039,42 @@ func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return time.Unix(timestamp, 0), nil
+}
+
+// recordPoke snapshots the genuine session activity and timestamps a
+// gc-initiated send-keys ("poke", e.g. a wake/nudge), so a later
+// GetSessionActivity can discount the poke's own keystroke echo.
+func (t *Tmux) recordPoke(session string) {
+	prior, err := t.GetSessionActivity(session)
+	if err != nil {
+		prior = time.Time{}
+	}
+	t.pokeMu.Lock()
+	if t.pokes == nil {
+		t.pokes = make(map[string]pokeInfo)
+	}
+	t.pokes[session] = pokeInfo{at: time.Now(), prior: prior}
+	t.pokeMu.Unlock()
+}
+
+// discountPokeActivity resolves the genuine activity time from the raw tmux
+// window activity (wa), the last recorded gc poke (pk) and the current time.
+//
+// If wa is only the poke's own keystroke echo (within pokeEcho of the poke) AND
+// the grace window has elapsed with no later agent output, it returns the
+// activity seen before the poke — revealing that the agent never actually
+// responded. Otherwise wa stands (a real post-poke turn, or a still-in-grace
+// recent poke). Pure function for testability.
+func discountPokeActivity(wa time.Time, pk pokeInfo, now time.Time) time.Time {
+	if pk.at.IsZero() || pk.prior.IsZero() {
+		return wa
+	}
+	echoOnly := wa.Sub(pk.at).Abs() <= pokeEcho
+	graceElapsed := now.Sub(pk.at) >= pokeGrace
+	if echoOnly && graceElapsed {
+		return pk.prior
+	}
+	return wa
 }
 
 func latestActivityTimestamp(out string) (int64, error) {
@@ -2361,10 +2501,17 @@ func (t *Tmux) resolveSessionProcessNames(session string) []string {
 // Useful for waiting until a shell has started a new process (e.g., claude).
 // Returns nil when a non-excluded command is detected, or error on timeout.
 //
+// Known pane-root wrappers (see wrapperCommands, e.g. systemd-run under
+// GC_AGENT_SLICE) are treated as excluded regardless of excludeCommands: a
+// wrapped pane reports the wrapper as pane_current_command for the pane's
+// whole lifetime, so first sight of the wrapper does not mean the agent
+// command has appeared.
+//
 // Includes an IsAgentAlive fallback: when the pane command stays as a shell
-// (e.g., "bash"), the agent may be running as a descendant process via a
-// wrapper script (e.g., "bash -c 'exec claude'"). In this case, pane_current_command
-// never changes from "bash", but IsAgentAlive detects the descendant.
+// (e.g., "bash") or a wrapper root, the agent may be running as a descendant
+// process (e.g., "bash -c 'exec claude'", or systemd-run's scope child). In
+// these cases pane_current_command never changes, but IsAgentAlive detects
+// the descendant.
 func (t *Tmux) WaitForCommand(ctx context.Context, session string, excludeCommands []string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -2382,8 +2529,10 @@ func (t *Tmux) WaitForCommand(ctx context.Context, session string, excludeComman
 			}
 			continue
 		}
-		// Check if current command is NOT in the exclude list
-		excluded := false
+		// Check if current command is NOT in the exclude list. Wrapper
+		// roots count as excluded: they hide the agent command for the
+		// pane's lifetime, so they must never satisfy the wait directly.
+		excluded := isWrapperCommand(cmd)
 		for _, exc := range excludeCommands {
 			if cmd == exc {
 				excluded = true
@@ -2393,8 +2542,9 @@ func (t *Tmux) WaitForCommand(ctx context.Context, session string, excludeComman
 		if !excluded {
 			return nil
 		}
-		// Fallback: if pane command is still a shell, check whether the
-		// agent is running as a descendant (handles bash-wrapped agents).
+		// Fallback: the pane command is still a shell or a wrapper root;
+		// check whether the agent is running as a descendant (handles
+		// bash-wrapped agents and systemd-run scope children).
 		if t.IsAgentAlive(session) {
 			return nil
 		}
@@ -2463,7 +2613,29 @@ func matchesPromptPrefix(line, readyPromptPrefix string) bool {
 	trimmed = strings.ReplaceAll(trimmed, "\u00a0", " ")
 	normalizedPrefix := strings.ReplaceAll(readyPromptPrefix, "\u00a0", " ")
 	prefix := strings.TrimSpace(normalizedPrefix)
-	return strings.HasPrefix(trimmed, normalizedPrefix) || (prefix != "" && trimmed == prefix)
+	// Some TUIs (e.g. grok) render the input line inside a box border, so the
+	// captured line is "│ ❯ …" rather than "❯ …". Test a border-stripped variant
+	// too so the prompt glyph after the border is detected — otherwise readiness
+	// and idle detection never match and queued prompt delivery is never released.
+	for _, cand := range []string{trimmed, stripLeadingBoxBorder(trimmed)} {
+		if strings.HasPrefix(cand, normalizedPrefix) || (prefix != "" && cand == prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripLeadingBoxBorder removes a leading vertical box-drawing character
+// (│ U+2502 / ┃ U+2503) plus surrounding spaces from a line, so prompt detection
+// can see a prompt glyph that a TUI renders inside a bordered input box (grok).
+// Returns the input unchanged when there is no such border.
+func stripLeadingBoxBorder(s string) string {
+	s = strings.TrimLeft(s, " \t")
+	r := []rune(s)
+	if len(r) > 0 && (r[0] == '│' || r[0] == '┃') {
+		return strings.TrimLeft(string(r[1:]), " \t")
+	}
+	return s
 }
 
 // WaitForRuntimeReady polls until the agent runtime's ready prompt appears in
@@ -2764,14 +2936,26 @@ func codexTranscriptTailContainsTurnAborted(tail string) bool {
 	return false
 }
 
-// paneContainsBusyIndicator checks captured pane lines for signs that the
-// agent is actively processing. Claude Code displays "esc to interrupt" in
-// the status bar while running tools or generating responses.
+// claudeBusySpinnerRe matches Claude Code's live "working" spinner footer: an
+// elapsed timer with a token-stream / interrupt suffix in parentheses, e.g.
+// "(2m 28s · ↓ 10.9k tokens)" or "(28m 11s • esc to interrupt)". Current Claude
+// Code (notably bypass-permissions mode) shows this spinner instead of a bare
+// "esc to interrupt" string while busy. Anchored on "(<digits><m|s>" before the
+// "·"/"•" separator so it does NOT match idle chrome — "(ctrl+o to expand)",
+// "(main)", "⏱️ Jun 4 02:57:04", or the "✻ Worked for 3m 38s" done marker.
+var claudeBusySpinnerRe = regexp.MustCompile(`\([0-9]+[ms][^)]*[·•]`)
+
+// paneContainsBusyIndicator checks captured pane lines for signs that the agent
+// is actively processing. Agent TUIs surface this differently: older Claude Code
+// and Codex show "esc to interrupt"; current Claude Code shows a live spinner
+// with an elapsed timer + token stream (claudeBusySpinnerRe); Gemini shows its
+// own cancel / shell-tool strings.
 func paneContainsBusyIndicator(lines []string) bool {
 	for _, line := range lines {
 		if strings.Contains(line, "esc to interrupt") ||
 			strings.Contains(line, "Press Esc or Ctrl+C to cancel") ||
-			strings.Contains(line, "[current working directory ") {
+			strings.Contains(line, "[current working directory ") ||
+			claudeBusySpinnerRe.MatchString(line) {
 			return true
 		}
 	}
@@ -2960,7 +3144,7 @@ func (t *Tmux) SetMailClickBinding(_ string) error {
 // This is used for "hot reload" of agent sessions - instantly restart in place.
 // The pane parameter should be a pane ID (e.g., "%0") or session:window.pane format.
 func (t *Tmux) RespawnPane(pane, command string) error {
-	_, err := t.run("respawn-pane", "-k", "-t", pane, command)
+	_, err := t.run("respawn-pane", "-k", "-t", pane, t.wrapPaneCommand(command))
 	return err
 }
 
@@ -2972,7 +3156,7 @@ func (t *Tmux) RespawnPaneWithWorkDir(pane, workDir, command string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	args = append(args, command)
+	args = append(args, t.wrapPaneCommand(command))
 	_, err := t.run(args...)
 	return err
 }

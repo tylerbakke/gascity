@@ -5,6 +5,7 @@ export type DashboardResource =
   | "crew"
   | "issues"
   | "mail"
+  | "comms"
   | "convoys"
   | "activity"
   | "admin"
@@ -27,6 +28,7 @@ const ALL_RESOURCES: DashboardResource[] = [
   "crew",
   "issues",
   "mail",
+  "comms",
   "convoys",
   "activity",
   "admin",
@@ -39,6 +41,7 @@ const CITY_SCOPED_RESOURCES: DashboardResource[] = [
   "crew",
   "issues",
   "mail",
+  "comms",
   "convoys",
   "activity",
   "admin",
@@ -160,7 +163,7 @@ export function invalidateForEventType(type: string): boolean {
   }
   if (type.startsWith("mail.")) {
     if (!hasCityScope) return false;
-    invalidate("status", "mail");
+    invalidate("status", "mail", "comms");
     return true;
   }
   if (type.startsWith("convoy.")) {

@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/formulatest"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/pgauth"
@@ -373,14 +374,56 @@ func TestOrderDispatchResolvesPackBindingForPool(t *testing.T) {
 	}
 
 	m.dispatch(context.Background(), t.TempDir(), time.Now())
-	time.Sleep(50 * time.Millisecond)
+	m.drain(context.Background())
 
 	work := workBeadByOrderLabel(t, store, "order-run:mol-dog-doctor")
 	if got := work.Metadata["gc.routed_to"]; got != "maintenance.dog" {
 		t.Errorf("gc.routed_to = %q, want %q (pack binding must qualify pool target)", got, "maintenance.dog")
 	}
-	if got := work.Metadata[poolDemandMetadataKey]; got != poolDemandMetadataValue {
-		t.Errorf("%s = %q, want %q (supervisor-cron-dispatched pool orders must carry the demand sentinel so defaultScaleCheckCounts can count the wisp despite readyExcludeTypes filtering molecules out of Ready() — see cmd/gc/pool_demand.go)", poolDemandMetadataKey, got, poolDemandMetadataValue)
+	assertNoDeprecatedPoolDemandMetadata(t, work.Metadata)
+}
+
+func TestOrderDispatchPoolLegacyFormulaWarnsWhenRootIsNotReadyVisible(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeFile(t, filepath.Join(formulaDir, "mol-legacy-cleanup.toml"), `
+formula = "mol-legacy-cleanup"
+version = 1
+
+[[steps]]
+id = "work"
+title = "Do legacy cleanup"
+description = "Do the cleanup."
+`)
+	store := beads.NewMemStore()
+	var stderr bytes.Buffer
+
+	m := &memoryOrderDispatcher{
+		aa: []orders.Order{{
+			Name:         "legacy-cleanup",
+			Trigger:      "cooldown",
+			Interval:     "5m",
+			Formula:      "mol-legacy-cleanup",
+			Pool:         "dog",
+			FormulaLayer: formulaDir,
+		}},
+		storeFn: func(_ execStoreTarget) (beads.Store, error) {
+			return store, nil
+		},
+		execRun: shellExecRunner,
+		rec:     events.Discard,
+		stderr:  &stderr,
+		cfg:     &config.City{},
+	}
+
+	m.dispatch(context.Background(), t.TempDir(), time.Now())
+	m.drain(context.Background())
+
+	if !strings.Contains(stderr.String(), "scale-from-zero pools will not wake") {
+		t.Fatalf("stderr = %q, want pool visibility warning", stderr.String())
+	}
+	work := workBeadByOrderLabel(t, store, "order-run:legacy-cleanup")
+	if work.Type != "molecule" {
+		t.Fatalf("legacy root Type = %q, want molecule", work.Type)
 	}
 }
 
@@ -415,7 +458,7 @@ func TestOrderDispatchPrefersCityShadowForPool(t *testing.T) {
 	}
 
 	m.dispatch(context.Background(), t.TempDir(), time.Now())
-	time.Sleep(50 * time.Millisecond)
+	m.drain(context.Background())
 
 	work := workBeadByOrderLabel(t, store, "order-run:mol-dog-doctor")
 	if got := work.Metadata["gc.routed_to"]; got != "dog" {
@@ -930,6 +973,58 @@ func TestOrderDispatchEventWispLatestSeqErrorDoesNotInstantiate(t *testing.T) {
 	}
 }
 
+func TestOrderDispatchGraphV2ConvoyReferenceFailsBeforeInstantiate(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	formulaBody := `
+formula = "graph-needs-convoy"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[[steps]]
+id = "step"
+title = "Do work"
+description = "Inspect convoy {{convoy_id}}"
+`
+	if err := os.WriteFile(filepath.Join(dir, "graph-needs-convoy.formula.toml"), []byte(strings.TrimSpace(formulaBody)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := beads.NewMemStore()
+	tracking, err := store.Create(beads.Bead{
+		Title:  "order:convoy-patrol",
+		Labels: []string{"order-run:convoy-patrol", labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec memRecorder
+	ad := buildOrderDispatcherFromListExec([]orders.Order{{
+		Name:         "convoy-patrol",
+		Trigger:      "cooldown",
+		Interval:     "15m",
+		Formula:      "graph-needs-convoy",
+		FormulaLayer: dir,
+	}}, store, nil, successfulExec, &rec)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	mad := ad.(*memoryOrderDispatcher)
+
+	mad.dispatchWisp(context.Background(), store, mad.aa[0], t.TempDir(), tracking.ID)
+
+	all := trackingBeads(t, store, "order-run:convoy-patrol")
+	if len(all) != 1 {
+		t.Fatalf("tracking beads with order-run label = %d, want only tracking bead", len(all))
+	}
+	if !slicesContain(all[0].Labels, "wisp-failed") {
+		t.Fatalf("tracking bead labels = %v, want wisp-failed", all[0].Labels)
+	}
+	if !rec.hasType(events.OrderFailed) {
+		t.Fatal("missing order.failed event")
+	}
+}
+
 func TestOrderDispatchResolvesImportedPackPoolAgainstCityShadow(t *testing.T) {
 	cityDir := t.TempDir()
 	writeImportedDogOrderFixture(t, cityDir, true)
@@ -1047,9 +1142,9 @@ schema = 2
 name = "dog"
 scope = "city"
 `)
-	doltDir, err := filepath.Abs(filepath.Join("..", "..", "examples", "dolt"))
+	doltDir, err := filepath.Abs(filepath.Join("..", "..", "examples", "bd", "dolt"))
 	if err != nil {
-		t.Fatalf("Abs(examples/dolt): %v", err)
+		t.Fatalf("Abs(examples/bd/dolt): %v", err)
 	}
 	writeFile(t, filepath.Join(cityDir, "pack.toml"), `
 [pack]
@@ -1077,9 +1172,7 @@ source = "`+doltDir+`"
 		"mol-dog-backup":     "$PACK_DIR/assets/scripts/mol-dog-backup.sh",
 		"mol-dog-compactor":  "gc dolt compact",
 		"mol-dog-doctor":     "$PACK_DIR/assets/scripts/mol-dog-doctor.sh",
-		"mol-dog-jsonl":      "$PACK_DIR/assets/scripts/jsonl-export.sh",
 		"mol-dog-phantom-db": "$PACK_DIR/assets/scripts/mol-dog-phantom-db.sh",
-		"mol-dog-reaper":     "$PACK_DIR/assets/scripts/reaper.sh",
 	}
 	gotExecDogOrders := map[string]bool{}
 	const wantFormulaDogOrders = 1
@@ -1126,8 +1219,8 @@ source = "`+doltDir+`"
 		if err != nil {
 			t.Fatalf("qualifyOrderPool(%s): %v", a.Name, err)
 		}
-		if got != "dog" {
-			t.Fatalf("qualifyOrderPool(%s) = %q, want local maintenance dog", a.Name, got)
+		if got != "dolt.dog" {
+			t.Fatalf("qualifyOrderPool(%s) = %q, want Dolt-local dog", a.Name, got)
 		}
 	}
 	if gotFormulaDogOrders != wantFormulaDogOrders {
@@ -1171,6 +1264,51 @@ func TestOrderDispatchCooldownNotDue(t *testing.T) {
 	}
 }
 
+type strictOpenWorkListCountingStore struct {
+	beads.Store
+
+	strictOpenWorkLists int
+}
+
+func (s *strictOpenWorkListCountingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if strings.HasPrefix(query.Label, "order-run:") && !query.IncludeClosed && query.Limit == 0 {
+		s.strictOpenWorkLists++
+		return nil, fmt.Errorf("strict open-work scan should only run for due orders")
+	}
+	return s.Store.List(query)
+}
+
+func TestOrderDispatchCooldownNotDueSkipsStrictOpenWorkScan(t *testing.T) {
+	store := &strictOpenWorkListCountingStore{Store: beads.NewMemStore()}
+	now := time.Date(2026, 6, 3, 4, 40, 0, 0, time.UTC)
+
+	if _, err := store.Create(beads.Bead{
+		Title:     "recent run",
+		Labels:    []string{"order-run:test-order"},
+		CreatedAt: now.Add(-5 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	aa := []orders.Order{{
+		Name:     "test-order",
+		Trigger:  "cooldown",
+		Interval: "1h",
+		Exec:     "true",
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+
+	ad.dispatch(context.Background(), t.TempDir(), now)
+	ad.drain(context.Background())
+
+	if store.strictOpenWorkLists != 0 {
+		t.Fatalf("strict open-work scans = %d, want 0 for not-due order", store.strictOpenWorkLists)
+	}
+}
+
 func TestOrderDispatchMultiple(t *testing.T) {
 	store := beads.NewMemStore()
 
@@ -1208,6 +1346,90 @@ func TestOrderDispatchMultiple(t *testing.T) {
 	if trackingCount != 1 {
 		t.Errorf("expected 1 tracking bead for order-a, got %d", trackingCount)
 	}
+}
+
+func TestOrderDispatchRespectsMaxDispatchesPerTick(t *testing.T) {
+	store := beads.NewMemStore()
+	var aa []orders.Order
+	for i := 0; i < 5; i++ {
+		aa = append(aa, orders.Order{
+			Name:     fmt.Sprintf("order-%d", i),
+			Trigger:  "cooldown",
+			Interval: "1m",
+			Exec:     "true",
+		})
+	}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, func(context.Context, string, string, []string) ([]byte, error) {
+		return []byte("ok\n"), nil
+	}, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	m := ad.(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 2
+
+	now := time.Date(2026, 5, 19, 2, 30, 0, 0, time.UTC)
+	ad.dispatch(context.Background(), t.TempDir(), now)
+	ad.drain(context.Background())
+
+	if got := countOrderTrackingRuns(t, store); got != 2 {
+		t.Fatalf("tracking runs after first tick = %d, want 2", got)
+	}
+
+	ad.dispatch(context.Background(), t.TempDir(), now.Add(time.Second))
+	ad.drain(context.Background())
+	if got := countOrderTrackingRuns(t, store); got != 4 {
+		t.Fatalf("tracking runs after second tick = %d, want 4", got)
+	}
+}
+
+func TestOrderDispatchBudgetRotatesAcrossAlwaysDueOrders(t *testing.T) {
+	store := beads.NewMemStore()
+	var aa []orders.Order
+	for i := 0; i < 5; i++ {
+		aa = append(aa, orders.Order{
+			Name:    fmt.Sprintf("condition-%d", i),
+			Trigger: "condition",
+			Check:   "true",
+			Exec:    "true",
+		})
+	}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, func(context.Context, string, string, []string) ([]byte, error) {
+		return []byte("ok\n"), nil
+	}, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	m := ad.(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 2
+
+	now := time.Date(2026, 5, 19, 2, 30, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		ad.dispatch(context.Background(), t.TempDir(), now.Add(time.Duration(i)*time.Second))
+		ad.drain(context.Background())
+	}
+
+	for i := 0; i < 5; i++ {
+		label := fmt.Sprintf("order-run:condition-%d", i)
+		if got := len(trackingBeads(t, store, label)); got == 0 {
+			t.Fatalf("%s did not dispatch under a rotating budget", label)
+		}
+	}
+}
+
+func countOrderTrackingRuns(t *testing.T, store beads.Store) int {
+	t.Helper()
+	all, err := store.ListByLabel(labelOrderTracking, 0, beads.IncludeClosed, beads.WithBothTiers)
+	if err != nil {
+		t.Fatalf("ListByLabel(%q): %v", labelOrderTracking, err)
+	}
+	count := 0
+	for _, b := range all {
+		if strings.HasPrefix(b.Title, "order:") {
+			count++
+		}
+	}
+	return count
 }
 
 func TestOrderDispatchCachesLastRunBetweenDispatches(t *testing.T) {
@@ -1625,7 +1847,7 @@ description = "Target: {{target_id}}, workspace: {{workspace}}"
 	mad.rec = &rec
 
 	ad.dispatch(context.Background(), t.TempDir(), time.Now())
-	time.Sleep(100 * time.Millisecond)
+	ad.drain(context.Background())
 
 	all := trackingBeads(t, store, "order-run:fail-formula-vars")
 	hasFailed := false
@@ -1734,6 +1956,86 @@ dolt.auto-start: false
 	if len(all) != 1 {
 		t.Fatalf("tracking beads after second dispatch = %#v, want original failure marker only", all)
 	}
+}
+
+func TestOrderDispatchTriggerEnvFailuresRespectMaxDispatchesPerTick(t *testing.T) {
+	clearAmbientPostgresEnv(t)
+	t.Setenv("GC_BEADS", "bd")
+
+	cityDir := t.TempDir()
+	writePGScopeFixture(t, cityDir, "")
+	if err := os.WriteFile(filepath.Join(cityDir, ".beads", "config.yaml"), []byte(`issue_prefix: city
+gc.endpoint_origin: managed_city
+gc.endpoint_status: verified
+dolt.auto-start: false
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := beads.NewMemStore()
+	var rec memRecorder
+	var aa []orders.Order
+	for i := 0; i < 5; i++ {
+		aa = append(aa, orders.Order{
+			Name:    fmt.Sprintf("pg-condition-%d", i),
+			Trigger: "condition",
+			Check:   "true",
+			Exec:    "true",
+		})
+	}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, &rec)
+	mad := ad.(*memoryOrderDispatcher)
+	mad.maxDispatchesPerTick = 2
+
+	now := time.Date(2026, 5, 19, 2, 30, 0, 0, time.UTC)
+	mad.dispatch(context.Background(), cityDir, now)
+	mad.drain(context.Background())
+
+	if got := countOrderTrackingRuns(t, store); got != 2 {
+		t.Fatalf("tracking runs after first tick = %d, want 2", got)
+	}
+	if got := countRecordedOrderFailedEvents(t, &rec); got != 2 {
+		t.Fatalf("order.failed events after first tick = %d, want 2", got)
+	}
+
+	mad.dispatch(context.Background(), cityDir, now.Add(time.Second))
+	mad.drain(context.Background())
+	if got := countOrderTrackingRuns(t, store); got != 4 {
+		t.Fatalf("tracking runs after second tick = %d, want 4", got)
+	}
+	if got := countRecordedOrderFailedEvents(t, &rec); got != 4 {
+		t.Fatalf("order.failed events after second tick = %d, want 4", got)
+	}
+
+	mad.dispatch(context.Background(), cityDir, now.Add(2*time.Second))
+	mad.drain(context.Background())
+	if got := countOrderTrackingRuns(t, store); got != 5 {
+		t.Fatalf("tracking runs after third tick = %d, want 5", got)
+	}
+	if got := countRecordedOrderFailedEvents(t, &rec); got != 5 {
+		t.Fatalf("order.failed events after third tick = %d, want 5", got)
+	}
+	for i := 0; i < 5; i++ {
+		label := fmt.Sprintf("order-run:pg-condition-%d", i)
+		if got := len(trackingBeads(t, store, label)); got != 1 {
+			t.Fatalf("%s tracking markers = %d, want 1", label, got)
+		}
+	}
+}
+
+func countRecordedOrderFailedEvents(t *testing.T, rec *memRecorder) int {
+	t.Helper()
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+
+	count := 0
+	for _, event := range rec.events {
+		if event.Type == events.OrderFailed {
+			count++
+		}
+	}
+	return count
 }
 
 func TestOrderDispatchTriggerEnvFailureTrackingSuppressesNonConditionBeforeEvaluation(t *testing.T) {
@@ -2692,6 +2994,8 @@ func TestShellExecRunnerDoesNotStartWhenContextCanceled(t *testing.T) {
 }
 
 func TestShellExecRunnerKillsProcessGroupOnTimeout(t *testing.T) {
+	processgrouptest.RequireRealProcessSignals(t)
+
 	workDir := t.TempDir()
 	heartbeatPath := filepath.Join(workDir, "heartbeat")
 	childPIDPath := filepath.Join(workDir, "child.pid")
@@ -2713,6 +3017,8 @@ func TestShellExecRunnerKillsProcessGroupOnTimeout(t *testing.T) {
 }
 
 func TestShellExecRunnerKillsProcessGroupAfterWaitDelay(t *testing.T) {
+	processgrouptest.RequireRealProcessSignals(t)
+
 	workDir := t.TempDir()
 	heartbeatPath := filepath.Join(workDir, "heartbeat")
 	childPIDPath := filepath.Join(workDir, "child.pid")
@@ -2796,7 +3102,7 @@ func TestOrderDispatchSkipsSuspendedRig(t *testing.T) {
 	// Mark the rig as suspended.
 	mad := ad.(*memoryOrderDispatcher)
 	mad.cfg = &config.City{
-		Rigs: []config.Rig{{Name: "demo", Path: "/tmp/demo", Suspended: true}},
+		Rigs: []config.Rig{{Name: "demo", Path: "/tmp/demo", SuspendedOnStart: true}},
 	}
 
 	ad.dispatch(context.Background(), t.TempDir(), time.Now())
@@ -2828,7 +3134,7 @@ func TestOrderDispatchSkipsSuspendedRigQualifiedPool(t *testing.T) {
 
 	mad := ad.(*memoryOrderDispatcher)
 	mad.cfg = &config.City{
-		Rigs: []config.Rig{{Name: "demo", Path: "/tmp/demo", Suspended: true}},
+		Rigs: []config.Rig{{Name: "demo", Path: "/tmp/demo", SuspendedOnStart: true}},
 	}
 
 	ad.dispatch(context.Background(), t.TempDir(), time.Now())
@@ -2890,7 +3196,7 @@ func TestOrderDispatchSkipsCitySuspended(t *testing.T) {
 	// Suspend the entire workspace.
 	mad := ad.(*memoryOrderDispatcher)
 	mad.cfg = &config.City{
-		Workspace: config.Workspace{Suspended: true},
+		Workspace: config.Workspace{SuspendedOnStart: true},
 	}
 
 	ad.dispatch(context.Background(), t.TempDir(), time.Now())
@@ -2919,7 +3225,7 @@ func TestOrderDispatchSkipsSuspendedRigExec(t *testing.T) {
 
 	mad := ad.(*memoryOrderDispatcher)
 	mad.cfg = &config.City{
-		Rigs: []config.Rig{{Name: "demo", Path: "/tmp/demo", Suspended: true}},
+		Rigs: []config.Rig{{Name: "demo", Path: "/tmp/demo", SuspendedOnStart: true}},
 	}
 
 	ad.dispatch(context.Background(), t.TempDir(), time.Now())
@@ -2935,7 +3241,7 @@ func TestOrderRigSuspended(t *testing.T) {
 	cfg := &config.City{
 		Rigs: []config.Rig{
 			{Name: "active", Path: "/tmp/active", Suspended: false},
-			{Name: "frozen", Path: "/tmp/frozen", Suspended: true},
+			{Name: "frozen", Path: "/tmp/frozen", SuspendedOnStart: true},
 		},
 	}
 	m := &memoryOrderDispatcher{cfg: cfg}
@@ -2972,7 +3278,7 @@ func TestOrderRigSuspended(t *testing.T) {
 func TestOrderRigSuspendedFallsBackToOrderRigOnPoolResolutionError(t *testing.T) {
 	cfg := &config.City{
 		Rigs: []config.Rig{
-			{Name: "frozen", Path: "/tmp/frozen", Suspended: true},
+			{Name: "frozen", Path: "/tmp/frozen", SuspendedOnStart: true},
 		},
 		Agents: []config.Agent{
 			{Name: "dog", Dir: "frozen", BindingName: "alpha"},
@@ -3057,6 +3363,73 @@ func TestSweepOrphanedOrderTracking_ClosesOpenTrackingBeads(t *testing.T) {
 		if b.Title == "real work" && b.Status != "open" {
 			t.Errorf("non-tracking bead %s should still be open, got %s", b.ID, b.Status)
 		}
+	}
+}
+
+func TestSweepOrphanedOrderTrackingLimit_ClosesAtMostBudget(t *testing.T) {
+	store := beads.NewMemStore()
+
+	ids := make([]string, 0, 5)
+	for _, name := range []string{"one", "two", "three", "four", "five"} {
+		b, err := store.Create(beads.Bead{
+			Title:     "order:" + name,
+			Labels:    []string{"order-run:" + name, labelOrderTracking},
+			Ephemeral: true,
+		})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", name, err)
+		}
+		ids = append(ids, b.ID)
+	}
+
+	closed, err := sweepOrphanedOrderTrackingLimit(store, 2)
+	if err != nil {
+		t.Fatalf("sweepOrphanedOrderTrackingLimit: %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("closed = %d, want 2", closed)
+	}
+
+	closedCount := 0
+	for _, id := range ids {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status == "closed" {
+			closedCount++
+			if got.Metadata["close_reason"] != orphanedOrderTrackingCloseReason {
+				t.Fatalf("close_reason for %s = %q, want %q", id, got.Metadata["close_reason"], orphanedOrderTrackingCloseReason)
+			}
+		}
+	}
+	if closedCount != 2 {
+		t.Fatalf("closed tracking beads = %d, want 2", closedCount)
+	}
+}
+
+func TestSweepOrphanedOrderTrackingRetryLimitSpendsRemainingBudget(t *testing.T) {
+	inner := beads.NewMemStore()
+	for _, name := range []string{"one", "two", "three", "four"} {
+		_, err := inner.Create(beads.Bead{
+			Title:  "order:" + name,
+			Labels: []string{"order-run:" + name, labelOrderTracking},
+		})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", name, err)
+		}
+	}
+
+	fs := &closeFailStore{Store: inner, closeN: 1}
+	n, err := sweepOrphanedOrderTrackingRetryLimit(fs, 3, time.Millisecond, 2)
+	if err == nil {
+		t.Fatal("expected error from partial close failure")
+	}
+	if n != 2 {
+		t.Fatalf("n = %d, want 2", n)
+	}
+	if fs.listCalls != 1 {
+		t.Fatalf("ListByLabel calls = %d, want 1 (budget exhaustion should stop retries)", fs.listCalls)
 	}
 }
 
@@ -3167,6 +3540,317 @@ func TestSweepStaleOrderTracking_ClosesOnlyOldOpenTrackingBeads(t *testing.T) {
 	}
 	if gotWork.Status != "open" {
 		t.Fatalf("non-tracking work status = %s, want open", gotWork.Status)
+	}
+}
+
+func TestOrderTrackingRetentionPolicyDefaultsToSevenDays(t *testing.T) {
+	policy := orderTrackingRetentionPolicyForConfig(&config.City{})
+
+	if policy.deleteAfterClose != 7*24*time.Hour {
+		t.Fatalf("deleteAfterClose = %v, want 7d", policy.deleteAfterClose)
+	}
+	if policy.retainLast != minClosedOrderTrackingRetained {
+		t.Fatalf("retainLast = %d, want %d", policy.retainLast, minClosedOrderTrackingRetained)
+	}
+}
+
+func TestOrderTrackingRetentionPolicyUsesConfiguredDeleteAfterClose(t *testing.T) {
+	cfg := &config.City{
+		Beads: config.BeadsConfig{
+			Policies: map[string]config.BeadPolicyConfig{
+				orderTrackingBeadPolicyName: {DeleteAfterClose: "36h"},
+			},
+		},
+	}
+
+	policy := orderTrackingRetentionPolicyForConfig(cfg)
+
+	if policy.deleteAfterClose != 36*time.Hour {
+		t.Fatalf("deleteAfterClose = %v, want 36h", policy.deleteAfterClose)
+	}
+	if policy.retainLast != minClosedOrderTrackingRetained {
+		t.Fatalf("retainLast = %d, want %d", policy.retainLast, minClosedOrderTrackingRetained)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionKeepsLatestTenPerOrderAcrossTiers(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	beadTime := now.Add(-48 * time.Hour)
+	seed := make([]beads.Bead, 0, 36)
+	for i := 0; i < 12; i++ {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("alpha-%02d", i),
+			Title:     "order:alpha",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: beadTime.Add(time.Duration(i) * time.Minute),
+			Labels:    []string{"order-run:alpha", labelOrderTracking},
+			Ephemeral: i%2 == 0,
+		})
+	}
+	for i := 0; i < 9; i++ {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("beta-%02d", i),
+			Title:     "order:beta",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: beadTime.Add(time.Duration(i) * time.Minute),
+			Labels:    []string{"order-run:beta", labelOrderTracking},
+			Ephemeral: i%2 == 0,
+		})
+	}
+	for i := 0; i < 12; i++ {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("fresh-%02d", i),
+			Title:     "order:fresh",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: now.Add(-time.Hour).Add(time.Duration(i) * time.Minute),
+			Labels:    []string{"order-run:fresh", labelOrderTracking},
+			Ephemeral: i%2 == 0,
+		})
+	}
+	seed = append(seed,
+		beads.Bead{
+			ID:        "open-old",
+			Title:     "order:alpha",
+			Status:    "open",
+			Type:      "task",
+			CreatedAt: beadTime,
+			Labels:    []string{"order-run:alpha", labelOrderTracking},
+			Ephemeral: true,
+		},
+		beads.Bead{
+			ID:        "unscoped-old",
+			Title:     "tracking without order scope",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: beadTime,
+			Labels:    []string{labelOrderTracking},
+			Ephemeral: true,
+		},
+		beads.Bead{
+			ID:        "title-only-old",
+			Title:     "order:title-only",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: beadTime,
+			Labels:    []string{labelOrderTracking},
+			Ephemeral: true,
+		},
+	)
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	deleted, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetention: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+
+	for _, id := range []string{"alpha-00", "alpha-01"} {
+		if _, err := store.Get(id); !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("Get(%s) err = %v, want ErrNotFound", id, err)
+		}
+	}
+	for _, prefixAndCount := range []struct {
+		prefix string
+		start  int
+		end    int
+	}{
+		{prefix: "alpha", start: 2, end: 12},
+		{prefix: "beta", start: 0, end: 9},
+		{prefix: "fresh", start: 0, end: 12},
+	} {
+		for i := prefixAndCount.start; i < prefixAndCount.end; i++ {
+			id := fmt.Sprintf("%s-%02d", prefixAndCount.prefix, i)
+			if _, err := store.Get(id); err != nil {
+				t.Fatalf("%s should be preserved: %v", id, err)
+			}
+		}
+	}
+	for _, id := range []string{"open-old", "unscoped-old", "title-only-old"} {
+		if _, err := store.Get(id); err != nil {
+			t.Fatalf("%s should be preserved: %v", id, err)
+		}
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionPrunesLegacyUnscopedTracking(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	beadTime := now.Add(-48 * time.Hour)
+	seed := make([]beads.Bead, 0, minClosedOrderTrackingRetained+2)
+	for i := range minClosedOrderTrackingRetained + 2 {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("legacy-%02d", i),
+			Title:     "legacy tracking bead",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: beadTime.Add(time.Duration(i) * time.Minute),
+			Labels:    []string{labelOrderTracking},
+			Ephemeral: i%2 == 0,
+		})
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	deleted, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetention: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	for _, id := range []string{"legacy-00", "legacy-01"} {
+		if _, err := store.Get(id); !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("Get(%s) err = %v, want ErrNotFound", id, err)
+		}
+	}
+	for i := 2; i < minClosedOrderTrackingRetained+2; i++ {
+		id := fmt.Sprintf("legacy-%02d", i)
+		if _, err := store.Get(id); err != nil {
+			t.Fatalf("%s should be preserved by legacy retain floor: %v", id, err)
+		}
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionRanksLatestByClosedReferenceTime(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	seed := make([]beads.Bead, 0, minClosedOrderTrackingRetained+2)
+	for i := range minClosedOrderTrackingRetained + 2 {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("ranked-%02d", i),
+			Title:     "order:ranked",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: now.Add(-72*time.Hour + time.Duration(i)*time.Minute),
+			UpdatedAt: now.Add(-72*time.Hour + time.Duration(i)*time.Minute),
+			Labels:    []string{"order-run:ranked", labelOrderTracking},
+			Ephemeral: i%2 == 0,
+		})
+	}
+	seed[0].UpdatedAt = now.Add(-25 * time.Hour)
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	deleted, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetention: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	if _, err := store.Get("ranked-00"); err != nil {
+		t.Fatalf("ranked-00 should be preserved as a recent close: %v", err)
+	}
+	for _, id := range []string{"ranked-01", "ranked-02"} {
+		if _, err := store.Get(id); !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("Get(%s) err = %v, want ErrNotFound", id, err)
+		}
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionAcrossStoresTracksSuccessfulStores(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	seed := make([]beads.Bead, 0, minClosedOrderTrackingRetained+1)
+	for i := range minClosedOrderTrackingRetained + 1 {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("failed-%02d", i),
+			Title:     "order:failed",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: now.Add(-48*time.Hour + time.Duration(i)*time.Minute),
+			Labels:    []string{"order-run:failed", labelOrderTracking},
+			Ephemeral: true,
+		})
+	}
+	store := &failingDeleteStore{
+		MemStore: beads.NewMemStoreFrom(100, seed, nil),
+		failID:   "failed-00",
+	}
+
+	result, err := sweepClosedOrderTrackingRetentionAcrossStores([]beads.Store{store}, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil)
+	if err == nil {
+		t.Fatal("sweepClosedOrderTrackingRetentionAcrossStores err = nil, want delete failure")
+	}
+	if result.storesSwept != 0 {
+		t.Fatalf("storesSwept = %d, want 0 when retention prune failed", result.storesSwept)
+	}
+	if result.deleted != 0 {
+		t.Fatalf("deleted = %d, want 0 after failed delete", result.deleted)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionDeletesForAnyConfiguredStorageTarget(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	storages := []string{
+		config.BeadStorageHistory,
+		config.BeadStorageNoHistory,
+		config.BeadStorageEphemeral,
+	}
+
+	for _, storage := range storages {
+		t.Run(storage, func(t *testing.T) {
+			cfg := &config.City{
+				Beads: config.BeadsConfig{
+					Policies: map[string]config.BeadPolicyConfig{
+						orderTrackingBeadPolicyName: {
+							Storage:          storage,
+							DeleteAfterClose: "1h",
+						},
+					},
+				},
+			}
+			policy := orderTrackingRetentionPolicyForConfig(cfg)
+			seed := make([]beads.Bead, 0, minClosedOrderTrackingRetained+2)
+			for i := range minClosedOrderTrackingRetained + 2 {
+				seed = append(seed, beads.Bead{
+					ID:        fmt.Sprintf("%s-%02d", storage, i),
+					Title:     "order:" + storage,
+					Status:    "closed",
+					Type:      "task",
+					CreatedAt: now.Add(-48*time.Hour + time.Duration(i)*time.Minute),
+					Labels:    []string{"order-run:" + storage, labelOrderTracking},
+					Ephemeral: storage == config.BeadStorageEphemeral,
+				})
+			}
+			store := beads.NewMemStoreFrom(100, seed, nil)
+
+			deleted, err := sweepClosedOrderTrackingRetention(store, now, policy, nil)
+			if err != nil {
+				t.Fatalf("sweepClosedOrderTrackingRetention: %v", err)
+			}
+			if deleted != 2 {
+				t.Fatalf("deleted = %d, want 2", deleted)
+			}
+			for _, id := range []string{fmt.Sprintf("%s-00", storage), fmt.Sprintf("%s-01", storage)} {
+				if _, err := store.Get(id); !errors.Is(err, beads.ErrNotFound) {
+					t.Fatalf("Get(%s) err = %v, want ErrNotFound", id, err)
+				}
+			}
+			remaining, err := store.List(beads.ListQuery{
+				Status:   "closed",
+				Label:    labelOrderTracking,
+				TierMode: beads.TierBoth,
+			})
+			if err != nil {
+				t.Fatalf("List(remaining): %v", err)
+			}
+			if len(remaining) != minClosedOrderTrackingRetained {
+				t.Fatalf("remaining = %d, want %d", len(remaining), minClosedOrderTrackingRetained)
+			}
+		})
 	}
 }
 
@@ -3303,7 +3987,6 @@ func TestSweepStaleOrderTrackingAcrossStoresClosesRigStoreAndUnblocksDispatch(t 
 		stale.CreatedAt.Add(time.Hour),
 		time.Minute,
 		orderFilterForTest("rig-digest:rig:frontend"),
-		orderTrackingSweepMetadataInitiator,
 		false,
 	)
 	if err != nil {
@@ -3330,6 +4013,13 @@ func (s *failingListOrderTrackingStore) ListByLabel(label string, limit int, opt
 		return nil, s.err
 	}
 	return s.Store.ListByLabel(label, limit, opts...)
+}
+
+func (s *failingListOrderTrackingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == labelOrderTracking {
+		return nil, s.err
+	}
+	return s.Store.List(query)
 }
 
 func TestSweepStaleOrderTrackingAcrossStoresContinuesAfterStoreError(t *testing.T) {
@@ -3361,7 +4051,6 @@ func TestSweepStaleOrderTrackingAcrossStoresContinuesAfterStoreError(t *testing.
 		cityStale.CreatedAt.Add(time.Hour),
 		time.Minute,
 		nil,
-		orderTrackingSweepMetadataInitiator,
 		false,
 	)
 	if err == nil {
@@ -3414,9 +4103,7 @@ func TestSweepStaleOrderTrackingClosesTriggerEnvFailedBeadsAndUnblocksDispatch(t
 	result, err := sweepStaleOrderTrackingWithOptions(
 		store,
 		normal.CreatedAt.Add(time.Hour),
-		time.Minute,
 		nil,
-		orderTrackingSweepMetadataInitiator,
 		false,
 	)
 	if err != nil {
@@ -3543,9 +4230,7 @@ func TestSweepStaleOrderTrackingWithWispsRequiresOrderFilter(t *testing.T) {
 	result, err := sweepStaleOrderTrackingWithOptions(
 		store,
 		time.Now(),
-		time.Minute,
 		nil,
-		orderTrackingSweepMetadataInitiator,
 		true,
 	)
 	if err == nil {
@@ -3613,9 +4298,7 @@ func TestSweepStaleOrderTrackingWithWispsClosesOldOpenWispSubtree(t *testing.T) 
 	result, err := sweepStaleOrderTrackingWithOptions(
 		store,
 		wispRoot.CreatedAt.Add(time.Hour),
-		time.Minute,
 		orderFilterForTest("digest"),
-		orderTrackingSweepMetadataInitiator,
 		true,
 	)
 	if err != nil {
@@ -3654,6 +4337,863 @@ func TestSweepStaleOrderTrackingWithWispsClosesOldOpenWispSubtree(t *testing.T) 
 	}
 }
 
+func TestSweepStaleOrderTrackingWithWispsClosesGraphDependentSubtreeViaTrackingSweep(t *testing.T) {
+	store := beads.NewMemStore()
+
+	wispRoot, err := store.Create(beads.Bead{
+		Title:  "mol-seth-patrol",
+		Type:   "task",
+		Labels: []string{"order-run:seth-patrol"},
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	step, err := store.Create(beads.Bead{
+		Title: "Infrastructure patrol",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.patrol",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(step): %v", err)
+	}
+	if err := store.DepAdd(step.ID, wispRoot.ID, "tracks"); err != nil {
+		t.Fatalf("DepAdd(tracks): %v", err)
+	}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		store,
+		wispRoot.CreatedAt.Add(time.Hour),
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 2 {
+		t.Fatalf("wispClosed = %d, want 2", result.wispClosed)
+	}
+
+	for _, id := range []string{wispRoot.ID, step.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed", id, got.Status)
+		}
+		if got.Metadata["close_reason"] != staleOrderWispCloseReason {
+			t.Fatalf("%s close_reason = %q, want %q", id, got.Metadata["close_reason"], staleOrderWispCloseReason)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingWithWispsClosesMetadataGraphSubtreeWithoutCloseOrdering(t *testing.T) {
+	base := beads.NewMemStore()
+
+	wispRoot, err := base.Create(beads.Bead{
+		Title:     "mol-seth-patrol",
+		Type:      "task",
+		Labels:    []string{"order-run:seth-patrol"},
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	step, err := base.Create(beads.Bead{
+		Title:     "Infrastructure patrol",
+		Type:      "task",
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.patrol",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(step): %v", err)
+	}
+	store := depListFailStore{Store: base, failID: wispRoot.ID}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		store,
+		wispRoot.CreatedAt.Add(time.Hour),
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 2 {
+		t.Fatalf("wispClosed = %d, want 2", result.wispClosed)
+	}
+
+	for _, id := range []string{wispRoot.ID, step.ID} {
+		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed", id, got.Status)
+		}
+		if got.Metadata["close_reason"] != staleOrderWispCloseReason {
+			t.Fatalf("%s close_reason = %q, want %q", id, got.Metadata["close_reason"], staleOrderWispCloseReason)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingWithWispsMixedLegacyGraphClosesOnlyOwnedSubtree(t *testing.T) {
+	store := beads.NewMemStore()
+
+	metadataRoot, err := store.Create(beads.Bead{
+		Title:     "mol-seth-patrol",
+		Type:      "task",
+		Labels:    []string{"order-run:seth-patrol"},
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(metadata root): %v", err)
+	}
+	metadataStep, err := store.Create(beads.Bead{
+		Title:     "Metadata-backed step",
+		Type:      "task",
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.root_bead_id": metadataRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.metadata",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(metadata step): %v", err)
+	}
+
+	legacyRoot, err := store.Create(beads.Bead{
+		Title:     "mol-seth-patrol",
+		Type:      "task",
+		Labels:    []string{"order-run:seth-patrol"},
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(legacy root): %v", err)
+	}
+	legacyStep, err := store.Create(beads.Bead{
+		Title:     "Legacy graph step",
+		Type:      "task",
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.step_ref": "mol-seth-patrol.legacy",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(legacy step): %v", err)
+	}
+	if err := store.DepAdd(legacyStep.ID, legacyRoot.ID, "tracks"); err != nil {
+		t.Fatalf("DepAdd(legacy tracks): %v", err)
+	}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		store,
+		metadataRoot.CreatedAt.Add(time.Hour),
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 2 {
+		t.Fatalf("wispClosed = %d, want 2", result.wispClosed)
+	}
+	for _, id := range []string{metadataRoot.ID, metadataStep.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed", id, got.Status)
+		}
+	}
+	// Dep-linked beads without gc.root_bead_id ownership metadata are outside
+	// the sweep's close authority (orderWispGraphDependentOwnedByRoot), so the
+	// legacy subtree is conservatively left open for dep-edge reaping.
+	for _, id := range []string{legacyRoot.ID, legacyStep.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "open" {
+			t.Fatalf("unowned legacy wisp %s status = %q, want open", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingDryRunCountsGraphSubtreeWithoutClosing(t *testing.T) {
+	store := beads.NewMemStore()
+
+	tracking, err := store.Create(beads.Bead{
+		Title:     "order:seth-patrol",
+		Labels:    []string{"order-run:seth-patrol", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(tracking): %v", err)
+	}
+	wispRoot, err := store.Create(beads.Bead{
+		Title:  "mol-seth-patrol",
+		Type:   "task",
+		Labels: []string{"order-run:seth-patrol"},
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	step, err := store.Create(beads.Bead{
+		Title: "Infrastructure patrol",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.patrol",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(step): %v", err)
+	}
+	if err := store.DepAdd(step.ID, wispRoot.ID, "tracks"); err != nil {
+		t.Fatalf("DepAdd(tracks): %v", err)
+	}
+
+	result, err := sweepStaleOrderTrackingWithOptionsLimitDryRun(
+		store,
+		wispRoot.CreatedAt.Add(time.Hour),
+		time.Minute,
+		orderFilterForTest("seth-patrol"),
+		orderTrackingSweepMetadataInitiator,
+		true,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptionsLimitDryRun: %v", err)
+	}
+	if result.trackingClosed != 1 {
+		t.Fatalf("trackingClosed = %d, want 1 dry-run candidate", result.trackingClosed)
+	}
+	if result.wispClosed != 2 {
+		t.Fatalf("wispClosed = %d, want 2 dry-run candidates", result.wispClosed)
+	}
+
+	for _, id := range []string{tracking.ID, wispRoot.ID, step.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "open" {
+			t.Fatalf("%s status after dry-run = %q, want open", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingDryRunSkipsCloseOrdering(t *testing.T) {
+	base := beads.NewMemStore()
+
+	wispRoot, err := base.Create(beads.Bead{
+		Title:  "mol-digest-generate",
+		Type:   "molecule",
+		Labels: []string{"order-run:digest"},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	child, err := base.Create(beads.Bead{
+		Title:    "draft-digest",
+		ParentID: wispRoot.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(child): %v", err)
+	}
+	store := depListFailStore{Store: base, failID: child.ID}
+
+	result, err := sweepStaleOrderTrackingWithOptionsLimitDryRun(
+		store,
+		wispRoot.CreatedAt.Add(time.Hour),
+		time.Minute,
+		orderFilterForTest("digest"),
+		orderTrackingSweepMetadataInitiator,
+		true,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptionsLimitDryRun: %v", err)
+	}
+	if result.wispClosed != 2 {
+		t.Fatalf("wispClosed = %d, want 2 dry-run candidates", result.wispClosed)
+	}
+	for _, id := range []string{wispRoot.ID, child.ID} {
+		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "open" {
+			t.Fatalf("%s status after dry-run = %q, want open", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingDryRunUsesRootMetadataDescendants(t *testing.T) {
+	base := beads.NewMemStore()
+
+	wispRoot, err := base.Create(beads.Bead{
+		Title:     "mol-seth-patrol",
+		Type:      "task",
+		Labels:    []string{"order-run:seth-patrol"},
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	step, err := base.Create(beads.Bead{
+		Title:     "Infrastructure patrol",
+		Type:      "task",
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.patrol",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(step): %v", err)
+	}
+	store := depListFailStore{Store: base, failID: wispRoot.ID}
+
+	result, err := sweepStaleOrderTrackingWithOptionsLimitDryRun(
+		store,
+		wispRoot.CreatedAt.Add(time.Hour),
+		time.Minute,
+		orderFilterForTest("seth-patrol"),
+		orderTrackingSweepMetadataInitiator,
+		true,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptionsLimitDryRun: %v", err)
+	}
+	if result.wispClosed != 2 {
+		t.Fatalf("wispClosed = %d, want 2 dry-run candidates", result.wispClosed)
+	}
+	for _, id := range []string{wispRoot.ID, step.ID} {
+		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "open" {
+			t.Fatalf("%s status after dry-run = %q, want open", id, got.Status)
+		}
+	}
+}
+
+// Partial-stamp molecules carry gc.root_bead_id on some steps while sibling
+// ParentID-only steps are un-stamped. The four tests below pin that such
+// un-stamped children take part in both the freshness veto and the close set
+// on the walk path (stamped sibling closed, so the batch path declines) and
+// on the batch path (stamped sibling open, batch handles the store).
+
+func TestSweepStaleOrderTrackingWithWispsPartialStampFreshChildVetoesClose(t *testing.T) {
+	store := &createdAtOverrideStore{Store: beads.NewMemStore()}
+
+	wispRoot, err := store.Create(beads.Bead{
+		Title:  "mol-seth-patrol",
+		Type:   "task",
+		Labels: []string{"order-run:seth-patrol"},
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	stampedStep, err := store.Create(beads.Bead{
+		Title: "Stamped finished step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.done",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(stamped step): %v", err)
+	}
+	if err := store.Close(stampedStep.ID); err != nil {
+		t.Fatalf("Close(stamped step): %v", err)
+	}
+	now := wispRoot.CreatedAt.Add(time.Hour)
+	unstampedChild, err := store.Create(beads.Bead{
+		Title:     "Un-stamped live step",
+		Type:      "task",
+		ParentID:  wispRoot.ID,
+		CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("Create(unstamped child): %v", err)
+	}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		store,
+		now,
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 0 {
+		t.Fatalf("wispClosed = %d, want 0 (fresh un-stamped child must veto)", result.wispClosed)
+	}
+	for _, id := range []string{wispRoot.ID, unstampedChild.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "open" {
+			t.Fatalf("%s status = %q, want open", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingWithWispsPartialStampClosesStaleChildWithSubtree(t *testing.T) {
+	store := beads.NewMemStore()
+
+	wispRoot, err := store.Create(beads.Bead{
+		Title:  "mol-seth-patrol",
+		Type:   "task",
+		Labels: []string{"order-run:seth-patrol"},
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	stampedStep, err := store.Create(beads.Bead{
+		Title: "Stamped finished step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.done",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(stamped step): %v", err)
+	}
+	if err := store.Close(stampedStep.ID); err != nil {
+		t.Fatalf("Close(stamped step): %v", err)
+	}
+	unstampedChild, err := store.Create(beads.Bead{
+		Title:    "Un-stamped stale step",
+		Type:     "task",
+		ParentID: wispRoot.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(unstamped child): %v", err)
+	}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		store,
+		wispRoot.CreatedAt.Add(time.Hour),
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 2 {
+		t.Fatalf("wispClosed = %d, want 2 (root and un-stamped child)", result.wispClosed)
+	}
+	for _, id := range []string{wispRoot.ID, unstampedChild.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed (un-stamped child must not be stranded)", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingBatchPartialStampFreshChildVetoesClose(t *testing.T) {
+	base := &createdAtOverrideStore{Store: beads.NewMemStore()}
+
+	wispRoot, err := base.Create(beads.Bead{
+		Title:  "mol-seth-patrol",
+		Type:   "task",
+		Labels: []string{"order-run:seth-patrol"},
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	stampedStep, err := base.Create(beads.Bead{
+		Title: "Stamped open step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.open",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(stamped step): %v", err)
+	}
+	now := wispRoot.CreatedAt.Add(time.Hour)
+	unstampedChild, err := base.Create(beads.Bead{
+		Title:     "Un-stamped live step",
+		Type:      "task",
+		ParentID:  wispRoot.ID,
+		CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("Create(unstamped child): %v", err)
+	}
+
+	// depListFailStore pins that the batch path handles this store: any
+	// fallback to the walk would DepList the root and fail the sweep.
+	store := depListFailStore{Store: base, failID: wispRoot.ID}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		store,
+		now,
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 0 {
+		t.Fatalf("wispClosed = %d, want 0 (fresh un-stamped child must veto)", result.wispClosed)
+	}
+	for _, id := range []string{wispRoot.ID, stampedStep.ID, unstampedChild.ID} {
+		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "open" {
+			t.Fatalf("%s status = %q, want open", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingBatchPartialStampClosesStaleChildWithSubtree(t *testing.T) {
+	base := beads.NewMemStore()
+
+	wispRoot, err := base.Create(beads.Bead{
+		Title:  "mol-seth-patrol",
+		Type:   "task",
+		Labels: []string{"order-run:seth-patrol"},
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	stampedStep, err := base.Create(beads.Bead{
+		Title: "Stamped open step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.open",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(stamped step): %v", err)
+	}
+	unstampedChild, err := base.Create(beads.Bead{
+		Title:    "Un-stamped stale step",
+		Type:     "task",
+		ParentID: wispRoot.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(unstamped child): %v", err)
+	}
+	// depListFailStore pins that the batch path handles this store without
+	// close ordering: a walk fallback or closeorder pass would DepList the
+	// root and fail the sweep.
+	store := depListFailStore{Store: base, failID: wispRoot.ID}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		store,
+		wispRoot.CreatedAt.Add(time.Hour),
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 3 {
+		t.Fatalf("wispClosed = %d, want 3 (root, stamped step, un-stamped child)", result.wispClosed)
+	}
+	for _, id := range []string{wispRoot.ID, stampedStep.ID, unstampedChild.ID} {
+		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed (un-stamped child must not be stranded)", id, got.Status)
+		}
+	}
+}
+
+// The two tests below pin the closed-intermediate shape on the batch path:
+// an open un-stamped grandchild reachable only through a closed ParentID
+// intermediate (the production instance is a lingering nudge/mail chore
+// parented under an already-closed step). The batch path must traverse the
+// closed intermediate exactly like the walk path's IncludeClosed queries do,
+// so a fresh grandchild vetoes the close and a stale one drains with the
+// subtree instead of being stranded.
+
+func TestSweepStaleOrderTrackingBatchFreshGrandchildBehindClosedIntermediateVetoesClose(t *testing.T) {
+	base := &createdAtOverrideStore{Store: beads.NewMemStore()}
+
+	wispRoot, err := base.Create(beads.Bead{
+		Title:  "mol-seth-patrol",
+		Type:   "task",
+		Labels: []string{"order-run:seth-patrol"},
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	stampedStep, err := base.Create(beads.Bead{
+		Title: "Stamped open step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.open",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(stamped step): %v", err)
+	}
+	intermediate, err := base.Create(beads.Bead{
+		Title:    "Un-stamped finished step",
+		Type:     "task",
+		ParentID: wispRoot.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(intermediate): %v", err)
+	}
+	now := wispRoot.CreatedAt.Add(time.Hour)
+	grandchild, err := base.Create(beads.Bead{
+		Title:     "Un-stamped live chore",
+		Type:      "task",
+		ParentID:  intermediate.ID,
+		CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("Create(grandchild): %v", err)
+	}
+	if err := base.Close(intermediate.ID); err != nil {
+		t.Fatalf("Close(intermediate): %v", err)
+	}
+
+	// depListFailStore pins that the batch path handles this store: any
+	// fallback to the walk would DepList the root and fail the sweep.
+	store := depListFailStore{Store: base, failID: wispRoot.ID}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		store,
+		now,
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 0 {
+		t.Fatalf("wispClosed = %d, want 0 (fresh grandchild behind closed intermediate must veto)", result.wispClosed)
+	}
+	for _, id := range []string{wispRoot.ID, stampedStep.ID, grandchild.ID} {
+		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "open" {
+			t.Fatalf("%s status = %q, want open", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingBatchClosesStaleGrandchildBehindClosedIntermediate(t *testing.T) {
+	base := beads.NewMemStore()
+
+	wispRoot, err := base.Create(beads.Bead{
+		Title:  "mol-seth-patrol",
+		Type:   "task",
+		Labels: []string{"order-run:seth-patrol"},
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	stampedStep, err := base.Create(beads.Bead{
+		Title: "Stamped open step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.open",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(stamped step): %v", err)
+	}
+	intermediate, err := base.Create(beads.Bead{
+		Title:    "Un-stamped finished step",
+		Type:     "task",
+		ParentID: wispRoot.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(intermediate): %v", err)
+	}
+	grandchild, err := base.Create(beads.Bead{
+		Title:    "Un-stamped stale chore",
+		Type:     "task",
+		ParentID: intermediate.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(grandchild): %v", err)
+	}
+	if err := base.Close(intermediate.ID); err != nil {
+		t.Fatalf("Close(intermediate): %v", err)
+	}
+
+	// depListFailStore pins that the batch path handles this store without
+	// close ordering: a walk fallback or closeorder pass would DepList the
+	// root and fail the sweep.
+	store := depListFailStore{Store: base, failID: wispRoot.ID}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		store,
+		wispRoot.CreatedAt.Add(time.Hour),
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 3 {
+		t.Fatalf("wispClosed = %d, want 3 (root, stamped step, grandchild behind closed intermediate)", result.wispClosed)
+	}
+	for _, id := range []string{wispRoot.ID, stampedStep.ID, grandchild.ID} {
+		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed (grandchild must not be stranded)", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingBatchIgnoresTitleOnlyOrderRoots(t *testing.T) {
+	base := beads.NewMemStore()
+
+	labeledRoot, err := base.Create(beads.Bead{
+		Title:  "mol-seth-patrol",
+		Type:   "task",
+		Labels: []string{"order-run:seth-patrol"},
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(labeled root): %v", err)
+	}
+	labeledStep, err := base.Create(beads.Bead{
+		Title: "Stamped open step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": labeledRoot.ID,
+			"gc.step_ref":     "mol-seth-patrol.open",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(labeled step): %v", err)
+	}
+	// A workflow root that was never order-poured: no order-run label, but a
+	// title that collides with the swept order name.
+	titleRoot, err := base.Create(beads.Bead{
+		Title: "order:seth-patrol",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind": "workflow",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(title root): %v", err)
+	}
+	titleStep, err := base.Create(beads.Bead{
+		Title: "Unrelated workflow step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": titleRoot.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(title step): %v", err)
+	}
+
+	result, err := sweepStaleOrderTrackingWithOptions(
+		base,
+		labeledRoot.CreatedAt.Add(time.Hour),
+		orderFilterForTest("seth-patrol"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptions: %v", err)
+	}
+	if result.wispClosed != 2 {
+		t.Fatalf("wispClosed = %d, want 2 (labeled subtree only)", result.wispClosed)
+	}
+	for _, id := range []string{labeledRoot.ID, labeledStep.ID} {
+		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed", id, got.Status)
+		}
+	}
+	for _, id := range []string{titleRoot.ID, titleStep.ID} {
+		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "open" {
+			t.Fatalf("title-only root subtree %s status = %q, want open (never order-poured)", id, got.Status)
+		}
+	}
+}
+
 func TestSweepStaleOrderTrackingWithoutWispsLeavesOpenWispSubtree(t *testing.T) {
 	store := beads.NewMemStore()
 
@@ -3676,9 +5216,7 @@ func TestSweepStaleOrderTrackingWithoutWispsLeavesOpenWispSubtree(t *testing.T) 
 	result, err := sweepStaleOrderTrackingWithOptions(
 		store,
 		wispRoot.CreatedAt.Add(time.Hour),
-		time.Minute,
 		nil,
-		orderTrackingSweepMetadataInitiator,
 		false,
 	)
 	if err != nil {
@@ -3694,6 +5232,10 @@ func TestSweepStaleOrderTrackingWithoutWispsLeavesOpenWispSubtree(t *testing.T) 
 	if gotChild.Status != "open" {
 		t.Fatalf("child status = %q, want open", gotChild.Status)
 	}
+}
+
+func sweepStaleOrderTrackingWithOptions(store beads.Store, now time.Time, onlyOrders map[string]struct{}, includeWispSubtrees bool) (orderTrackingSweepResult, error) {
+	return sweepStaleOrderTrackingWithOptionsLimit(store, now, time.Minute, onlyOrders, orderTrackingSweepMetadataInitiator, includeWispSubtrees, 0)
 }
 
 func TestSweepStaleOrderTrackingWithWispsClosesDeepestFirst(t *testing.T) {
@@ -3726,9 +5268,7 @@ func TestSweepStaleOrderTrackingWithWispsClosesDeepestFirst(t *testing.T) {
 	result, err := sweepStaleOrderTrackingWithOptions(
 		store,
 		wispRoot.CreatedAt.Add(time.Hour),
-		time.Minute,
 		orderFilterForTest("digest"),
-		orderTrackingSweepMetadataInitiator,
 		true,
 	)
 	if err != nil {
@@ -3740,6 +5280,71 @@ func TestSweepStaleOrderTrackingWithWispsClosesDeepestFirst(t *testing.T) {
 
 	for _, id := range []string{wispRoot.ID, child.ID, grandchild.ID} {
 		got, err := base.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingLimitOnlyAppliesToTrackingBeads(t *testing.T) {
+	store := beads.NewMemStore()
+
+	for _, name := range []string{"digest", "digest-retry"} {
+		_, err := store.Create(beads.Bead{
+			Title:     "order:" + name,
+			Labels:    []string{"order-run:" + name, labelOrderTracking},
+			Ephemeral: true,
+		})
+		if err != nil {
+			t.Fatalf("Create(tracking %s): %v", name, err)
+		}
+	}
+	wispRoot, err := store.Create(beads.Bead{
+		Title:  "mol-digest-generate",
+		Type:   "molecule",
+		Labels: []string{"order-run:digest"},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	child, err := store.Create(beads.Bead{
+		Title:    "draft-digest",
+		ParentID: wispRoot.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(child): %v", err)
+	}
+	grandchild, err := store.Create(beads.Bead{
+		Title:    "nested-step-still-running",
+		ParentID: child.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(grandchild): %v", err)
+	}
+
+	result, err := sweepStaleOrderTrackingWithOptionsLimit(
+		store,
+		time.Now().Add(time.Hour),
+		time.Minute,
+		orderFilterForTest("digest", "digest-retry"),
+		orderTrackingSweepMetadataInitiator,
+		true,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingWithOptionsLimit: %v", err)
+	}
+	if result.trackingClosed != 1 {
+		t.Fatalf("trackingClosed = %d, want 1", result.trackingClosed)
+	}
+	if result.wispClosed != 3 {
+		t.Fatalf("wispClosed = %d, want 3", result.wispClosed)
+	}
+	for _, id := range []string{wispRoot.ID, child.ID, grandchild.ID} {
+		got, err := store.Get(id)
 		if err != nil {
 			t.Fatalf("Get(%s): %v", id, err)
 		}
@@ -3767,9 +5372,7 @@ func TestSweepStaleOrderTrackingWithWispsClosesRootOnlyWisp(t *testing.T) {
 	result, err := sweepStaleOrderTrackingWithOptions(
 		store,
 		wispRoot.CreatedAt.Add(time.Hour),
-		time.Minute,
 		orderFilterForTest("digest"),
-		orderTrackingSweepMetadataInitiator,
 		true,
 	)
 	if err != nil {
@@ -3808,7 +5411,7 @@ func TestSweepStaleOrderTrackingWithWispsSkipsFreshOpenDescendant(t *testing.T) 
 	}
 	cutoff := wispRoot.CreatedAt.Add(child.CreatedAt.Sub(wispRoot.CreatedAt) / 2)
 
-	closed, err := sweepStaleOrderWispSubtrees(store, cutoff, orderFilterForTest("digest"), orderTrackingSweepMetadataInitiator)
+	closed, err := sweepStaleOrderWispSubtrees(store, cutoff, orderFilterForTest("digest"))
 	if err != nil {
 		t.Fatalf("sweepStaleOrderWispSubtrees: %v", err)
 	}
@@ -3823,6 +5426,182 @@ func TestSweepStaleOrderTrackingWithWispsSkipsFreshOpenDescendant(t *testing.T) 
 		if got.Status != "open" {
 			t.Fatalf("%s status = %q, want open", id, got.Status)
 		}
+	}
+}
+
+func TestSweepStaleOrderTrackingWithWispsClosesGraphDependentSubtree(t *testing.T) {
+	store := beads.NewMemStore()
+
+	wispRoot, err := store.Create(beads.Bead{
+		Title:  "graph-workflow-digest",
+		Type:   "task",
+		Labels: []string{"order-run:digest"},
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(wisp root): %v", err)
+	}
+	step, err := store.Create(beads.Bead{
+		Title: "draft-digest",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "draft",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(graph step): %v", err)
+	}
+	if err := store.DepAdd(step.ID, wispRoot.ID, "tracks"); err != nil {
+		t.Fatalf("DepAdd(tracks): %v", err)
+	}
+
+	closed, err := sweepStaleOrderWispSubtrees(
+		store,
+		step.CreatedAt.Add(time.Minute),
+		orderFilterForTest("digest"),
+	)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderWispSubtrees: %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("closed = %d, want root and graph step closed", closed)
+	}
+	for _, id := range []string{wispRoot.ID, step.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed", id, got.Status)
+		}
+	}
+}
+
+func TestSweepStaleOrderTrackingWithWispsClosesSameWorkflowGraphDependencyTypes(t *testing.T) {
+	for _, depType := range []string{"blocks", "parent-child"} {
+		t.Run(depType, func(t *testing.T) {
+			store := beads.NewMemStore()
+
+			wispRoot, err := store.Create(beads.Bead{
+				Title:  "graph-workflow-digest",
+				Type:   "task",
+				Labels: []string{"order-run:digest"},
+				Metadata: map[string]string{
+					"gc.kind":             "workflow",
+					"gc.formula_contract": "graph.v2",
+				},
+			})
+			if err != nil {
+				t.Fatalf("Create(wisp root): %v", err)
+			}
+			step, err := store.Create(beads.Bead{
+				Title: "draft-digest",
+				Metadata: map[string]string{
+					"gc.root_bead_id": wispRoot.ID,
+					"gc.step_ref":     "draft",
+				},
+			})
+			if err != nil {
+				t.Fatalf("Create(graph step): %v", err)
+			}
+			if err := store.DepAdd(step.ID, wispRoot.ID, depType); err != nil {
+				t.Fatalf("DepAdd(%s): %v", depType, err)
+			}
+
+			closed, err := sweepStaleOrderWispSubtrees(
+				store,
+				step.CreatedAt.Add(time.Minute),
+				orderFilterForTest("digest"),
+			)
+			if err != nil {
+				t.Fatalf("sweepStaleOrderWispSubtrees: %v", err)
+			}
+			if closed != 2 {
+				t.Fatalf("closed = %d, want root and graph step closed", closed)
+			}
+			for _, id := range []string{wispRoot.ID, step.ID} {
+				got, err := store.Get(id)
+				if err != nil {
+					t.Fatalf("Get(%s): %v", id, err)
+				}
+				if got.Status != "closed" {
+					t.Fatalf("%s status = %q, want closed", id, got.Status)
+				}
+			}
+		})
+	}
+}
+
+func TestSweepStaleOrderTrackingWithWispsIgnoresForeignGraphDependents(t *testing.T) {
+	tests := []struct {
+		name     string
+		depType  string
+		metadata map[string]string
+	}{
+		{
+			name:    "external convoy tracks edge",
+			depType: "tracks",
+		},
+		{
+			name:    "unrelated downstream blocks edge",
+			depType: "blocks",
+			metadata: map[string]string{
+				"gc.root_bead_id": "other-workflow-root",
+				"gc.step_ref":     "external",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+
+			wispRoot, err := store.Create(beads.Bead{
+				Title:  "graph-workflow-digest",
+				Type:   "task",
+				Labels: []string{"order-run:digest"},
+				Metadata: map[string]string{
+					"gc.kind":             "workflow",
+					"gc.formula_contract": "graph.v2",
+				},
+			})
+			if err != nil {
+				t.Fatalf("Create(wisp root): %v", err)
+			}
+			external, err := store.Create(beads.Bead{
+				Title:    "external-dependent",
+				Metadata: tt.metadata,
+			})
+			if err != nil {
+				t.Fatalf("Create(external): %v", err)
+			}
+			if err := store.DepAdd(external.ID, wispRoot.ID, tt.depType); err != nil {
+				t.Fatalf("DepAdd(%s): %v", tt.depType, err)
+			}
+
+			closed, err := sweepStaleOrderWispSubtrees(
+				store,
+				external.CreatedAt.Add(time.Minute),
+				orderFilterForTest("digest"),
+			)
+			if err != nil {
+				t.Fatalf("sweepStaleOrderWispSubtrees: %v", err)
+			}
+			if closed != 0 {
+				t.Fatalf("closed = %d, want foreign dependent ignored", closed)
+			}
+			for _, id := range []string{wispRoot.ID, external.ID} {
+				got, err := store.Get(id)
+				if err != nil {
+					t.Fatalf("Get(%s): %v", id, err)
+				}
+				if got.Status != "open" {
+					t.Fatalf("%s status = %q, want open", id, got.Status)
+				}
+			}
+		})
 	}
 }
 
@@ -3847,7 +5626,6 @@ func TestSweepStaleOrderTrackingWithWispsPropagatesDescendantListError(t *testin
 		store,
 		wispRoot.CreatedAt.Add(time.Minute),
 		orderFilterForTest("digest"),
-		orderTrackingSweepMetadataInitiator,
 	)
 	if err == nil {
 		t.Fatal("sweepStaleOrderWispSubtrees err = nil, want descendant-list error")
@@ -3884,7 +5662,6 @@ func TestSweepStaleOrderTrackingWithWispsPropagatesCloseOrderError(t *testing.T)
 		store,
 		wispRoot.CreatedAt.Add(time.Minute),
 		orderFilterForTest("digest"),
-		orderTrackingSweepMetadataInitiator,
 	)
 	if err == nil {
 		t.Fatal("sweepStaleOrderWispSubtrees err = nil, want close-order error")
@@ -3894,6 +5671,52 @@ func TestSweepStaleOrderTrackingWithWispsPropagatesCloseOrderError(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "ordering stale order wisp closes") {
 		t.Fatalf("err = %q, want close-order context", err)
+	}
+}
+
+func TestSweepStaleOrderTrackingLimit_ClosesAtMostBudget(t *testing.T) {
+	store := beads.NewMemStore()
+	now := time.Now()
+
+	ids := make([]string, 0, 4)
+	for _, name := range []string{"one", "two", "three", "four"} {
+		b, err := store.Create(beads.Bead{
+			Title:     "order:" + name,
+			Labels:    []string{"order-run:" + name, labelOrderTracking},
+			Ephemeral: true,
+		})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", name, err)
+		}
+		ids = append(ids, b.ID)
+	}
+
+	closed, err := sweepStaleOrderTrackingLimit(store, now.Add(time.Hour), time.Minute, nil, orderTrackingWatchdogMetadataInitiator, 3)
+	if err != nil {
+		t.Fatalf("sweepStaleOrderTrackingLimit: %v", err)
+	}
+	if closed != 3 {
+		t.Fatalf("closed = %d, want 3", closed)
+	}
+
+	closedCount := 0
+	for _, id := range ids {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got.Status == "closed" {
+			closedCount++
+			if got.Metadata["close_reason"] != staleOrderTrackingCloseReason {
+				t.Fatalf("close_reason for %s = %q, want %q", id, got.Metadata["close_reason"], staleOrderTrackingCloseReason)
+			}
+			if got.Metadata["order_tracking_sweep_by"] != orderTrackingWatchdogMetadataInitiator {
+				t.Fatalf("order_tracking_sweep_by for %s = %q, want %q", id, got.Metadata["order_tracking_sweep_by"], orderTrackingWatchdogMetadataInitiator)
+			}
+		}
+	}
+	if closedCount != 3 {
+		t.Fatalf("closed tracking beads = %d, want 3", closedCount)
 	}
 }
 
@@ -4257,13 +6080,14 @@ func buildOrderDispatcherFromListExec(aa []orders.Order, store beads.Store, ep e
 		storeFn: func(_ execStoreTarget) (beads.Store, error) {
 			return store, nil
 		},
-		ep:             ep,
-		execRun:        execRun,
-		rec:            rec,
-		stderr:         lockedStderr(&bytes.Buffer{}),
-		cfg:            cfg,
-		dispatchCtx:    dispatchCtx,
-		dispatchCancel: dispatchCancel,
+		ep:                   ep,
+		execRun:              execRun,
+		rec:                  rec,
+		stderr:               lockedStderr(&bytes.Buffer{}),
+		maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick,
+		cfg:                  cfg,
+		dispatchCtx:          dispatchCtx,
+		dispatchCancel:       dispatchCancel,
 	}
 }
 
@@ -4471,9 +6295,29 @@ func TestQualifyPool(t *testing.T) {
 		{Name: "dog", BindingName: "maintenance", SourceDir: "/city/packs/maintenance"},
 		{Name: "dog", BindingName: "gastown", SourceDir: "/city/packs/gastown"},
 	}}
-	dirIsolatedCfg := &config.City{Agents: []config.Agent{
-		// City-level binding agent should NOT match a rig-scoped order.
+	materializedPackCfg := &config.City{Agents: []config.Agent{
+		{Name: "dog"},
+		{Name: "dog", BindingName: "dolt", PackName: "dolt", SourceDir: "/city/.gc/system/packs/bd/dolt"},
+	}}
+	transitiveNestedPackCfg := &config.City{Agents: []config.Agent{
+		{Name: "dog", BindingName: "wrapper", PackName: "gastown", SourceDir: "/repo/examples/gastown/packs/gastown"},
+		{Name: "dog", BindingName: "dolt", PackName: "dolt", SourceDir: "/city/.gc/system/packs/bd/dolt"},
+	}}
+	transitiveClosureCfg := &config.City{Agents: []config.Agent{
+		{Name: "mayor", BindingName: "wrapper", PackName: "gastown", SourceDir: "/repo/examples/gastown/packs/gastown"},
+		{Name: "dog", BindingName: "wrapper", PackName: "maintenance", SourceDir: "/repo/examples/gastown/packs/maintenance"},
+		{Name: "dog", BindingName: "dolt", PackName: "dolt", SourceDir: "/city/.gc/system/packs/bd/dolt"},
+	}}
+	sameTailShadowForkCfg := &config.City{Agents: []config.Agent{
+		{Name: "dog", BindingName: "fork", PackName: "gastown", SourceDir: "/city/packs/gastown"},
+		{Name: "dog", BindingName: "gastown", PackName: "gastown", SourceDir: "/city/.gc/system/packs/gastown"},
+	}}
+	rigWithCityFallbackCfg := &config.City{Agents: []config.Agent{
 		{Name: "dog", BindingName: "maintenance"},
+	}}
+	rigShadowCfg := &config.City{Agents: []config.Agent{
+		{Name: "dog", BindingName: "maintenance"},
+		{Name: "dog", BindingName: "foo", Dir: "api"},
 	}}
 
 	tests := []struct {
@@ -4503,10 +6347,22 @@ func TestQualifyPool(t *testing.T) {
 		{"no hint stays ambiguous", importedOnlyCollisionCfg, "dog", "", "", "", `ambiguous pool "dog" for city order: matches maintenance.dog, gastown.dog`},
 		{"source hint beats city shadow", importedShadowCfg, "dog", "", "/city/packs/maintenance", "maintenance.dog", ""},
 		{"source hint beats sibling import collision", importedShadowCfg, "dog", "", "/city/packs/gastown", "gastown.dog", ""},
+		{"source checkout hint matches materialized same pack", materializedPackCfg, "dog", "", "/repo/examples/bd/dolt", "dolt.dog", ""},
+		{"source hint ignores unrelated nested materialized pack", transitiveNestedPackCfg, "dog", "", "/repo/examples/gastown/packs/gastown", "wrapper.dog", ""},
+		{"source hint carries transitive import binding context", transitiveClosureCfg, "dog", "", "/repo/examples/gastown/packs/gastown", "wrapper.dog", ""},
+
+		// Distinct packs sharing the same two-component source tail (a
+		// city-local fork plus the builtin pack materialized under
+		// .gc/system) must resolve by exact SourceDir, not go ambiguous
+		// because the other pack tail-matches.
+		{"same-tail distinct packs prefer exact fork source", sameTailShadowForkCfg, "dog", "", "/city/packs/gastown", "fork.dog", ""},
+		{"same-tail distinct packs prefer exact materialized source", sameTailShadowForkCfg, "dog", "", "/city/.gc/system/packs/gastown", "gastown.dog", ""},
 
 		// Rig-order binding lookup.
 		{"rig order resolves binding", rigBindingCfg, "dog", "api", "", "api/foo.dog", ""},
-		{"rig order isolated from city agent", dirIsolatedCfg, "dog", "api", "", "api/dog", ""},
+		{"rig order falls back to city binding", rigWithCityFallbackCfg, "dog", "api", "", "maintenance.dog", ""},
+		{"rig order binding-qualified city fallback", rigWithCityFallbackCfg, "maintenance.dog", "api", "", "maintenance.dog", ""},
+		{"rig order local binding shadows city fallback", rigShadowCfg, "dog", "api", "", "api/foo.dog", ""},
 
 		// Ambiguity is a hard failure — dispatch must not recreate the
 		// original bare-name route/scaler mismatch.
@@ -4666,6 +6522,88 @@ pool = "worker"
 	work := workBeadByOrderLabel(t, rigStore, "order-run:rig-digest:rig:frontend")
 	if work.Metadata["gc.routed_to"] != "frontend/worker" {
 		t.Errorf("gc.routed_to = %q, want %q", work.Metadata["gc.routed_to"], "frontend/worker")
+	}
+}
+
+func TestBuildOrderDispatcherRigOrderCityPoolUsesCityFileStore(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	cityLayer := filepath.Join(cityDir, "formulas")
+	rigLayer := filepath.Join(rigDir, "formulas")
+	orderDir := filepath.Join(rigDir, "orders")
+	for _, dir := range []string{cityLayer, rigLayer, orderDir} {
+		if err := mkdirAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(orderDir, "rig-digest.toml"), `[order]
+formula = "test-formula"
+trigger = "cooldown"
+interval = "1m"
+pool = "dog"
+`)
+	formulaText, err := os.ReadFile(filepath.Join(sharedTestFormulaDir, "test-formula.toml"))
+	if err != nil {
+		t.Fatalf("ReadFile(test-formula): %v", err)
+	}
+	writeFile(t, filepath.Join(rigLayer, "test-formula.toml"), string(formulaText))
+	if err := ensureScopedFileStoreLayout(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensurePersistedScopeLocalFileStore(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensurePersistedScopeLocalFileStore(rigDir); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "demo", Prefix: "ct"},
+		Agents: []config.Agent{{
+			Name:        "dog",
+			BindingName: "maintenance",
+		}},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{cityLayer},
+			Rigs: map[string][]string{
+				"frontend": {cityLayer, rigLayer},
+			},
+		},
+		Rigs: []config.Rig{{
+			Name:   "frontend",
+			Path:   "frontend",
+			Prefix: "fe",
+		}},
+	}
+
+	var stderr bytes.Buffer
+	ad := buildOrderDispatcher(cityDir, cfg, events.Discard, &stderr)
+	if ad == nil {
+		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
+	}
+
+	ad.dispatch(context.Background(), cityDir, time.Now())
+	ad.drain(context.Background())
+
+	cityStore, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(city): %v", err)
+	}
+	work := workBeadByOrderLabel(t, cityStore, "order-run:rig-digest:rig:frontend")
+	if work.Metadata["gc.routed_to"] != "maintenance.dog" {
+		t.Errorf("city work gc.routed_to = %q, want maintenance.dog", work.Metadata["gc.routed_to"])
+	}
+
+	rigStore, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	rigRuns := trackingBeads(t, rigStore, "order-run:rig-digest:rig:frontend")
+	if len(rigRuns) != 0 {
+		t.Fatalf("rig store has %d city-pool order bead(s), want 0", len(rigRuns))
 	}
 }
 
@@ -4971,8 +6909,8 @@ func TestOrderDispatchSkipsRigCooldownWhenLegacyOpenWorkReadFails(t *testing.T) 
 	if len(rigRuns) != 0 {
 		t.Fatalf("rig store has %d new run bead(s), want 0 when legacy last-run state cannot be read", len(rigRuns))
 	}
-	if !strings.Contains(stderr.String(), "checking open work") {
-		t.Fatalf("stderr missing open-work gate error:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "reading last run") {
+		t.Fatalf("stderr missing last-run gate error:\n%s", stderr.String())
 	}
 }
 
@@ -5546,7 +7484,7 @@ func TestOrderDispatchSkipsOpenTrackingBeadForConditionOrder(t *testing.T) {
 	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
 
 	ad.dispatch(context.Background(), t.TempDir(), time.Now())
-	time.Sleep(50 * time.Millisecond)
+	ad.drain(context.Background())
 
 	if ran {
 		t.Error("exec should not have run while an order-tracking bead is open")
@@ -5729,6 +7667,250 @@ func TestHasOpenWorkStrictBlocksOnWispWithOpenChildren(t *testing.T) {
 	}
 }
 
+// TestStoreHasOpenDescendantsUsesMembershipFastPath proves the #2893
+// optimization: an open descendant reachable ONLY by its gc.root_bead_id
+// membership metadata (no ParentID, no dependency edge) is found in a single
+// metadata-filtered List, without the O(tree) per-node ParentID/DepList walk.
+// Because the descendant has no walkable edge to the root, a true result can
+// only come from the membership fast path.
+func TestStoreHasOpenDescendantsUsesMembershipFastPath(t *testing.T) {
+	store := beads.NewMemStore()
+
+	root, err := store.Create(beads.Bead{
+		Title:  "mol-digest-generate",
+		Type:   "molecule",
+		Labels: []string{"order-run:digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Open member tied to the root only by membership metadata.
+	if _, err := store.Create(beads.Bead{
+		Title:    "determine-period",
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	has, err := storeHasOpenDescendants(store, root.ID, nil)
+	if err != nil {
+		t.Fatalf("storeHasOpenDescendants: %v", err)
+	}
+	if !has {
+		t.Fatal("open member carrying gc.root_bead_id must count as in-flight via the membership fast path")
+	}
+}
+
+// TestStoreHasOpenDescendantsMembershipOrphanAllClosed guards against false
+// positives: when every member carries gc.root_bead_id but all are closed, the
+// root is an orphan (ga-jra/ga-lo8c) and must NOT count as in-flight work, so a
+// later cooldown tick can re-dispatch.
+func TestStoreHasOpenDescendantsMembershipOrphanAllClosed(t *testing.T) {
+	store := beads.NewMemStore()
+
+	root, err := store.Create(beads.Bead{
+		Title:  "mol-digest-generate",
+		Type:   "molecule",
+		Labels: []string{"order-run:digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := store.Create(beads.Bead{
+		Title:    "determine-period",
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(child.ID); err != nil {
+		t.Fatalf("close member: %v", err)
+	}
+
+	has, err := storeHasOpenDescendants(store, root.ID, nil)
+	if err != nil {
+		t.Fatalf("storeHasOpenDescendants: %v", err)
+	}
+	if has {
+		t.Fatal("all-closed membership is an orphan root and must not count as in-flight work")
+	}
+}
+
+// TestStoreHasOpenDescendantsFallsBackWithoutMembershipMetadata proves the
+// fallback: a descendant materialized before gc.root_bead_id stamping is linked
+// only by ParentID and carries no membership metadata. The metadata List
+// returns nothing, so the gate must fall back to the authoritative tree walk
+// and still find the open child — behavior is byte-identical to the historical
+// implementation for un-stamped data.
+func TestStoreHasOpenDescendantsFallsBackWithoutMembershipMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+
+	root, err := store.Create(beads.Bead{
+		Title:  "mol-digest-generate",
+		Type:   "molecule",
+		Labels: []string{"order-run:digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Open child linked only by ParentID — no gc.root_bead_id (pre-stamp data).
+	if _, err := store.Create(beads.Bead{
+		Title:    "determine-period",
+		ParentID: root.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	has, err := storeHasOpenDescendants(store, root.ID, nil)
+	if err != nil {
+		t.Fatalf("storeHasOpenDescendants: %v", err)
+	}
+	if !has {
+		t.Fatal("ParentID-linked open child without membership metadata must be found via the walk fallback")
+	}
+}
+
+// TestStoreHasOpenDescendantsFallsBackOnPartialStampMembership guards the
+// single-flight safety of a partial-stamp molecule: some steps carry
+// gc.root_bead_id (a nested sub-molecule) while sibling ParentID-only steps do
+// not. When every stamped member is closed but an un-stamped sibling is still
+// open, the membership set is non-empty yet has no open member — the gate must
+// still fall back to the walk and report in-flight work, not declare the root
+// idle (which would re-dispatch while work is in flight).
+func TestStoreHasOpenDescendantsFallsBackOnPartialStampMembership(t *testing.T) {
+	base := beads.NewMemStore()
+	store := listIncludingClosedStore{Store: base}
+
+	root, err := store.Create(beads.Bead{
+		Title:  "mol-digest-generate",
+		Type:   "molecule",
+		Labels: []string{"order-run:digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A stamped member (e.g. a nested sub-molecule) that is CLOSED.
+	stamped, err := store.Create(beads.Bead{
+		Title:    "sub-molecule",
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(stamped.ID); err != nil {
+		t.Fatalf("close stamped member: %v", err)
+	}
+	// A sibling step linked only by ParentID, NOT stamped, still OPEN.
+	if _, err := store.Create(beads.Bead{
+		Title:    "unstamped-step",
+		ParentID: root.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	has, err := storeHasOpenDescendants(store, root.ID, nil)
+	if err != nil {
+		t.Fatalf("storeHasOpenDescendants: %v", err)
+	}
+	if !has {
+		t.Fatal("partial-stamp molecule with a closed stamped member and an open un-stamped ParentID sibling must still report in-flight via the walk fallback (single-flight false negative otherwise)")
+	}
+}
+
+// TestStoreHasOpenDescendantsMembershipSkipsTransientNotification proves the
+// #3102 skip predicate composes with the #2893 membership fast path: an OPEN
+// stamped transient-notification bead (a nudge or mail/message chore reaped on
+// its own TTL) carries gc.root_bead_id and so is returned by the membership
+// List, but it must NOT wedge the single-flight gate. With skip =
+// isTransientNotificationBead the fast path skips it, finds no other open
+// member, and the walk fallback (which also honors skip) likewise reports the
+// root idle so the order can re-dispatch.
+func TestStoreHasOpenDescendantsMembershipSkipsTransientNotification(t *testing.T) {
+	store := beads.NewMemStore()
+
+	root, err := store.Create(beads.Bead{
+		Title:  "mol-digest-generate",
+		Type:   "molecule",
+		Labels: []string{"order-run:digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An OPEN stamped transient chore (a mail/message) tied to the root by
+	// membership metadata. Without skip it would be reported as in-flight work.
+	if _, err := store.Create(beads.Bead{
+		Title:    "delivery-mail",
+		Type:     "message",
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without a skip predicate the open transient member counts as in-flight.
+	has, err := storeHasOpenDescendants(store, root.ID, nil)
+	if err != nil {
+		t.Fatalf("storeHasOpenDescendants(nil): %v", err)
+	}
+	if !has {
+		t.Fatal("open stamped member must count as in-flight when skip is nil")
+	}
+
+	// With isTransientNotificationBead the transient chore is skipped on the
+	// membership fast path and must NOT wedge the gate.
+	has, err = storeHasOpenDescendants(store, root.ID, isTransientNotificationBead)
+	if err != nil {
+		t.Fatalf("storeHasOpenDescendants(skip): %v", err)
+	}
+	if has {
+		t.Fatal("open stamped transient-notification bead must not count as in-flight on the membership fast path when skip=isTransientNotificationBead")
+	}
+}
+
+func TestHasOpenWorkStrictFindsOlderInFlightWispBehindOrphanRoots(t *testing.T) {
+	const formerOpenWorkProbeLimit = 50
+
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	rows := []beads.Bead{{
+		ID:        "gc-inflight-root",
+		Title:     "older in-flight wisp",
+		Status:    "open",
+		Type:      "molecule",
+		CreatedAt: base,
+		UpdatedAt: base,
+		Labels:    []string{"order-run:digest"},
+	}, {
+		ID:        "gc-inflight-child",
+		Title:     "still running",
+		Status:    "open",
+		Type:      "task",
+		ParentID:  "gc-inflight-root",
+		CreatedAt: base.Add(time.Second),
+		UpdatedAt: base.Add(time.Second),
+	}}
+	for i := 0; i < formerOpenWorkProbeLimit+1; i++ {
+		created := base.Add(time.Duration(i+2) * time.Second)
+		rows = append(rows, beads.Bead{
+			ID:        fmt.Sprintf("gc-orphan-root-%02d", i),
+			Title:     "newer orphan wisp root",
+			Status:    "open",
+			Type:      "molecule",
+			CreatedAt: created,
+			UpdatedAt: created,
+			Labels:    []string{"order-run:digest"},
+		})
+	}
+	store := beads.NewMemStoreFrom(len(rows), rows, nil)
+
+	ad := &memoryOrderDispatcher{}
+	has, err := ad.hasOpenWorkStrict(store, "digest")
+	if err != nil {
+		t.Fatalf("hasOpenWorkStrict: %v", err)
+	}
+	if !has {
+		t.Fatal("older wisp with open descendants must block even after newer orphan roots exceed the old probe window")
+	}
+}
+
 func TestHasOpenWorkStrictBlocksOnWispWithPartiallyClosedChildren(t *testing.T) {
 	store := beads.NewMemStore()
 
@@ -5846,6 +8028,146 @@ func TestHasOpenWorkStrictBlocksOnGraphWorkflowWispWithOpenDescendant(t *testing
 	}
 }
 
+func TestHasOpenWorkStrictBlocksOnGraphWorkflowTracksDependent(t *testing.T) {
+	store := beads.NewMemStore()
+
+	wispRoot, err := store.Create(beads.Bead{
+		Title:  "graph-workflow-digest",
+		Type:   "task",
+		Labels: []string{"order-run:digest"},
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := store.Create(beads.Bead{
+		Title: "draft-digest",
+		Metadata: map[string]string{
+			"gc.root_bead_id": wispRoot.ID,
+			"gc.step_ref":     "draft",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DepAdd(step.ID, wispRoot.ID, "tracks"); err != nil {
+		t.Fatal(err)
+	}
+
+	ad := &memoryOrderDispatcher{}
+	has, err := ad.hasOpenWorkStrict(store, "digest")
+	if err != nil {
+		t.Fatalf("hasOpenWorkStrict: %v", err)
+	}
+	if !has {
+		t.Fatal("graph workflow wisp with an open tracks dependent must count as in-flight work")
+	}
+}
+
+func TestHasOpenWorkStrictBlocksOnSameWorkflowGraphDependencyTypes(t *testing.T) {
+	for _, depType := range []string{"blocks", "parent-child"} {
+		t.Run(depType, func(t *testing.T) {
+			store := beads.NewMemStore()
+
+			wispRoot, err := store.Create(beads.Bead{
+				Title:  "graph-workflow-digest",
+				Type:   "task",
+				Labels: []string{"order-run:digest"},
+				Metadata: map[string]string{
+					"gc.kind":             "workflow",
+					"gc.formula_contract": "graph.v2",
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			step, err := store.Create(beads.Bead{
+				Title: "draft-digest",
+				Metadata: map[string]string{
+					"gc.root_bead_id": wispRoot.ID,
+					"gc.step_ref":     "draft",
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.DepAdd(step.ID, wispRoot.ID, depType); err != nil {
+				t.Fatal(err)
+			}
+
+			ad := &memoryOrderDispatcher{}
+			has, err := ad.hasOpenWorkStrict(store, "digest")
+			if err != nil {
+				t.Fatalf("hasOpenWorkStrict: %v", err)
+			}
+			if !has {
+				t.Fatalf("graph workflow wisp with an open %s dependent must count as in-flight work", depType)
+			}
+		})
+	}
+}
+
+func TestHasOpenWorkStrictIgnoresForeignGraphDependents(t *testing.T) {
+	tests := []struct {
+		name     string
+		depType  string
+		metadata map[string]string
+	}{
+		{
+			name:    "external convoy tracks edge",
+			depType: "tracks",
+		},
+		{
+			name:    "unrelated downstream blocks edge",
+			depType: "blocks",
+			metadata: map[string]string{
+				"gc.root_bead_id": "other-workflow-root",
+				"gc.step_ref":     "external",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+
+			wispRoot, err := store.Create(beads.Bead{
+				Title:  "graph-workflow-digest",
+				Type:   "task",
+				Labels: []string{"order-run:digest"},
+				Metadata: map[string]string{
+					"gc.kind":             "workflow",
+					"gc.formula_contract": "graph.v2",
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			external, err := store.Create(beads.Bead{
+				Title:    "external-dependent",
+				Metadata: tt.metadata,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.DepAdd(external.ID, wispRoot.ID, tt.depType); err != nil {
+				t.Fatal(err)
+			}
+
+			ad := &memoryOrderDispatcher{}
+			has, err := ad.hasOpenWorkStrict(store, "digest")
+			if err != nil {
+				t.Fatalf("hasOpenWorkStrict: %v", err)
+			}
+			if has {
+				t.Fatalf("foreign %s dependent must not count as in-flight order work", tt.depType)
+			}
+		})
+	}
+}
+
 func TestHasOpenWorkStrictBlocksOnRootOnlyWisp(t *testing.T) {
 	store := beads.NewMemStore()
 
@@ -5951,6 +8273,37 @@ func TestHasOpenWorkStrictPropagatesWispChildListError(t *testing.T) {
 	}
 }
 
+func TestStoreHasOpenDescendantsShortCircuitsOpenParentChildBeforeGraphReads(t *testing.T) {
+	base := beads.NewMemStore()
+
+	wispRoot, err := base.Create(beads.Bead{
+		Title: "graph-workflow-digest",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.Create(beads.Bead{
+		Title:    "direct-open-step",
+		ParentID: wispRoot.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	store := depListFailStore{Store: base, failID: wispRoot.ID}
+	has, err := storeHasOpenDescendants(store, wispRoot.ID, nil)
+	if err != nil {
+		t.Fatalf("storeHasOpenDescendants: %v", err)
+	}
+	if !has {
+		t.Fatal("direct open ParentID child must count as an open descendant")
+	}
+}
+
 // TestOrderDispatchOpenWispWithOpenStepsBlocksRedispatch is the
 // integration-level guard for tr-kds01. The scenario: a periodic
 // formula+pool order whose first dispatch's step beads were never picked
@@ -5995,6 +8348,58 @@ func TestOrderDispatchOpenWispWithOpenStepsBlocksRedispatch(t *testing.T) {
 	if ran {
 		t.Fatal("exec must NOT run — prior wisp has open step beads, " +
 			"the cooldown gate must treat it as in-flight (tr-kds01)")
+	}
+}
+
+func TestOrderDispatchClosedTrackingHistoryStillChecksOpenWispWork(t *testing.T) {
+	store := beads.NewMemStore()
+
+	wispRoot, err := store.Create(beads.Bead{
+		Title:  "mol-digest-generate",
+		Type:   "molecule",
+		Labels: []string{"order-run:my-pool-order"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:    "determine-period",
+		ParentID: wispRoot.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tracking, err := store.Create(beads.Bead{
+		Title:     "order:my-pool-order",
+		Labels:    []string{"order-run:my-pool-order", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(tracking.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	ran := false
+	fakeExec := func(_ context.Context, _, _ string, _ []string) ([]byte, error) {
+		ran = true
+		return nil, nil
+	}
+
+	aa := []orders.Order{{
+		Name:     "my-pool-order",
+		Trigger:  "cooldown",
+		Interval: "1s",
+		Exec:     "scripts/run.sh",
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
+
+	ad.dispatch(context.Background(), t.TempDir(), tracking.CreatedAt.Add(5*time.Second))
+	ad.drain(context.Background())
+
+	if ran {
+		t.Fatal("exec must NOT run — closed order-tracking history must not bypass " +
+			"the strict open-wisp check while prior step work is still open")
 	}
 }
 
@@ -6296,6 +8701,172 @@ func TestOrderExecEnvSetsBeadsActorToOrderName(t *testing.T) {
 	}
 }
 
+// TestOrderExecEnvScrubsAmbientDoltEnvForCityWithoutDoltTarget pins the
+// projection contract the core maintenance scripts' no-Dolt guard relies
+// on: for a city without a canonical Dolt target (e.g. `[beads] provider =
+// "file"`), the order exec env defines every projected GC_DOLT_* key as
+// explicitly empty, so mergeOrderExecEnv drops ambient operator values and
+// Dolt-dependent core orders cannot be aimed at a server outside the city.
+func TestOrderExecEnvScrubsAmbientDoltEnvForCityWithoutDoltTarget(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT_HOST", "ambient.example.internal")
+	t.Setenv("GC_DOLT_PORT", "4406")
+	_ = os.Unsetenv("BEADS_ACTOR")
+
+	cityDir := t.TempDir()
+	target := execStoreTarget{ScopeRoot: cityDir, ScopeKind: "city", Prefix: "pc"}
+	a := orders.Order{Name: "jsonl-export", Trigger: "cooldown", Interval: "15m", Exec: "true"}
+
+	envSlice, err := orderExecEnvWithError(cityDir, nil, target, a)
+	if err != nil {
+		t.Fatalf("orderExecEnvWithError() error = %v", err)
+	}
+	overrides := map[string]string{}
+	for _, entry := range envSlice {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			overrides[key] = value
+		}
+	}
+	for _, key := range []string{"GC_DOLT_HOST", "GC_DOLT_PORT"} {
+		value, defined := overrides[key]
+		if !defined {
+			t.Fatalf("order env does not define %s; ambient controller env would leak through: %v", key, envSlice)
+		}
+		if value != "" {
+			t.Fatalf("%s = %q, want explicitly empty for a city without a dolt target", key, value)
+		}
+	}
+
+	merged := mergeOrderExecEnv([]string{"GC_DOLT_HOST=ambient.example.internal", "GC_DOLT_PORT=4406"}, envSlice)
+	for _, entry := range merged {
+		if entry == "GC_DOLT_PORT=4406" || entry == "GC_DOLT_HOST=ambient.example.internal" {
+			t.Fatalf("ambient dolt env survived merge: %q in %v", entry, merged)
+		}
+	}
+}
+
+// TestOrderExecEnvAppliesOrderEnvOverrides verifies that env entries
+// declared in `[order.env]` on the order TOML reach the dispatched
+// subprocess. This is the per-order tuning knob for threshold env vars
+// (GC_DOCTOR_LATENCY_WARN_S, GC_JSONL_SPIKE_THRESHOLD, etc.) that would
+// otherwise require editing the controller's parent environment.
+func TestOrderExecEnvAppliesOrderEnvOverrides(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+	_ = os.Unsetenv("BEADS_ACTOR")
+
+	cityDir := t.TempDir()
+	target := execStoreTarget{ScopeRoot: cityDir, ScopeKind: "city", Prefix: "pc"}
+	a := orders.Order{
+		Name:     "doctor",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     "true",
+		Env: map[string]string{
+			"GC_DOCTOR_LATENCY_WARN_S": "5",
+			"CUSTOM_ORDER_FLAG":        "yes",
+		},
+	}
+
+	envSlice, err := orderExecEnvWithError(cityDir, nil, target, a)
+	if err != nil {
+		t.Fatalf("orderExecEnvWithError() error = %v", err)
+	}
+
+	wants := []string{
+		"GC_DOCTOR_LATENCY_WARN_S=5",
+		"CUSTOM_ORDER_FLAG=yes",
+	}
+	for _, want := range wants {
+		found := false
+		for _, entry := range envSlice {
+			if entry == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("orderExecEnv missing %q; env=%v", want, envSlice)
+		}
+	}
+}
+
+// TestOrderExecEnvRejectsReservedOrderEnvKeys verifies that `[order.env]`
+// cannot shadow controller-owned routing and identity variables after the
+// store target has already been resolved.
+func TestOrderExecEnvRejectsReservedOrderEnvKeys(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+
+	cityDir := t.TempDir()
+	target := execStoreTarget{ScopeRoot: cityDir, ScopeKind: "city", Prefix: "pc"}
+	for _, key := range []string{
+		"GC_STORE_SCOPE",
+		"ORDER_DIR",
+		"PACK_DIR",
+		"BD_EXPORT_AUTO",
+		"GC_BEADS",
+		"GC_BEADS_SCOPE_ROOT",
+	} {
+		t.Run(key, func(t *testing.T) {
+			a := orders.Order{
+				Name:     "scoped-order",
+				Trigger:  "cooldown",
+				Interval: "1m",
+				Exec:     "true",
+				Env: map[string]string{
+					key: "overridden",
+				},
+			}
+
+			_, err := orderExecEnvWithError(cityDir, nil, target, a)
+			if err == nil {
+				t.Fatal("orderExecEnvWithError() succeeded; want reserved env key error")
+			}
+			if !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "controller-owned") {
+				t.Fatalf("error = %q, want controller-owned %s diagnostic", err, key)
+			}
+		})
+	}
+}
+
+func TestOrderExecEnvReservedKeysCoverProjectedEnv(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+
+	cityDir := t.TempDir()
+	packDir := filepath.Join(cityDir, "packs", "maintenance")
+	target := execStoreTarget{ScopeRoot: cityDir, ScopeKind: "city", Prefix: "pc"}
+	a := orders.Order{
+		Name:         "scoped-order",
+		Trigger:      "cooldown",
+		Interval:     "1m",
+		Exec:         "true",
+		Source:       filepath.Join(packDir, "orders", "scoped-order.toml"),
+		FormulaLayer: filepath.Join(packDir, "formulas"),
+	}
+
+	envSlice, err := orderExecEnvWithError(cityDir, nil, target, a)
+	if err != nil {
+		t.Fatalf("orderExecEnvWithError() error = %v", err)
+	}
+
+	var unreserved []string
+	for _, entry := range envSlice {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if !isReservedOrderExecEnvKey(key) {
+			unreserved = append(unreserved, key)
+		}
+	}
+	if len(unreserved) > 0 {
+		t.Fatalf("projected order exec env keys missing from reserved guard: %v", unreserved)
+	}
+}
+
 // TestOrderExecEnvSkipsBeadsActorForUnnamedOrder guards against accidentally
 // emitting "BEADS_ACTOR=order:" (empty suffix) when an order has no name.
 // The conditional in orderExecEnv prevents that — verified here so future
@@ -6473,10 +9044,10 @@ func TestLockedStderrWrapsNonNil(t *testing.T) {
 	}
 }
 
-// TestOrderDispatchTrackingBeadIsEphemeral asserts the dispatcher routes the
-// tracking bead to the wisps tier (Ephemeral=true), so each cooldown cycle
-// does not produce a full Dolt commit on the permanent issues tier.
-func TestOrderDispatchTrackingBeadIsEphemeral(t *testing.T) {
+// TestOrderDispatchTrackingBeadIsNoHistory asserts the dispatcher routes the
+// tracking bead to the no-history tier, so each cooldown cycle avoids a full
+// Dolt commit while remaining visible to normal issue-tier reads.
+func TestOrderDispatchTrackingBeadIsNoHistory(t *testing.T) {
 	store := beads.NewMemStore()
 
 	aa := []orders.Order{{
@@ -6506,33 +9077,40 @@ func TestOrderDispatchTrackingBeadIsEphemeral(t *testing.T) {
 	if tb == nil {
 		t.Fatal("no tracking bead found")
 	}
-	if !tb.Ephemeral {
-		t.Errorf("tracking bead Ephemeral = false, want true")
+	if tb.Ephemeral || !tb.NoHistory {
+		t.Errorf("tracking bead storage = Ephemeral:%v NoHistory:%v, want no-history only", tb.Ephemeral, tb.NoHistory)
 	}
-	// Tracking bead must NOT be visible to issues-tier-only queries —
-	// that is the whole point of routing it to the wisps tier.
+	// No-history beads remain visible to issue-tier reads, which keeps
+	// bd 1.0.4 ready/list compatibility while avoiding Dolt history pressure.
 	issuesOnly, err := store.ListByLabel("order-run:wisp-order", 0, beads.IncludeClosed)
 	if err != nil {
 		t.Fatal(err)
 	}
+	found := false
 	for _, b := range issuesOnly {
 		if strings.HasPrefix(b.Title, "order:") {
-			t.Errorf("ephemeral tracking bead leaked into issues-tier query: %+v", b)
+			found = true
+			if b.Ephemeral || !b.NoHistory {
+				t.Errorf("issue-tier tracking bead storage = Ephemeral:%v NoHistory:%v, want no-history only", b.Ephemeral, b.NoHistory)
+			}
 		}
+	}
+	if !found {
+		t.Errorf("no-history tracking bead was not visible to issues-tier query")
 	}
 }
 
-// TestOrderDispatchSingleFlightLockSeesEphemeralTracker is the regression
+// TestOrderDispatchSingleFlightLockSeesNoHistoryTracker is the regression
 // guard for the single-flight lock (`hasOpenWorkInStoresStrict`) after the
-// tracking bead moved to the wisps tier. If the lock query were not
+// tracking bead moved out of history. If the lock query were not
 // tier-aware, the dispatcher would re-fire the same cooldown order on the
 // next tick.
-func TestOrderDispatchSingleFlightLockSeesEphemeralTracker(t *testing.T) {
+func TestOrderDispatchSingleFlightLockSeesNoHistoryTracker(t *testing.T) {
 	store := beads.NewMemStore()
 	if _, err := store.Create(beads.Bead{
 		Title:     "order:double-fire",
 		Labels:    []string{"order-run:double-fire", labelOrderTracking},
-		Ephemeral: true,
+		NoHistory: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -6543,7 +9121,31 @@ func TestOrderDispatchSingleFlightLockSeesEphemeralTracker(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !hasOpen {
-		t.Fatal("single-flight lock missed ephemeral tracking bead — would dispatch again")
+		t.Fatal("single-flight lock missed no-history tracking bead; would dispatch again")
+	}
+}
+
+func TestOrderDispatchSingleFlightLockSeesBackingOnlyCachedTracker(t *testing.T) {
+	backing := beads.NewMemStore()
+	store := beads.NewCachingStoreForTest(backing, nil)
+	if err := store.PrimeActive(); err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+	if _, err := backing.Create(beads.Bead{
+		Title:     "order:double-fire",
+		Labels:    []string{"order-run:double-fire", labelOrderTracking},
+		NoHistory: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &memoryOrderDispatcher{}
+	hasOpen, err := m.hasOpenWorkStrict(store, "double-fire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasOpen {
+		t.Fatal("single-flight lock missed backing-only tracking bead behind a primed cache")
 	}
 }
 
@@ -6566,5 +9168,386 @@ func TestOrderDispatchSingleFlightLockFailsClosedOnPartialTierError(t *testing.T
 	}
 	if hasOpen {
 		t.Fatal("hasOpenWorkStrict returned true with partial tier error; caller must fail closed instead")
+	}
+}
+
+// --- dispatch() store-handle close regression tests (ga-anio6p) ---
+//
+// dispatch() must close every store handle it opens each pass via
+// closeBeadStoreHandle, which type-asserts for interface{ CloseStore() error }.
+// The close is deferred to a detached closer goroutine that runs once the
+// in-flight dispatchOne goroutines launched that tick have released the handles
+// (gascity#3157) — closing inline would race those goroutines on a native
+// store's one-way close latch. These tests therefore drain and then poll for
+// the close rather than asserting it synchronously at dispatch() return.
+
+// dispatchCloseStoreSpy wraps MemStore and counts CloseStore() calls. CloseStore
+// runs on dispatch()'s detached closer goroutine, so access to the counter is
+// serialized through closeCount.
+type dispatchCloseStoreSpy struct {
+	*beads.MemStore
+	mu       sync.Mutex
+	closed   int
+	closeErr error
+}
+
+func (s *dispatchCloseStoreSpy) CloseStore() error {
+	s.mu.Lock()
+	s.closed++
+	s.mu.Unlock()
+	return s.closeErr
+}
+
+// closeCount returns how many times CloseStore has been called, synchronized
+// against the detached closer goroutine.
+func (s *dispatchCloseStoreSpy) closeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+// newDispatchCloseStoreSpyFn returns an orderStoreFunc that appends a fresh
+// dispatchCloseStoreSpy to *spies on each call and returns it as a Store.
+func newDispatchCloseStoreSpyFn(spies *[]*dispatchCloseStoreSpy) orderStoreFunc {
+	return func(_ execStoreTarget) (beads.Store, error) {
+		spy := &dispatchCloseStoreSpy{MemStore: beads.NewMemStore()}
+		*spies = append(*spies, spy)
+		return spy, nil
+	}
+}
+
+// waitForDispatchCloseCounts drains the in-flight dispatchOne goroutines, then
+// waits for dispatch()'s detached closer to close every spied handle exactly
+// `want` times. The close lands shortly after drain() returns (gascity#3157),
+// so this polls with a deadline rather than asserting synchronously.
+func waitForDispatchCloseCounts(t *testing.T, m *memoryOrderDispatcher, spies []*dispatchCloseStoreSpy, want int) {
+	t.Helper()
+	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if !m.drain(drainCtx) {
+		t.Fatal("drain timed out waiting for in-flight dispatchOne to finish")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		reached := true
+		for _, spy := range spies {
+			if spy.closeCount() < want {
+				reached = false
+				break
+			}
+		}
+		if reached || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for i, spy := range spies {
+		if got := spy.closeCount(); got != want {
+			t.Errorf("store[%d]: CloseStore() called %d times, want %d", i, got, want)
+		}
+	}
+}
+
+func TestDispatchClosesEveryOpenedStoreHandle(t *testing.T) {
+	var spies []*dispatchCloseStoreSpy
+	m := &memoryOrderDispatcher{
+		aa: []orders.Order{{
+			Name:     "noop",
+			Trigger:  "cooldown",
+			Interval: "1m",
+			Exec:     "true",
+		}},
+		storeFn: newDispatchCloseStoreSpyFn(&spies),
+		execRun: func(_ context.Context, _, _ string, _ []string) ([]byte, error) { return nil, nil },
+		rec:     events.Discard,
+		stderr:  &bytes.Buffer{},
+		cfg:     &config.City{},
+	}
+
+	m.dispatch(context.Background(), t.TempDir(), time.Now())
+
+	if len(spies) == 0 {
+		t.Fatal("storeFn never called: expected at least one store to be opened")
+	}
+	waitForDispatchCloseCounts(t, m, spies, 1)
+}
+
+func TestDispatchClosesRigAndLegacyCityStoreHandles(t *testing.T) {
+	var spies []*dispatchCloseStoreSpy
+	cityPath := t.TempDir()
+	rigPath := t.TempDir()
+
+	m := &memoryOrderDispatcher{
+		aa: []orders.Order{{
+			Name:     "rig-noop",
+			Rig:      "worker",
+			Trigger:  "cooldown",
+			Interval: "1m",
+			Exec:     "true",
+		}},
+		storeFn: newDispatchCloseStoreSpyFn(&spies),
+		execRun: func(_ context.Context, _, _ string, _ []string) ([]byte, error) { return nil, nil },
+		rec:     events.Discard,
+		stderr:  &bytes.Buffer{},
+		cfg: &config.City{
+			Rigs: []config.Rig{{Name: "worker", Path: rigPath}},
+		},
+	}
+
+	m.dispatch(context.Background(), cityPath, time.Now())
+
+	if len(spies) != 2 {
+		t.Fatalf("storeFn called %d times, want 2 (rig + legacy city fallback)", len(spies))
+	}
+	waitForDispatchCloseCounts(t, m, spies, 1)
+}
+
+func TestDispatchDeduplicatesStoreHandlesAcrossOrders(t *testing.T) {
+	var spies []*dispatchCloseStoreSpy
+	m := &memoryOrderDispatcher{
+		aa: []orders.Order{
+			{Name: "order-a", Trigger: "cooldown", Interval: "1m", Exec: "true"},
+			{Name: "order-b", Trigger: "cooldown", Interval: "1m", Exec: "true"},
+		},
+		storeFn: newDispatchCloseStoreSpyFn(&spies),
+		execRun: func(_ context.Context, _, _ string, _ []string) ([]byte, error) { return nil, nil },
+		rec:     events.Discard,
+		stderr:  &bytes.Buffer{},
+		cfg:     &config.City{},
+	}
+
+	m.dispatch(context.Background(), t.TempDir(), time.Now())
+
+	if len(spies) != 1 {
+		t.Fatalf("storeFn called %d times, want 1 (same target deduped across orders)", len(spies))
+	}
+	waitForDispatchCloseCounts(t, m, spies, 1)
+}
+
+func TestDispatchClosesNoStoresWhenCitySuspended(t *testing.T) {
+	var spies []*dispatchCloseStoreSpy
+	m := &memoryOrderDispatcher{
+		aa: []orders.Order{{
+			Name:     "noop",
+			Trigger:  "cooldown",
+			Interval: "1m",
+			Exec:     "true",
+		}},
+		storeFn: newDispatchCloseStoreSpyFn(&spies),
+		execRun: func(_ context.Context, _, _ string, _ []string) ([]byte, error) { return nil, nil },
+		rec:     events.Discard,
+		stderr:  &bytes.Buffer{},
+		cfg:     &config.City{Workspace: config.Workspace{Suspended: true}},
+	}
+
+	m.dispatch(context.Background(), t.TempDir(), time.Now())
+
+	if len(spies) != 0 {
+		t.Errorf("storeFn called %d times, want 0 when city is suspended", len(spies))
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionAcrossStoresBounded_HonorsBudgetAcrossStores(t *testing.T) {
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+	policy := orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}
+	// Each store gets minClosedOrderTrackingRetained+3 beads (48h old, past 24h TTL), so 3 are eligible per store.
+	makeStore := func(prefix string) *beads.MemStore {
+		seed := make([]beads.Bead, 0, minClosedOrderTrackingRetained+3)
+		for i := range minClosedOrderTrackingRetained + 3 {
+			seed = append(seed, beads.Bead{
+				ID:        fmt.Sprintf("%s-%02d", prefix, i),
+				Title:     "order:" + prefix,
+				Status:    "closed",
+				Type:      "task",
+				CreatedAt: now.Add(-48*time.Hour + time.Duration(i)*time.Minute),
+				Labels:    []string{"order-run:" + prefix, labelOrderTracking},
+				Ephemeral: true,
+			})
+		}
+		return beads.NewMemStoreFrom(100, seed, nil)
+	}
+	storeA := makeStore("alpha")
+	storeB := makeStore("beta")
+
+	// limit=4: budget spans both stores (3 eligible each = 6 total), stops at 4.
+	deleted, err := sweepClosedOrderTrackingRetentionAcrossStoresBounded(
+		[]beads.Store{storeA, storeB}, now, policy, nil, 4)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetentionAcrossStoresBounded: %v", err)
+	}
+	if deleted != 4 {
+		t.Fatalf("deleted = %d, want 4 (budget limit)", deleted)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionAcrossStoresBounded_ReturnsPartialCountWithNilErrorOnBudgetExhaustion(t *testing.T) {
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+	policy := orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}
+	seed := make([]beads.Bead, 0, minClosedOrderTrackingRetained+5)
+	for i := range minClosedOrderTrackingRetained + 5 {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("ga-%02d", i),
+			Title:     "order:ga",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: now.Add(-48*time.Hour + time.Duration(i)*time.Minute),
+			Labels:    []string{"order-run:ga", labelOrderTracking},
+			Ephemeral: true,
+		})
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	// limit=2, 5 eligible: returns 2 with nil error.
+	deleted, err := sweepClosedOrderTrackingRetentionAcrossStoresBounded(
+		[]beads.Store{store}, now, policy, nil, 2)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetentionAcrossStoresBounded: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2 (budget limit)", deleted)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionAcrossStoresBounded_DoesNotBypassRetainFloor(t *testing.T) {
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+	policy := orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}
+	// Exactly minClosedOrderTrackingRetained beads — all at the floor, none eligible.
+	seed := make([]beads.Bead, 0, minClosedOrderTrackingRetained)
+	for i := range minClosedOrderTrackingRetained {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("floor-%02d", i),
+			Title:     "order:floor",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: now.Add(-48*time.Hour + time.Duration(i)*time.Minute),
+			Labels:    []string{"order-run:floor", labelOrderTracking},
+			Ephemeral: true,
+		})
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	deleted, err := sweepClosedOrderTrackingRetentionAcrossStoresBounded(
+		[]beads.Store{store}, now, policy, nil, 100)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetentionAcrossStoresBounded: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("deleted = %d, want 0 (retain-10 floor must hold)", deleted)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionAcrossStoresBounded_ZeroLimitDeletesNothing(t *testing.T) {
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+	policy := orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}
+	seed := make([]beads.Bead, 0, minClosedOrderTrackingRetained+3)
+	for i := range minClosedOrderTrackingRetained + 3 {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("zero-%02d", i),
+			Title:     "order:zero",
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: now.Add(-48*time.Hour + time.Duration(i)*time.Minute),
+			Labels:    []string{"order-run:zero", labelOrderTracking},
+			Ephemeral: true,
+		})
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	deleted, err := sweepClosedOrderTrackingRetentionAcrossStoresBounded(
+		[]beads.Store{store}, now, policy, nil, 0)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetentionAcrossStoresBounded: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("deleted = %d, want 0 (limit=0 means no budget)", deleted)
+	}
+}
+
+// TestLastRunFuncGatesFallbackOnIndexMiss pins #3201: the per-order fallback
+// (a serial bd-query) must fire only on a genuine index miss. An index hit must
+// return the indexed time without consulting the fallback — otherwise every
+// cooldown/cron order pays the query on each cold-cache dispatch and hangs
+// gc reload/gc doctor.
+func TestLastRunFuncGatesFallbackOnIndexMiss(t *testing.T) {
+	store := beads.NewMemStore()
+	const storeKey = "city"
+	idx := newOrderDispatchTrackingIndex()
+	indexed := time.Now().Add(-time.Hour)
+	// Pre-seed the history index so lastRunForStore reads it without listing
+	// the store. The "\x00history" suffix matches historyEntriesForStore's key.
+	idx.entries[storeKey+"\x00history"] = map[string]orderTrackingSummary{
+		"order-hit": {lastRun: indexed},
+	}
+
+	fallbackCalls := 0
+	fallbackTime := time.Now() // deliberately newer than the indexed entry
+	fallback := func(string) (time.Time, error) {
+		fallbackCalls++
+		return fallbackTime, nil
+	}
+	fn := idx.lastRunFunc([]beads.Store{store}, []string{storeKey}, fallback)
+
+	got, err := fn("order-hit")
+	if err != nil {
+		t.Fatalf("lastRunFunc(order-hit): %v", err)
+	}
+	if !got.Equal(indexed) {
+		t.Errorf("index hit returned %v, want indexed %v", got, indexed)
+	}
+	if fallbackCalls != 0 {
+		t.Errorf("index hit invoked fallback %d times, want 0 (the cold-cache storm)", fallbackCalls)
+	}
+
+	got, err = fn("order-miss")
+	if err != nil {
+		t.Fatalf("lastRunFunc(order-miss): %v", err)
+	}
+	if !got.Equal(fallbackTime) {
+		t.Errorf("index miss returned %v, want fallback %v", got, fallbackTime)
+	}
+	if fallbackCalls != 1 {
+		t.Errorf("index miss invoked fallback %d times, want 1", fallbackCalls)
+	}
+}
+
+// TestCarryLastRunCacheFrom pins the #3201 complement: a rebuilt dispatcher
+// inherits warm last-run entries (forward-only) from its predecessor, and a
+// nil/empty predecessor is a no-op.
+func TestCarryLastRunCacheFrom(t *testing.T) {
+	keys := []string{"city"}
+	older := time.Now().Add(-2 * time.Hour)
+	newer := time.Now().Add(-time.Hour)
+
+	prev := &memoryOrderDispatcher{}
+	prev.rememberLastRun("order-a", keys, newer)
+	prev.rememberLastRun("order-b", keys, older)
+
+	next := &memoryOrderDispatcher{}
+	next.rememberLastRun("order-a", keys, older) // stale; carry must advance it
+	next.carryLastRunCacheFrom(prev)
+
+	if got := next.lastRunCache[orderHistoryCacheKey("order-a", keys)]; !got.Equal(newer) {
+		t.Errorf("order-a = %v, want newer %v (forward-only carry)", got, newer)
+	}
+	if got := next.lastRunCache[orderHistoryCacheKey("order-b", keys)]; !got.Equal(older) {
+		t.Errorf("order-b = %v, want %v", got, older)
+	}
+
+	next.carryLastRunCacheFrom(&memoryOrderDispatcher{}) // empty source
+	next.carryLastRunCacheFrom(nil)                      // nil source
+	if len(next.lastRunCache) != 2 {
+		t.Errorf("cache size = %d after no-op carries, want 2", len(next.lastRunCache))
 	}
 }

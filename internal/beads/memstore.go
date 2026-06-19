@@ -19,6 +19,8 @@ type MemStore struct {
 	seq   int
 }
 
+var _ ConditionalAssignmentReleaser = (*MemStore)(nil)
+
 // NewMemStore returns a new empty MemStore.
 func NewMemStore() *MemStore {
 	return &MemStore{}
@@ -61,6 +63,8 @@ func (m *MemStore) snapshot() (int, []Bead, []Dep) {
 // and the store.
 func cloneBead(b Bead) Bead {
 	b.Priority = cloneIntPtr(b.Priority)
+	b.DeferUntil = cloneTimePtr(b.DeferUntil)
+	b.IsBlocked = cloneBoolPtr(b.IsBlocked)
 	b.Metadata = maps.Clone(b.Metadata)
 	b.Labels = slices.Clone(b.Labels)
 	b.Needs = slices.Clone(b.Needs)
@@ -160,6 +164,26 @@ func (m *MemStore) Update(id string, opts UpdateOpts) error {
 		}
 	}
 	return fmt.Errorf("updating bead %q: %w", id, ErrNotFound)
+}
+
+// ReleaseIfCurrent clears an in-progress assignment only when the bead still
+// has the expected assignee.
+func (m *MemStore) ReleaseIfCurrent(id, expectedAssignee string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.beads {
+		if m.beads[i].ID != id {
+			continue
+		}
+		if m.beads[i].Status != "in_progress" || m.beads[i].Assignee != expectedAssignee {
+			return false, nil
+		}
+		m.beads[i].Status = "open"
+		m.beads[i].Assignee = ""
+		m.beads[i].UpdatedAt = time.Now()
+		return true, nil
+	}
+	return false, nil
 }
 
 // Close sets a bead's status to "closed". Returns a wrapped ErrNotFound if
@@ -267,14 +291,9 @@ func (m *MemStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	}
 
 	var result []Bead
+	now := time.Now().UTC()
 	for _, b := range m.beads {
-		if b.Status != "open" {
-			continue
-		}
-		if b.Ephemeral {
-			continue
-		}
-		if IsReadyExcludedType(b.Type) {
+		if !IsReadyCandidateForTier(b, now, q.TierMode) {
 			continue
 		}
 		if q.Assignee != "" && b.Assignee != q.Assignee {
@@ -326,6 +345,7 @@ func (m *MemStore) Children(parentID string, opts ...QueryOpt) ([]Bead, error) {
 		ParentID:      parentID,
 		IncludeClosed: HasOpt(opts, IncludeClosed),
 		Sort:          SortCreatedAsc,
+		TierMode:      TierModeFromOpts(opts),
 	})
 }
 
@@ -479,6 +499,23 @@ func (m *MemStore) DepList(id, direction string) ([]Dep, error) {
 			if d.IssueID == id {
 				result = append(result, d)
 			}
+		}
+	}
+	return result, nil
+}
+
+// DepListBatch returns "down" dependencies for multiple beads from memory.
+func (m *MemStore) DepListBatch(ids []string) (map[string][]Dep, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idSet := make(map[string]struct{}, len(ids))
+	result := make(map[string][]Dep, len(ids))
+	for _, id := range ids {
+		idSet[id] = struct{}{}
+	}
+	for _, d := range m.deps {
+		if _, ok := idSet[d.IssueID]; ok {
+			result[d.IssueID] = append(result[d.IssueID], d)
 		}
 	}
 	return result, nil

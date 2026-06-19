@@ -12,8 +12,10 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -55,14 +57,16 @@ func observeStatusTargetsParallel(
 }
 
 type cityStatusSnapshot struct {
-	CityName      string
-	CityPath      string
-	Controller    ControllerJSON
-	Suspended     bool
-	Agents        []cityStatusAgentRow
-	Rigs          []StatusRigJSON
-	NamedSessions []cityStatusNamedSession
-	Summary       StatusSummaryJSON
+	CityName        string
+	CityPath        string
+	EffectiveAPIURL string
+	Controller      ControllerJSON
+	Suspended       bool
+	Beads           *beads.BeadsDiagnostic
+	Agents          []cityStatusAgentRow
+	Rigs            []StatusRigJSON
+	NamedSessions   []cityStatusNamedSession
+	Summary         StatusSummaryJSON
 }
 
 type cityStatusAgentRow struct {
@@ -84,19 +88,19 @@ type rigStatusCounts struct {
 	Suspended int
 }
 
-func openCityStatusStore(cityPath string, stderr io.Writer) (beads.Store, int) {
+func openCityStatusStore(cityPath string, stderr io.Writer) (beads.Store, *beads.BeadsDiagnostic, int) {
 	if cityPath == "" {
-		return nil, 0
+		return nil, nil, 0
 	}
 	if !cityStatusStorePresent(cityPath) {
-		return nil, 0
+		return nil, nil, 0
 	}
 	opened, err := openCityStoreAtForStatus(cityPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc status: opening bead store: %v\n", err) //nolint:errcheck // best-effort stderr
-		return nil, 1
+		return nil, nil, 1
 	}
-	return opened, 0
+	return opened.Store, diagnosticPtr(opened.Diagnostic), 0
 }
 
 func cityStatusStorePresent(cityPath string) bool {
@@ -153,14 +157,16 @@ func collectCityStatusSnapshotFromStoreSnapshot(
 	statusSnapshot *sessionBeadSnapshot,
 	stderr io.Writer,
 ) cityStatusSnapshot {
+	citySt, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
 	suspended := os.Getenv("GC_SUSPENDED") == "1"
 	if cfg != nil {
-		suspended = citySuspended(cfg)
+		suspended = citySuspendedWithState(cfg, citySt)
 	}
 	snapshot := cityStatusSnapshot{
-		CityPath:   cityPath,
-		Controller: controllerStatusForCity(cityPath),
-		Suspended:  suspended,
+		CityPath:        cityPath,
+		EffectiveAPIURL: resolveEffectiveAPIURL(cityPath, cfg),
+		Controller:      controllerStatusForCity(cityPath),
+		Suspended:       suspended,
 	}
 	snapshot.CityName = loadedCityName(cfg, cityPath)
 	registerStatusProviderACPRoutes(sp, statusSnapshot, snapshot.CityName, cfg)
@@ -171,12 +177,8 @@ func collectCityStatusSnapshotFromStoreSnapshot(
 		return snapshot
 	}
 
-	suspendedRigs := make(map[string]bool, len(cfg.Rigs))
-	for _, r := range cfg.Rigs {
-		if r.Suspended {
-			suspendedRigs[r.Name] = true
-		}
-	}
+	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
+	suspendedRigs := buildEffectiveSuspendedRigNames(cfg, suspState)
 
 	rigCounts := make(map[string]*rigStatusCounts, len(cfg.Rigs))
 	addRigCount := func(rigName string, rowSuspended bool) {
@@ -282,7 +284,7 @@ func collectCityStatusSnapshotFromStoreSnapshot(
 	}
 
 	for _, r := range cfg.Rigs {
-		suspended := r.Suspended
+		suspended := suspendedRigs[r.Name]
 		if !suspended {
 			if tally := rigCounts[r.Name]; tally != nil && tally.Total > 0 && tally.Total == tally.Suspended {
 				suspended = true
@@ -300,7 +302,7 @@ func collectCityStatusSnapshotFromStoreSnapshot(
 	for _, ns := range cfg.NamedSessions {
 		identity := ns.QualifiedName()
 		mode := ns.ModeOrDefault()
-		status := namedSessionStatusForCity(cityPath, cfg, store, statusSnapshot, snapshot.CityName, identity, mode, suspendedRigs)
+		status := namedSessionStatusForCity(cityPath, cfg, store, statusSnapshot, snapshot.CityName, identity, mode, suspState, suspendedRigs)
 		snapshot.NamedSessions = append(snapshot.NamedSessions, cityStatusNamedSession{
 			Identity: identity,
 			Status:   status,
@@ -319,11 +321,12 @@ func namedSessionStatusForCity(
 	cityName string,
 	identity string,
 	mode string,
+	suspState suspensionstate.State,
 	suspendedRigs map[string]bool,
 ) string {
 	status := "reserved-unmaterialized"
 	if spec, ok := findNamedSessionSpec(cfg, cityName, identity); ok {
-		if mode == "always" && namedSessionBlockedBySuspension(cfg, spec.Agent, suspendedRigs) {
+		if mode == "always" && namedSessionBlockedBySuspension(cfg, spec.Agent, suspState, suspendedRigs) {
 			status = "degraded blocked"
 		}
 	}
@@ -450,15 +453,26 @@ func cityStatusJSONFromSnapshot(snapshot cityStatusSnapshot, summary StatusSumma
 		Running:       running,
 		Suspended:     snapshot.Suspended,
 		Health:        HealthJSON{Usable: running && !snapshot.Suspended, Degraded: degraded, Signals: signals},
+		Beads:         snapshot.Beads,
 		Agents:        agents,
 		Rigs:          rigs,
 		Summary:       summary,
 	}
 }
 
+func diagnosticPtr(diagnostic beads.BeadsDiagnostic) *beads.BeadsDiagnostic {
+	if diagnostic.Store == "" && !diagnostic.NativeStoreEligible && diagnostic.PreflightGate == "" && diagnostic.PreflightReason == "" {
+		return nil
+	}
+	return &diagnostic
+}
+
 func renderCityStatusText(snapshot cityStatusSnapshot, dops drainOps, stdout io.Writer) {
 	fmt.Fprintf(stdout, "%s  %s\n", snapshot.CityName, snapshot.CityPath)                //nolint:errcheck // best-effort stdout
 	fmt.Fprintf(stdout, "  Controller: %s\n", controllerStatusLine(snapshot.Controller)) //nolint:errcheck // best-effort stdout
+	if snapshot.EffectiveAPIURL != "" {
+		fmt.Fprintf(stdout, "  API:        %s\n", snapshot.EffectiveAPIURL) //nolint:errcheck // best-effort stdout
+	}
 	for _, line := range controllerStatusGuidance(snapshot.Controller, snapshot.CityPath) {
 		fmt.Fprintf(stdout, "  %s\n", line) //nolint:errcheck // best-effort stdout
 	}

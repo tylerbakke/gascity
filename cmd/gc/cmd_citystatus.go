@@ -12,24 +12,26 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/worker"
 	"github.com/spf13/cobra"
 )
 
-// StatusJSON is the JSON output format for "gc status --json".
+// StatusJSON is the JSON output format for gc status.
 type StatusJSON struct {
-	SchemaVersion string            `json:"schema_version"`
-	OK            bool              `json:"ok"`
-	CityName      string            `json:"city_name"`
-	Workspace     WorkspaceJSON     `json:"workspace"`
-	CityPath      string            `json:"city_path"`
-	Controller    ControllerJSON    `json:"controller"`
-	Running       bool              `json:"running"`
-	Suspended     bool              `json:"suspended"`
-	Health        HealthJSON        `json:"health"`
-	Agents        []StatusAgentJSON `json:"agents"`
-	Rigs          []StatusRigJSON   `json:"rigs"`
-	Summary       StatusSummaryJSON `json:"summary"`
+	SchemaVersion string                 `json:"schema_version"`
+	OK            bool                   `json:"ok"`
+	CityName      string                 `json:"city_name"`
+	Workspace     WorkspaceJSON          `json:"workspace"`
+	CityPath      string                 `json:"city_path"`
+	Controller    ControllerJSON         `json:"controller"`
+	Running       bool                   `json:"running"`
+	Suspended     bool                   `json:"suspended"`
+	Health        HealthJSON             `json:"health"`
+	Beads         *beads.BeadsDiagnostic `json:"beads,omitempty"`
+	Agents        []StatusAgentJSON      `json:"agents"`
+	Rigs          []StatusRigJSON        `json:"rigs"`
+	Summary       StatusSummaryJSON      `json:"summary"`
 }
 
 type WorkspaceJSON struct {
@@ -100,7 +102,7 @@ type StoreHealth struct {
 
 var (
 	observeSessionTargetForStatus = workerObserveSessionTargetWithConfig
-	openCityStoreAtForStatus      = openCityStoreAt
+	openCityStoreAtForStatus      = openCityStoreResultAt
 )
 
 var (
@@ -112,6 +114,7 @@ var (
 // newStatusCmd creates the "gc status [path]" command.
 func newStatusCmd(stdout, stderr io.Writer) *cobra.Command {
 	var jsonFlag bool
+	var formatFlag string
 	cmd := &cobra.Command{
 		Use:   "status [path]",
 		Short: "Show city-wide status overview",
@@ -119,13 +122,21 @@ func newStatusCmd(stdout, stderr io.Writer) *cobra.Command {
 all agents with running status, rigs, and a summary count.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdCityStatus(args, jsonFlag, stdout, stderr) != 0 {
+			format := strings.ToLower(strings.TrimSpace(formatFlag))
+			switch format {
+			case "", "text", "json":
+			default:
+				fmt.Fprintf(stderr, "gc status: unsupported format %q\n", formatFlag) //nolint:errcheck // best-effort stderr
+				return errExit
+			}
+			if cmdCityStatus(args, jsonFlag || format == "json", stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "Output in JSON format")
+	cmd.Flags().StringVar(&formatFlag, "format", "", "Output format: text or json")
 	return cmd
 }
 
@@ -159,7 +170,7 @@ func cmdCityStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) int
 	if jsonOutput {
 		storeStderr = io.Discard
 	}
-	store, code := openCityStatusStore(cityPath, storeStderr)
+	store, _, code := openCityStatusStore(cityPath, storeStderr)
 	if code != 0 {
 		if jsonOutput {
 			return writeJSONError(stdout, stderr, "store_open_failed", "gc status: opening bead store failed", code)
@@ -213,13 +224,13 @@ func routeCityStatus(
 	} else {
 		logRoute(stderr, cmdName, "fallback", nilReason)
 	}
-	store, code := openCityStatusStore(cityPath, stderr)
+	store, diagnostic, code := openCityStatusStore(cityPath, stderr)
 	if code != 0 {
 		return code
 	}
 	statusSnapshot := loadStatusSessionSnapshot(store, stderr)
 	if jsonOutput {
-		return doCityStatusJSONWithStoreAndSnapshot(sp, cfg, cityPath, store, statusSnapshot, stdout, stderr)
+		return doCityStatusJSONWithDiagnosticAndSnapshot(sp, cfg, cityPath, store, diagnostic, statusSnapshot, stdout, stderr)
 	}
 	return doCityStatusWithStoreAndSnapshot(sp, dops, cfg, cityPath, store, statusSnapshot, stdout, stderr)
 }
@@ -258,6 +269,7 @@ func snapshotFromStatusView(cityPath string, v api.StatusView) cityStatusSnapsho
 		CityPath:   v.CityPath,
 		Suspended:  v.Suspended,
 		Controller: controllerStatusForCity(cityPath),
+		Beads:      v.Beads,
 		Summary: StatusSummaryJSON{
 			TotalAgents:       v.Summary.TotalAgents,
 			RunningAgents:     v.Summary.RunningAgents,
@@ -393,7 +405,7 @@ func loadStatusSessionSnapshot(store beads.Store, stderr io.Writer) *sessionBead
 			if stderr != nil {
 				fmt.Fprintf(stderr, "gc status: loading session snapshot: %v\n", result.err) //nolint:errcheck // best-effort stderr
 			}
-			return newSessionBeadSnapshotWithError(nil, fmt.Errorf("loading session snapshot: %w", result.err))
+			return newSessionBeadSnapshotWithError(fmt.Errorf("loading session snapshot: %w", result.err))
 		}
 		if result.snapshot == nil {
 			return newSessionBeadSnapshot(nil)
@@ -403,7 +415,7 @@ func loadStatusSessionSnapshot(store beads.Store, stderr io.Writer) *sessionBead
 		if stderr != nil {
 			fmt.Fprintf(stderr, "gc status: loading session snapshot timed out after %s; continuing with runtime-only status\n", statusSessionSnapshotTimeout) //nolint:errcheck // best-effort stderr
 		}
-		return newSessionBeadSnapshotWithError(nil, fmt.Errorf("loading session snapshot timed out after %s", statusSessionSnapshotTimeout))
+		return newSessionBeadSnapshotWithError(fmt.Errorf("loading session snapshot timed out after %s", statusSessionSnapshotTimeout))
 	}
 }
 
@@ -438,11 +450,11 @@ func statusObservationTargetForIdentity(
 	}
 }
 
-func namedSessionBlockedBySuspension(cfg *config.City, agentCfg *config.Agent, suspendedRigs map[string]bool) bool {
+func namedSessionBlockedBySuspension(cfg *config.City, agentCfg *config.Agent, suspState suspensionstate.State, suspendedRigs map[string]bool) bool {
 	if cfg == nil {
 		return false
 	}
-	if citySuspended(cfg) {
+	if citySuspendedWithState(cfg, suspState) {
 		return true
 	}
 	if agentCfg == nil {
@@ -460,7 +472,7 @@ func doCityStatus(
 	cityPath string,
 	stdout, stderr io.Writer,
 ) int {
-	store, code := openCityStatusStore(cityPath, stderr)
+	store, _, code := openCityStatusStore(cityPath, stderr)
 	if code != 0 {
 		return code
 	}
@@ -510,22 +522,24 @@ func doCityStatusJSON(
 	cityPath string,
 	stdout, stderr io.Writer,
 ) int {
-	store, code := openCityStatusStore(cityPath, stderr)
+	store, diagnostic, code := openCityStatusStore(cityPath, stderr)
 	if code != 0 {
 		return code
 	}
-	return doCityStatusJSONWithStoreAndSnapshot(sp, cfg, cityPath, store, loadStatusSessionSnapshot(store, stderr), stdout, stderr)
+	return doCityStatusJSONWithDiagnosticAndSnapshot(sp, cfg, cityPath, store, diagnostic, loadStatusSessionSnapshot(store, stderr), stdout, stderr)
 }
 
-func doCityStatusJSONWithStoreAndSnapshot(
+func doCityStatusJSONWithDiagnosticAndSnapshot(
 	sp runtime.Provider,
 	cfg *config.City,
 	cityPath string,
 	store beads.Store,
+	diagnostic *beads.BeadsDiagnostic,
 	statusSnapshot *sessionBeadSnapshot,
 	stdout, stderr io.Writer,
 ) int {
 	snapshot := collectCityStatusSnapshotFromStoreSnapshot(sp, cfg, cityPath, store, statusSnapshot, stderr)
+	snapshot.Beads = diagnostic
 	// Track session-snapshot degradation so we can emit the JSON payload AND
 	// signal the failure via exit code. Restores the pre-#2005 contract that
 	// monitoring callers rely on (see #2147).

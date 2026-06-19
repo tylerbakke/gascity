@@ -70,6 +70,89 @@ func TestSessionLogAdapterLoadHistoryClaude(t *testing.T) {
 	}
 }
 
+func TestSessionLogAdapterLoadHistoryAntigravityOpenToolUseIDs(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	writeLines(t, path,
+		`{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-04-04T09:00:01Z","content":"checking","tool_calls":[{"id":"call-open","name":"Read","args":{"path":"README.md"}}]}`,
+	)
+
+	snapshot, err := SessionLogAdapter{}.LoadHistory(LoadRequest{
+		Provider:       "antigravity/tmux-cli",
+		TranscriptPath: path,
+	})
+	if err != nil {
+		t.Fatalf("LoadHistory() error = %v", err)
+	}
+
+	if len(snapshot.TailState.OpenToolUseIDs) != 1 || snapshot.TailState.OpenToolUseIDs[0] != "call-open" {
+		t.Fatalf("OpenToolUseIDs = %#v, want [call-open]", snapshot.TailState.OpenToolUseIDs)
+	}
+}
+
+func TestSessionLogAdapterLoadHistoryAntigravityCompletedToolUseIDs(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	writeLines(t, path,
+		`{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-04-04T09:00:01Z","content":"checking","tool_calls":[{"id":"call-done","name":"Read","args":{"path":"README.md"}}]}`,
+		`{"step_index":2,"type":"READ_FILE","created_at":"2026-04-04T09:00:02Z","tool_call_id":"call-done","content":"file data"}`,
+	)
+
+	snapshot, err := SessionLogAdapter{}.LoadHistory(LoadRequest{
+		Provider:       "antigravity/tmux-cli",
+		TranscriptPath: path,
+	})
+	if err != nil {
+		t.Fatalf("LoadHistory() error = %v", err)
+	}
+
+	if len(snapshot.TailState.OpenToolUseIDs) != 0 {
+		t.Fatalf("OpenToolUseIDs = %#v, want none for completed tool use", snapshot.TailState.OpenToolUseIDs)
+	}
+}
+
+func TestSessionLogAdapterReadTranscriptAntigravityHonorsCursors(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	writeLines(t, path,
+		`{"step_index":0,"type":"USER_INPUT","created_at":"2026-04-04T09:00:00Z","content":"first"}`,
+		`{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-04-04T09:00:01Z","content":"second"}`,
+		`{"step_index":2,"type":"USER_INPUT","created_at":"2026-04-04T09:00:02Z","content":"third"}`,
+		`{"step_index":3,"type":"PLANNER_RESPONSE","created_at":"2026-04-04T09:00:03Z","content":"fourth"}`,
+	)
+
+	older, err := SessionLogAdapter{}.ReadTranscript(TranscriptRequest{
+		Provider:       "antigravity/tmux-cli",
+		TranscriptPath: path,
+		BeforeEntryID:  "agy-2",
+	})
+	if err != nil {
+		t.Fatalf("ReadTranscript older: %v", err)
+	}
+	if got := transcriptEntryIDs(older); strings.Join(got, ",") != "agy-0,agy-1" {
+		t.Fatalf("older Antigravity transcript IDs = %v, want [agy-0 agy-1]", got)
+	}
+
+	rawNewer, err := SessionLogAdapter{}.ReadTranscript(TranscriptRequest{
+		Provider:       "antigravity/tmux-cli",
+		TranscriptPath: path,
+		AfterEntryID:   "agy-2",
+		Raw:            true,
+	})
+	if err != nil {
+		t.Fatalf("ReadTranscript raw newer: %v", err)
+	}
+	if got := transcriptEntryIDs(rawNewer); strings.Join(got, ",") != "agy-3" {
+		t.Fatalf("raw newer Antigravity transcript IDs = %v, want [agy-3]", got)
+	}
+	if len(rawNewer.RawMessages) != 1 {
+		t.Fatalf("raw newer RawMessages = %d, want 1", len(rawNewer.RawMessages))
+	}
+}
+
 func TestSessionLogAdapterDiscoverTranscriptExplicitIDFailsClosed(t *testing.T) {
 	t.Parallel()
 
@@ -91,6 +174,14 @@ func TestSessionLogAdapterDiscoverTranscriptExplicitIDFailsClosed(t *testing.T) 
 	if discovered != "" {
 		t.Fatalf("DiscoverTranscript() = %q, want empty string when explicit session ID is missing", discovered)
 	}
+}
+
+func transcriptEntryIDs(result *TranscriptResult) []string {
+	ids := make([]string, 0, len(result.Session.Messages))
+	for _, entry := range result.Session.Messages {
+		ids = append(ids, entry.UUID)
+	}
+	return ids
 }
 
 func TestSessionLogAdapterDiscoverTranscriptKimiKeyedMissFailsClosed(t *testing.T) {
@@ -151,6 +242,34 @@ func TestSessionLogAdapterDiscoverTranscriptPiExplicitIDFailsClosed(t *testing.T
 	discovered := adapter.DiscoverTranscript("pi/tmux-cli", workDir, "missing-session")
 	if discovered != "" {
 		t.Fatalf("DiscoverTranscript() = %q, want empty string when explicit Pi session ID is missing", discovered)
+	}
+}
+
+func TestSessionLogAdapterDiscoverTranscriptAntigravityProvisionalIDUsesLastConversation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	workDir := filepath.Join(t.TempDir(), "antigravity-project")
+	fixtureRoot := t.TempDir()
+	brainRoot := filepath.Join(fixtureRoot, "brain")
+	convID := "750fa972-4c56-4215-99b9-893382aee2b4"
+	path := filepath.Join(brainRoot, convID, ".system_generated", "logs", "transcript.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	writeLines(t, path, `{"step_index":0,"type":"USER_INPUT","content":"hello"}`)
+
+	cachePath := filepath.Join(fixtureRoot, "cache", "last_conversations.json")
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		t.Fatalf("mkdir cache dir: %v", err)
+	}
+	if err := os.WriteFile(cachePath, []byte(fmt.Sprintf("{%q:%q}\n", workDir, convID)), 0o644); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+
+	adapter := SessionLogAdapter{SearchPaths: []string{brainRoot}}
+	discovered := adapter.DiscoverTranscript("antigravity/tmux-cli", workDir, "gc-1")
+	if discovered != path {
+		t.Fatalf("DiscoverTranscript() = %q, want %q", discovered, path)
 	}
 }
 

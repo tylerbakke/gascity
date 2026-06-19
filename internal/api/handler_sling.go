@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/execenv"
+	gitpkg "github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
@@ -172,6 +174,10 @@ func (s *Server) execSling(ctx context.Context, body slingBody, _ string) (*slin
 		var crossRigErr *sling.CrossRigError
 		if errors.As(err, &crossRigErr) {
 			return nil, http.StatusBadRequest, "cross_rig", err.Error(), nil
+		}
+		var crossStoreErr *sling.CrossStoreRouteError
+		if errors.As(err, &crossStoreErr) {
+			return nil, http.StatusBadRequest, "cross_store", err.Error(), nil
 		}
 		return nil, http.StatusBadRequest, "invalid", err.Error(), nil
 	}
@@ -385,8 +391,12 @@ func (r apiBranchResolver) DefaultBranch(dir string) string {
 	}
 	// Best-effort: read git's origin/HEAD ref for the default branch.
 	// Falls back to empty string if git is unavailable.
-	out, err := exec.CommandContext(context.Background(), "git", "-C", dir,
-		"symbolic-ref", "--short", "refs/remotes/origin/HEAD").Output()
+	cmd := exec.CommandContext(context.Background(), "git", "-C", dir,
+		"symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	// Sanitize the environment so a leaked GIT_DIR from a parent repo or hook
+	// cannot redirect resolution to the wrong repository's default branch.
+	cmd.Env = gitpkg.SanitizedEnv()
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -437,7 +447,7 @@ func (r apiBeadRouter) Route(_ context.Context, req sling.RouteRequest) error {
 	if cfg != nil {
 		routedTo = agentutil.NormalizePoolRouteTarget(cfg, req.Target)
 	}
-	if err := r.store.SetMetadata(req.BeadID, "gc.routed_to", routedTo); err != nil {
+	if err := r.store.SetMetadata(req.BeadID, beadmeta.RoutedToMetadataKey, routedTo); err != nil {
 		if req.Force && errors.Is(err, beads.ErrNotFound) {
 			return nil
 		}

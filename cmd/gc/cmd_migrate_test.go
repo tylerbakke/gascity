@@ -16,10 +16,10 @@ func TestDoImportMigrateIsDeprecatedShim(t *testing.T) {
 	}
 	for _, want := range []string{
 		"gc import migrate has been deprecated",
-		`Use "gc doctor" to inspect legacy PackV1 surfaces.`,
+		`Use "gc doctor" to inspect legacy pack surfaces.`,
 		`Use "gc doctor --fix" for the safe mechanical cases that currently have automatic rewrites`,
-		"in-place PackV1-to-PackV2 rewrites",
-		"docs/guides/migrating-to-pack-vnext.md",
+		"in-place legacy-to-current pack rewrites",
+		"docs/guides/shareable-packs.md",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())

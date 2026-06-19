@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/processgroup/processgrouptest"
 	otellog "go.opentelemetry.io/otel/log"
 	otellogglobal "go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
@@ -47,6 +48,12 @@ func TestBDCommandTimeoutForReadCommands(t *testing.T) {
 	if got := bdCommandTimeoutFor("bd", []string{"ready", "--json"}); got != bdReadCommandTimeout {
 		t.Fatalf("bd ready timeout = %s, want %s", got, bdReadCommandTimeout)
 	}
+	if got := bdCommandTimeoutFor("bd", []string{"sql", "select 1", "--json"}); got != bdReadCommandTimeout {
+		t.Fatalf("bd sql timeout = %s, want %s", got, bdReadCommandTimeout)
+	}
+	if got := bdCommandTimeoutFor("bd", []string{"version"}); got != bdReadCommandTimeout {
+		t.Fatalf("bd version timeout = %s, want %s", got, bdReadCommandTimeout)
+	}
 	if got := bdCommandTimeoutFor("bd", []string{"update", "gc-1", "--status", "open"}); got != bdCommandTimeout {
 		t.Fatalf("bd update timeout = %s, want %s", got, bdCommandTimeout)
 	}
@@ -58,6 +65,22 @@ func TestBDCommandTimeoutForReadCommands(t *testing.T) {
 func TestBDCommandTimeoutForGraphApply(t *testing.T) {
 	if got := bdCommandTimeoutFor("bd", []string{"create", "--graph", "/tmp/plan.json", "--json"}); got != bdGraphApplyCommandTimeout {
 		t.Fatalf("bd create --graph timeout = %s, want %s", got, bdGraphApplyCommandTimeout)
+	}
+}
+
+// TestBDCommandTimeoutForQuery pins the dedicated, shorter bound on the
+// ephemeral `bd query` subcommand (#3191). The bound must be below the general
+// timeout so gc reload / gc doctor kill a slow ephemeral child and degrade to
+// the durable tier instead of blocking.
+func TestBDCommandTimeoutForQuery(t *testing.T) {
+	if got := bdCommandTimeoutFor("bd", []string{"query", "--json", "ephemeral=true", "--limit", "1"}); got != bdQueryCommandTimeout {
+		t.Fatalf("bd query timeout = %s, want %s", got, bdQueryCommandTimeout)
+	}
+	if bdQueryCommandTimeout >= bdCommandTimeout {
+		t.Fatalf("bd query timeout %s must be below general timeout %s", bdQueryCommandTimeout, bdCommandTimeout)
+	}
+	if bdQueryCommandTimeout >= bdReadCommandTimeout {
+		t.Fatalf("bd query timeout %s must be below read timeout %s", bdQueryCommandTimeout, bdReadCommandTimeout)
 	}
 }
 
@@ -130,6 +153,8 @@ printf '[]\n'
 // the same assertion against a 50ms timeout, which lost on macOS where
 // first-exec of a new script file pays a ~150ms validation tax.
 func TestKillCommandTreeKillsProcessGroup(t *testing.T) {
+	processgrouptest.RequireRealProcessSignals(t)
+
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh unavailable")
 	}

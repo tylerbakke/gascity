@@ -21,6 +21,24 @@ func writeFile(t *testing.T, dir, name, content string) {
 	}
 }
 
+type readCountingFS struct {
+	fsys.OSFS
+	reads map[string]int
+}
+
+func newReadCountingFS() *readCountingFS {
+	return &readCountingFS{reads: make(map[string]int)}
+}
+
+func (f *readCountingFS) ReadFile(name string) ([]byte, error) {
+	f.reads[filepath.Clean(name)]++
+	return f.OSFS.ReadFile(name)
+}
+
+func (f *readCountingFS) ReadCount(name string) int {
+	return f.reads[filepath.Clean(name)]
+}
+
 func TestExpandPacks_Basic(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/gastown/pack.toml", `
@@ -61,6 +79,34 @@ name = "refinery"
 	// witness should have adjusted prompt_template path.
 	if !strings.Contains(cfg.Agents[0].PromptTemplate, "prompts/witness.md") {
 		t.Errorf("witness prompt_template = %q, want to contain prompts/witness.md", cfg.Agents[0].PromptTemplate)
+	}
+}
+
+func TestExpandPacksAllowsSemanticallyInvalidFlatOrder(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/tools/pack.toml", `
+[pack]
+name = "tools"
+version = "1.0.0"
+schema = 1
+`)
+	writeFile(t, dir, "packs/tools/orders/deploy.toml", `
+[order]
+formula = "mol-deploy"
+trigger = "manual"
+
+[order.env]
+CUSTOM_ORDER_FLAG = "enabled"
+`)
+
+	cfg := &City{
+		Rigs: []Rig{
+			{Name: "demo", Path: "/work", Includes: []string{"packs/tools"}},
+		},
+	}
+
+	if err := ExpandPacks(cfg, fsys.OSFS{}, dir, nil); err != nil {
+		t.Fatalf("ExpandPacks: %v", err)
 	}
 }
 
@@ -900,6 +946,45 @@ func TestPackContentHashRecursive(t *testing.T) {
 	}
 }
 
+func TestPackContentHashRecursiveCachesUnchangedTree(t *testing.T) {
+	ResetPackContentHashCache()
+	t.Cleanup(ResetPackContentHashCache)
+
+	dir := t.TempDir()
+	writeFile(t, dir, "pack.toml", `name = "p"`)
+	writeFile(t, dir, "prompts/a.md", "prompt a")
+	writeFile(t, dir, "assets/big.txt", strings.Repeat("x", 4096))
+
+	cfs := newReadCountingFS()
+	bigPath := filepath.Join(dir, "assets/big.txt")
+
+	h1 := PackContentHashRecursive(cfs, dir)
+	if cfs.ReadCount(bigPath) == 0 {
+		t.Fatal("first hash should read file content")
+	}
+
+	// Second call on the unchanged tree: cache hit, zero additional content reads.
+	before := cfs.ReadCount(bigPath)
+	h2 := PackContentHashRecursive(cfs, dir)
+	if h2 != h1 {
+		t.Fatalf("cached hash mismatch: %q vs %q", h1, h2)
+	}
+	if after := cfs.ReadCount(bigPath); after != before {
+		t.Fatalf("cache hit re-read content (%d→%d), want no new reads (stat fingerprint should gate)", before, after)
+	}
+
+	// Mutating a file bumps its mtime/size → fingerprint changes → re-read + new hash.
+	writeFile(t, dir, "prompts/a.md", "prompt a (edited, longer)")
+	beforeChange := cfs.ReadCount(bigPath)
+	h3 := PackContentHashRecursive(cfs, dir)
+	if h3 == h1 {
+		t.Fatal("hash should change after content change")
+	}
+	if cfs.ReadCount(bigPath) == beforeChange {
+		t.Fatal("changed tree should be re-read, not served from cache")
+	}
+}
+
 func TestPackContentHashRecursiveIgnoresRuntimeDirs(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "pack.toml", "test")
@@ -914,6 +999,13 @@ func TestPackContentHashRecursiveIgnoresRuntimeDirs(t *testing.T) {
 	writeFile(t, dir, ".cache/tool/result.json", `{"cached":true}`)
 	writeFile(t, dir, ".git/HEAD", "ref: refs/heads/main")
 	writeFile(t, dir, "nested/__pycache__/helper.pyc", "compiled")
+	// gastownhall/gascity#2954: node_modules at any depth must be skipped.
+	// Packs anchored at monorepo roots previously dragged tens of thousands
+	// of node_modules files through the supervisor on every dirty reload.
+	writeFile(t, dir, "node_modules/.package-lock.json", `{"name":"x"}`)
+	writeFile(t, dir, "node_modules/lodash/index.js", "module.exports = {}")
+	writeFile(t, dir, "packages/foo/node_modules/lodash/index.js", "module.exports = {}")
+	writeFile(t, dir, "apps/bar/node_modules/.bun/install-cache.bin", "binary")
 	h2 := PackContentHashRecursive(fsys.OSFS{}, dir)
 	if h2 != h1 {
 		t.Fatalf("hash changed after runtime output writes: %q vs %q", h1, h2)
@@ -988,6 +1080,115 @@ includes = ["packs/gt"]
 	} else if !strings.Contains(src, "pack.toml") {
 		t.Errorf("witness provenance = %q, want to contain pack.toml", src)
 	}
+}
+
+func TestLoadWithIncludes_PackAgentDefaultsProviderAppliesToIncludedAgent(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/gt/pack.toml", `
+[pack]
+name = "gastown"
+version = "1.0.0"
+schema = 1
+
+[providers.claude]
+base = "builtin:claude"
+
+[providers.codex]
+base = "builtin:codex"
+
+[agent_defaults]
+provider = "codex"
+
+[[agent]]
+name = "worker"
+
+[[agent]]
+name = "reviewer"
+provider = "claude"
+`)
+
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test-city"
+provider = "gemini"
+includes = ["packs/gt"]
+
+[providers.gemini]
+base = "builtin:gemini"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	var worker, reviewer *Agent
+	for i := range cfg.Agents {
+		switch cfg.Agents[i].QualifiedName() {
+		case "worker":
+			worker = &cfg.Agents[i]
+		case "reviewer":
+			reviewer = &cfg.Agents[i]
+		}
+	}
+	if worker == nil || reviewer == nil {
+		t.Fatalf("expected worker and reviewer, got worker=%v reviewer=%v", worker != nil, reviewer != nil)
+	}
+	if got := worker.Provider; got != "codex" {
+		t.Fatalf("worker Provider = %q, want pack default codex", got)
+	}
+	if got := reviewer.Provider; got != "claude" {
+		t.Fatalf("reviewer Provider = %q, want explicit claude", got)
+	}
+}
+
+func TestLoadWithIncludes_CityAgentDefaultsProviderOverridesIncludedPackDefault(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/gt/pack.toml", `
+[pack]
+name = "gastown"
+version = "1.0.0"
+schema = 1
+
+[providers.codex]
+base = "builtin:codex"
+
+[agent_defaults]
+provider = "codex"
+
+[[agent]]
+name = "worker"
+`)
+
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test-city"
+includes = ["packs/gt"]
+
+[agent_defaults]
+provider = "gemini"
+
+[providers.gemini]
+base = "builtin:gemini"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	for _, a := range cfg.Agents {
+		if a.QualifiedName() != "worker" {
+			continue
+		}
+		if got := a.Provider; got != "gemini" {
+			t.Fatalf("worker Provider = %q, want city default gemini", got)
+		}
+		return
+	}
+	t.Fatal("worker agent not found")
 }
 
 func TestExpandPacks_OverrideEnv(t *testing.T) {
@@ -1147,8 +1348,14 @@ func TestHasPackRigs(t *testing.T) {
 	if HasPackRigs(nil) {
 		t.Error("nil rigs should return false")
 	}
-	if HasPackRigs([]Rig{{Name: "a", Path: "/a"}}) {
-		t.Error("rig without pack should return false")
+	if HasPackRigs([]Rig{{Name: "a"}}) {
+		t.Error("rig with no path and no includes should return false")
+	}
+	// A rig with only a path is treated as potentially having a pack (expandPacks
+	// will discover the root pack.toml if present). This enables the packV2
+	// convention where a rig root carries agents/ directories directly.
+	if !HasPackRigs([]Rig{{Name: "a", Path: "/a"}}) {
+		t.Error("rig with path should return true (may have root pack.toml)")
 	}
 	if !HasPackRigs([]Rig{{Name: "a", Path: "/a", Includes: []string{"topo"}}}) {
 		t.Error("rig with includes should return true")
@@ -3027,6 +3234,349 @@ includes = ["packs/rigsup"]
 	}
 }
 
+func TestLoadWithIncludes_SkipsExtraIncludeReachableFromRigPackGraph(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/maintenance/pack.toml", `
+[pack]
+name = "maintenance"
+schema = 2
+`)
+	writeFile(t, dir, "packs/maintenance/agents/dog/agent.toml", `
+scope = "city"
+fallback = true
+`)
+
+	writeFile(t, dir, "packs/gastown/pack.toml", `
+[pack]
+name = "gastown"
+schema = 2
+
+[imports.maintenance]
+source = "../maintenance"
+`)
+	writeFile(t, dir, "packs/gastown/agents/polecat/agent.toml", `
+scope = "rig"
+`)
+
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test"
+
+[[rigs]]
+name = "gascity"
+path = "/tmp/gascity"
+includes = ["packs/gastown"]
+`)
+
+	cfg, _, err := LoadWithIncludes(
+		fsys.OSFS{},
+		filepath.Join(dir, "city.toml"),
+		filepath.Join(dir, "packs", "maintenance"),
+	)
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	for _, packDir := range cfg.PackDirs {
+		if filepath.Base(packDir) == "maintenance" {
+			t.Fatalf("maintenance was injected at city scope despite being reachable from rig pack graph: PackDirs=%v RigPackDirs=%v",
+				cfg.PackDirs, cfg.RigPackDirs)
+		}
+	}
+	if got := cfg.RigPackDirs["gascity"]; len(got) != 2 {
+		t.Fatalf("rig pack graph dirs = %v, want gastown plus transitive maintenance", got)
+	}
+}
+
+func TestLoadWithIncludes_SkipsExtraIncludeReachableFromNamedRigPackGraph(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/maintenance/pack.toml", `
+[pack]
+name = "maintenance"
+schema = 2
+`)
+	writeFile(t, dir, "packs/maintenance/agents/dog/agent.toml", `
+scope = "city"
+fallback = true
+`)
+
+	writeFile(t, dir, ".gc/cache/packs/maintenance/pack.toml", `
+[pack]
+name = "maintenance"
+schema = 2
+`)
+	writeFile(t, dir, ".gc/cache/packs/maintenance/agents/dog/agent.toml", `
+scope = "city"
+fallback = true
+`)
+
+	writeFile(t, dir, ".gc/cache/packs/gastown/pack.toml", `
+[pack]
+name = "gastown"
+schema = 2
+
+[imports.maintenance]
+source = "../maintenance"
+`)
+	writeFile(t, dir, ".gc/cache/packs/gastown/agents/polecat/agent.toml", `
+scope = "rig"
+`)
+
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test"
+
+[packs.gastown]
+source = "https://example.com/gastown.git"
+
+[[rigs]]
+name = "gascity"
+path = "/tmp/gascity"
+includes = ["gastown"]
+`)
+
+	cfg, _, err := LoadWithIncludes(
+		fsys.OSFS{},
+		filepath.Join(dir, "city.toml"),
+		filepath.Join(dir, "packs", "maintenance"),
+	)
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	for _, packDir := range cfg.PackDirs {
+		if filepath.Base(packDir) == "maintenance" {
+			t.Fatalf("maintenance was injected at city scope despite being reachable from named rig pack graph: PackDirs=%v RigPackDirs=%v",
+				cfg.PackDirs, cfg.RigPackDirs)
+		}
+	}
+	if got := cfg.RigPackDirs["gascity"]; len(got) != 2 {
+		t.Fatalf("rig pack graph dirs = %v, want gastown plus transitive maintenance", got)
+	}
+}
+
+func TestResolvedPackNames_ExpandsRepeatedSourceWhenAnyVisitIsTransitive(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/maintenance/pack.toml", `
+[pack]
+name = "maintenance"
+schema = 2
+`)
+	writeFile(t, dir, "packs/shared/pack.toml", `
+[pack]
+name = "shared"
+schema = 2
+
+[imports.maintenance]
+source = "../maintenance"
+`)
+	writeFile(t, dir, "packs/wrapper/pack.toml", `
+[pack]
+name = "wrapper"
+schema = 2
+
+[imports.shared]
+source = "../shared"
+transitive = false
+`)
+
+	names := resolvedPackNames([]string{"packs/wrapper"}, map[string]Import{
+		"shared": {Source: "packs/shared"},
+	}, fsys.OSFS{}, dir)
+
+	if !names["maintenance"] {
+		t.Fatalf("maintenance missing after mixed shallow/deep visits: names=%v", names)
+	}
+}
+
+func TestResolvedPackNames_NonTransitiveImportDoesNotCollectDeepDependency(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/maintenance/pack.toml", `
+[pack]
+name = "maintenance"
+schema = 2
+`)
+	writeFile(t, dir, "packs/shared/pack.toml", `
+[pack]
+name = "shared"
+schema = 2
+
+[imports.maintenance]
+source = "../maintenance"
+`)
+
+	transitiveFalse := false
+	names := resolvedPackNames(nil, map[string]Import{
+		"shared": {Source: "packs/shared", Transitive: &transitiveFalse},
+	}, fsys.OSFS{}, dir)
+
+	if !names["shared"] {
+		t.Fatalf("shared missing from non-transitive visit: names=%v", names)
+	}
+	if names["maintenance"] {
+		t.Fatalf("maintenance collected through non-transitive import: names=%v", names)
+	}
+}
+
+func TestResolvedPackNames_NonTransitiveImportDoesNotExposeNestedPack(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/maintenance/pack.toml", `
+[pack]
+name = "maintenance"
+schema = 2
+`)
+	writeFile(t, dir, "packs/middle/pack.toml", `
+[pack]
+name = "middle"
+schema = 2
+
+[imports.maintenance]
+source = "../maintenance"
+`)
+	writeFile(t, dir, "packs/root/pack.toml", `
+[pack]
+name = "root"
+schema = 2
+
+[imports.middle]
+source = "../middle"
+transitive = false
+`)
+
+	names := resolvedPackNames([]string{"packs/root"}, nil, fsys.OSFS{}, dir)
+	if !names["middle"] {
+		t.Fatalf("middle pack was not recorded: names=%v", names)
+	}
+	if names["maintenance"] {
+		t.Fatalf("non-transitive import exposed nested maintenance pack: names=%v", names)
+	}
+}
+
+func TestResolvedPackNames_RevisitsPackReachedFirstThroughNonTransitiveImport(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "packs/maintenance/pack.toml", `
+[pack]
+name = "maintenance"
+schema = 2
+`)
+	writeFile(t, dir, "packs/middle/pack.toml", `
+[pack]
+name = "middle"
+schema = 2
+
+[imports.maintenance]
+source = "../maintenance"
+`)
+	writeFile(t, dir, "packs/shallow/pack.toml", `
+[pack]
+name = "shallow"
+schema = 2
+
+[imports.middle]
+source = "../middle"
+transitive = false
+`)
+	writeFile(t, dir, "packs/deep/pack.toml", `
+[pack]
+name = "deep"
+schema = 2
+
+[imports.middle]
+source = "../middle"
+`)
+
+	for _, includes := range [][]string{
+		{"packs/shallow", "packs/deep"},
+		{"packs/deep", "packs/shallow"},
+	} {
+		names := resolvedPackNames(includes, nil, fsys.OSFS{}, dir)
+		if !names["maintenance"] {
+			t.Fatalf("includes %v did not resolve transitive maintenance after shallow visit: names=%v", includes, names)
+		}
+	}
+}
+
+func TestResolvedPackNames_AvoidsRedundantPackReads(t *testing.T) {
+	t.Run("repeated shallow imports", func(t *testing.T) {
+		dir := t.TempDir()
+
+		writeFile(t, dir, "packs/shared/pack.toml", `
+[pack]
+name = "shared"
+schema = 2
+`)
+
+		transitiveFalse := false
+		countingFS := newReadCountingFS()
+		names := resolvedPackNames(nil, map[string]Import{
+			"shared_a": {Source: "packs/shared", Transitive: &transitiveFalse},
+			"shared_b": {Source: "packs/shared", Transitive: &transitiveFalse},
+		}, countingFS, dir)
+
+		if !names["shared"] {
+			t.Fatalf("shared missing from repeated shallow imports: names=%v", names)
+		}
+		if got := countingFS.ReadCount(filepath.Join(dir, "packs/shared/pack.toml")); got != 1 {
+			t.Fatalf("shared pack.toml read count = %d, want 1", got)
+		}
+	})
+
+	t.Run("diamond transitive imports", func(t *testing.T) {
+		dir := t.TempDir()
+
+		writeFile(t, dir, "packs/shared/pack.toml", `
+[pack]
+name = "shared"
+schema = 2
+`)
+		writeFile(t, dir, "packs/left/pack.toml", `
+[pack]
+name = "left"
+schema = 2
+
+[imports.shared]
+source = "../shared"
+`)
+		writeFile(t, dir, "packs/right/pack.toml", `
+[pack]
+name = "right"
+schema = 2
+
+[imports.shared]
+source = "../shared"
+`)
+		writeFile(t, dir, "packs/root/pack.toml", `
+[pack]
+name = "root"
+schema = 2
+
+[imports.left]
+source = "../left"
+
+[imports.right]
+source = "../right"
+`)
+
+		countingFS := newReadCountingFS()
+		names := resolvedPackNames([]string{"packs/root"}, nil, countingFS, dir)
+
+		for _, name := range []string{"root", "left", "right", "shared"} {
+			if !names[name] {
+				t.Fatalf("%s missing from diamond imports: names=%v", name, names)
+			}
+		}
+		if got := countingFS.ReadCount(filepath.Join(dir, "packs/shared/pack.toml")); got != 1 {
+			t.Fatalf("shared pack.toml read count = %d, want 1", got)
+		}
+	})
+}
+
 // agentNamesOf is a small test helper for readable failure messages.
 func agentNamesOf(agents []Agent) []string {
 	names := make([]string, 0, len(agents))
@@ -3322,114 +3872,14 @@ agent = ""
 }
 
 // ---------------------------------------------------------------------------
-// Fallback agent tests
+// Pack agent collision tests
 // ---------------------------------------------------------------------------
+// The fallback-agent mechanism was removed: packs own their agents under
+// unambiguous names and cross-pack duplicates are hard errors. A stale
+// `fallback` key in a V2 agents/<name>/agent.toml is ignored; in a V1
+// inline [[agent]] it fails the pack's unknown-key gate.
 
-func TestFallbackAgent_NonFallbackWins(t *testing.T) {
-	// Non-fallback dog from pack A, fallback dog from pack B.
-	// Only A's dog should survive.
-	dir := t.TempDir()
-	writeFile(t, dir, "packs/maintenance/pack.toml", `
-[pack]
-name = "maintenance"
-schema = 1
-
-[[agent]]
-name = "dog"
-scope = "city"
-nudge = "full dog"
-`)
-	writeFile(t, dir, "packs/dolt/pack.toml", `
-[pack]
-name = "dolt"
-schema = 1
-
-[[agent]]
-name = "dog"
-scope = "city"
-fallback = true
-nudge = "fallback dog"
-`)
-
-	cfg := &City{
-		Workspace: Workspace{
-			Includes: []string{"packs/maintenance", "packs/dolt"},
-		},
-	}
-
-	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
-	if err != nil {
-		t.Fatalf("ExpandCityPacks: %v", err)
-	}
-
-	// Only the non-fallback dog should remain.
-	var dogs []Agent
-	for _, a := range cfg.Agents {
-		if a.Name == "dog" {
-			dogs = append(dogs, a)
-		}
-	}
-	if len(dogs) != 1 {
-		t.Fatalf("got %d dogs, want 1", len(dogs))
-	}
-	if dogs[0].Nudge != "full dog" {
-		t.Errorf("surviving dog nudge = %q, want %q", dogs[0].Nudge, "full dog")
-	}
-}
-
-func TestFallbackAgent_BothFallback_FirstWins(t *testing.T) {
-	// Two fallback dogs from different packs. First loaded wins.
-	dir := t.TempDir()
-	writeFile(t, dir, "packs/alpha/pack.toml", `
-[pack]
-name = "alpha"
-schema = 1
-
-[[agent]]
-name = "dog"
-scope = "city"
-fallback = true
-nudge = "alpha dog"
-`)
-	writeFile(t, dir, "packs/beta/pack.toml", `
-[pack]
-name = "beta"
-schema = 1
-
-[[agent]]
-name = "dog"
-scope = "city"
-fallback = true
-nudge = "beta dog"
-`)
-
-	cfg := &City{
-		Workspace: Workspace{
-			Includes: []string{"packs/alpha", "packs/beta"},
-		},
-	}
-
-	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
-	if err != nil {
-		t.Fatalf("ExpandCityPacks: %v", err)
-	}
-
-	var dogs []Agent
-	for _, a := range cfg.Agents {
-		if a.Name == "dog" {
-			dogs = append(dogs, a)
-		}
-	}
-	if len(dogs) != 1 {
-		t.Fatalf("got %d dogs, want 1", len(dogs))
-	}
-	if dogs[0].Nudge != "alpha dog" {
-		t.Errorf("surviving dog nudge = %q, want %q (first loaded wins)", dogs[0].Nudge, "alpha dog")
-	}
-}
-
-func TestFallbackAgent_NeitherFallback_CollisionError(t *testing.T) {
-	// Two non-fallback dogs from different packs. Should still error.
+func TestPackAgents_DuplicateAcrossPacksErrors(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/alpha/pack.toml", `
 [pack]
@@ -3458,26 +3908,26 @@ scope = "city"
 
 	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err == nil {
-		t.Fatal("expected collision error for two non-fallback dogs")
+		t.Fatal("expected collision error for two dogs from different packs")
 	}
 	if !strings.Contains(err.Error(), "duplicate agent") {
 		t.Errorf("error = %q, want 'duplicate agent'", err.Error())
 	}
 }
 
-func TestFallbackAgent_StandaloneWorks(t *testing.T) {
-	// Single fallback agent, no collision — should be kept normally.
+func TestPackAgents_StaleFallbackKeyInAgentTomlIgnored(t *testing.T) {
+	// The removed `fallback` key in a V2 agent.toml must not break loading;
+	// the agent is kept as a normal definition.
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/health/pack.toml", `
 [pack]
 name = "health"
-schema = 1
-
-[[agent]]
-name = "dog"
+schema = 2
+`)
+	writeFile(t, dir, "packs/health/agents/dog/agent.toml", `
 scope = "city"
 fallback = true
-nudge = "standalone fallback"
+nudge = "standalone dog"
 `)
 
 	cfg := &City{
@@ -3494,9 +3944,6 @@ nudge = "standalone fallback"
 	}
 	if cfg.Agents[0].Name != "dog" {
 		t.Errorf("agent name = %q, want dog", cfg.Agents[0].Name)
-	}
-	if !cfg.Agents[0].Fallback {
-		t.Error("agent should have Fallback = true")
 	}
 }
 
@@ -4746,5 +5193,100 @@ depends_on = ["db"]
 	// Validation should pass since deps are now qualified.
 	if err := ValidateAgents(cfg.Agents); err != nil {
 		t.Errorf("ValidateAgents failed after pack expansion: %v", err)
+	}
+}
+
+// TestMergeHoistedCityAgents_DedupAcrossBindings covers the topology where a
+// pack (here "maintenance") is imported at the city level under one binding
+// (e.g. "gastown") and ALSO transitively pulled in via rig includes that
+// restamp the binding to something else (e.g. "atlas"). The same underlying
+// agent — same (Dir, Name) — then appears twice with different binding
+// prefixes. Hoist dedup must collapse these by (Dir, Name) because
+// ValidateAgents keys collisions on (Dir, Name), not on QualifiedName.
+//
+// Before the fix, hoist dedup only checked QualifiedName, so "gastown.dog"
+// and "atlas.dog" both survived and ValidateAgents reported a duplicate.
+//
+// The shared Dir mirrors the production reproducer literally: both entries
+// resolve to the same on-disk pack (.../packs/maintenance), which is why the
+// original failure rendered the same path twice in its "duplicate name
+// (from X and X)" message.
+func TestMergeHoistedCityAgents_DedupAcrossBindings(t *testing.T) {
+	const maintenanceDir = "/home/user/.gc/packs/maintenance"
+	agents := []Agent{
+		{Name: "dog", Dir: maintenanceDir, BindingName: "gastown", Scope: "city"},
+	}
+	hoisted := []Agent{
+		{Name: "dog", Dir: maintenanceDir, BindingName: "atlas", Scope: "city"},
+	}
+
+	merged := mergeHoistedCityAgents(agents, hoisted)
+	if len(merged) != 1 {
+		t.Fatalf("merged length = %d, want 1 (city-scope dog should only appear once)", len(merged))
+	}
+	if merged[0].BindingName != "gastown" {
+		t.Errorf("first-occurrence-wins: BindingName = %q, want %q", merged[0].BindingName, "gastown")
+	}
+
+	if err := ValidateAgents(merged); err != nil {
+		t.Errorf("ValidateAgents failed after dedup: %v", err)
+	}
+}
+
+// TestMergeHoistedCityAgents_SameNameDifferentDirPreserved locks the dedup key
+// to (Dir, Name) rather than Name alone. Two agents that share a Name but
+// originate from different on-disk packs are genuinely distinct definitions,
+// so both must survive the hoist. This guards against a future regression that
+// collapses the key down to Name and silently drops a legitimate agent.
+func TestMergeHoistedCityAgents_SameNameDifferentDirPreserved(t *testing.T) {
+	agents := []Agent{
+		{Name: "dog", Dir: "/home/user/.gc/packs/maintenance", BindingName: "gastown", Scope: "city"},
+	}
+	hoisted := []Agent{
+		{Name: "dog", Dir: "/home/user/.gc/packs/atlas", BindingName: "atlas", Scope: "city"},
+	}
+
+	merged := mergeHoistedCityAgents(agents, hoisted)
+	if len(merged) != 2 {
+		t.Fatalf("merged length = %d, want 2 (same Name from different Dir are distinct definitions)", len(merged))
+	}
+}
+
+// TestMergeHoistedCityAgents_DistinctNamesPreserved guards against
+// over-aggressive dedup: hoisted agents with the same binding but different
+// names must all survive.
+func TestMergeHoistedCityAgents_DistinctNamesPreserved(t *testing.T) {
+	agents := []Agent{
+		{Name: "mayor", Dir: "", BindingName: "gastown", Scope: "city"},
+	}
+	hoisted := []Agent{
+		{Name: "deacon", Dir: "", BindingName: "atlas", Scope: "city"},
+		{Name: "boot", Dir: "", BindingName: "atlas", Scope: "city"},
+	}
+
+	merged := mergeHoistedCityAgents(agents, hoisted)
+	if len(merged) != 3 {
+		t.Fatalf("merged length = %d, want 3", len(merged))
+	}
+}
+
+// TestMergeHoistedCityNamedSessions_DedupAcrossBindings mirrors the agent
+// case for named sessions. ValidateNamedSessions does not currently key on
+// BindingName, so a duplicate (Dir, Template) under different bindings
+// would still wedge city startup once the hoist re-introduced the conflict.
+func TestMergeHoistedCityNamedSessions_DedupAcrossBindings(t *testing.T) {
+	sessions := []NamedSession{
+		{Template: "mayor", Dir: "", BindingName: "gastown", Scope: "city"},
+	}
+	hoisted := []NamedSession{
+		{Template: "mayor", Dir: "", BindingName: "atlas", Scope: "city"},
+	}
+
+	merged := mergeHoistedCityNamedSessions(sessions, hoisted)
+	if len(merged) != 1 {
+		t.Fatalf("merged length = %d, want 1", len(merged))
+	}
+	if merged[0].BindingName != "gastown" {
+		t.Errorf("first-occurrence-wins: BindingName = %q, want %q", merged[0].BindingName, "gastown")
 	}
 }

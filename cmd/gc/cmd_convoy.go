@@ -51,9 +51,13 @@ func newConvoyCmd(stdout, stderr io.Writer) *cobra.Command {
 A convoy is a named graph of beads with dependencies. Convoys
 group related issues via tracks dependencies.
 
-Convoys are distinct from workflows (graph.v2 formula-compiled
-DAGs managed by the dispatch subsystem) — gc convoy commands do
-not operate on workflow roots.`,
+Convoys are distinct from workflows — the DAGs compiled from
+v2 formulas and managed by the dispatch
+subsystem. The convoy lifecycle subcommands (create, list, status,
+target, add, close, check, stranded, land) do not operate on
+workflow roots; the dispatch subcommands (control, delete,
+delete-source, reopen-source) manage workflow trees and their
+control beads.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if len(args) == 0 {
@@ -1786,11 +1790,20 @@ func convoyAutocloseStoreRoot(cwd string) string {
 }
 
 // autocloseCityPathForStoreRoot resolves the runtime city for bd hook cleanup.
-// The hook-projected store root identifies the bead that just closed, so prefer
-// filesystem discovery from that root over an inherited GC_CITY from the
-// supervising process.
+// Precedence: a city.toml-backed discovery result from the store root wins
+// outright; otherwise a validated explicit GC_CITY from the supervising
+// process is preferred over a legacy `.gc/`-only discovery result (an external
+// rig checkout with runtime state but no city.toml); the legacy runtime root
+// is used when no explicit city is set; cityForStoreDir is the final fallback
+// when discovery fails entirely.
 func autocloseCityPathForStoreRoot(storeRoot string) string {
 	if cityPath, err := findCity(storeRoot); err == nil {
+		if _, statErr := os.Stat(filepath.Join(cityPath, "city.toml")); statErr == nil {
+			return cityPath
+		}
+		if explicitCity, ok := resolveExplicitCityPathEnv(); ok {
+			return explicitCity
+		}
 		return cityPath
 	}
 	return cityForStoreDir(storeRoot)

@@ -7,6 +7,199 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Version pins on builtin packs are honored: the binary only pre-seeds
+  its embedded content at each pack's canonical pin.** Previously the
+  bundled synthetic cache served the running binary's embedded bytes for
+  ANY commit pinned on a bundled source — editing the pin changed nothing.
+  Now only the canonical pin (the one `gc init` writes) resolves from the
+  embedded copy; a bundled source pinned at any other commit behaves
+  exactly like a regular remote import: `gc import install` fetches that
+  exact commit from git, validation uses the git checkout, and the cache
+  slot uses the plain remote key. Cities on canonical pins keep working
+  fully offline, including across binary upgrades that keep the pin
+  constants; releases that bump a canonical pin migrate existing cities
+  via `gc doctor --fix` (superseded canonical pins are rewritten to the
+  current one).
+
+- **Builtin packs are no longer materialized into cities; they compose via
+  pinned imports resolved from the user-global pack cache.** The per-city
+  `.gc/system/packs` tree is retired (and pruned on sight): `gc init` now
+  writes pinned `[imports.core]`/`[imports.bd]` entries into pack.toml plus
+  a matching packs.lock, and the gc binary self-heals the GC_HOME cache
+  (`$GC_HOME/cache/repos`) with its own embedded content so the pins resolve
+  offline. The `builtin-pack-includes` doctor check became
+  `builtin-pack-imports`: it migrates legacy `workspace.includes =
+  [".gc/system/packs/..."]` cities by stripping the includes, upserting the
+  pinned imports (creating a minimal pack.toml for legacy cities), and
+  refreshing packs.lock and the cache. The bd lifecycle script moved behind
+  a stable per-city shim at `.gc/scripts/gc-beads-bd.sh` that execs the
+  cache-resolved bundled script; provider normalization still recognizes
+  the legacy materialized path. All repo-cache roots (packman install,
+  config resolution, doctor) now uniformly resolve via GC_HOME instead of
+  mixing `$HOME/.gc` and GC_HOME. `gc rig add --include <builtin>`
+  canonicalizes to the bundled remote source and locks it. **Migration:**
+  run `gc doctor --fix` once per existing city.
+
+- **The registry `gascity` planning pack is bundled and offered by the init
+  wizard.** `gc init` now offers `gascity` as a config template alongside
+  minimal/gastown (also via `--template gascity`), wiring the pinned public
+  import from gascity-packs the same way the gastown template does. The
+  pack is embedded from the `github.com/gastownhall/gascity-packs` module
+  root, so the pin resolves offline from the bundled synthetic cache.
+
+- **The bundled gastown pack is now a Go module dependency, not a checked-in
+  copy.** `examples/gastown/packs/gastown` is gone; the gc binary embeds the
+  pack from `github.com/gastownhall/gascity-packs` (pinned in go.mod to the
+  registry release commit), and the example city composes gastown through
+  the pinned public registry import plus a committed `packs.lock` — the same
+  shape `gc init` writes — resolved offline from the bundled synthetic
+  cache. `scripts/update-bundled-gastown-pack` no longer writes a vendored
+  tree; it bumps the go.mod pin, the `PublicGastownPack*` constants, and the
+  example pins from the latest registry release, and `--check` verifies the
+  pinned module content against the registry hash. The gastown integration
+  tests in `examples/gastown` now run against the module-embedded bytes, so
+  a runtime/pack mismatch fails in gascity CI.
+
+- **The bundled maintenance pack was folded into the core pack, and builtin
+  packs compose only through explicit pinned imports.** The bundled `core`
+  pack carries the gc-* skills, default worker prompts, core formulas, the
+  mechanical housekeeping orders that used to ship in the maintenance pack
+  (gate-sweep, orphan-sweep, cross-rig-deps, order-tracking-sweep,
+  spawn-storm-detect, prune-branches, wisp-compact, nudge-mail-sweep,
+  nudge-on-route, cascade-nudge-on-blocker-close), the check-binaries doctor
+  check, and the per-provider hook overlays. Config load no longer splices
+  builtin packs into composition: `gc init` writes explicit `[imports.core]`
+  and, for default bd-provider cities, `[imports.bd]` entries into
+  `pack.toml`, plus a matching `packs.lock`. The fixable
+  `builtin-pack-imports` doctor check repairs missing imports and migrates
+  legacy `workspace.includes = [".gc/system/packs/..."]` cities by stripping
+  those includes, adding the pinned imports, and pruning stale
+  `.gc/system/packs` materialization. **Migration:** run `gc doctor --fix`
+  once per existing city.
+- **The implicit fallback dog is gone, and the `fallback` agent field was
+  removed.** The gastown pack now owns its dog pool outright
+  (`agents/dog/`, themed, with `mol-shutdown-dance`), and the dolt pack
+  keeps its own dolt dog for Dolt maintenance formulas. The
+  fallback-agent resolution mechanism (`fallback = true`, non-fallback
+  wins, first-loaded wins) was removed: cross-pack agent name collisions
+  are now hard errors, and a stale `fallback` key in a V2
+  `agents/<name>/agent.toml` is ignored while a V1 inline `[[agent]]`
+  entry fails the pack's unknown-key gate. External packs that relied on
+  the bundled fallback dog must define their own worker pool (or route
+  work to a pool they ship themselves).
+
+### Added
+
+- **Formulas v2 and `drain` are the supported path for new graph
+  workflows.** The v2 compiler emits flat workflow graphs with
+  controller-owned control/finalize beads, and `drain` is now the canonical
+  fan-out primitive for scattering convoy members into per-item formula runs.
+  The bundled `gascity` planning pack ships graph.v2 build and implementation
+  formulas, including the mayor skill's documented `gc sling ... --on
+  <formula>` launch flow and drain-based `implement` workflow, so new Gas City
+  methodology workflows no longer need the legacy `gc.output_json`/tally fan-out
+  pattern.
+
+- Proxy-process workspace services now receive `GC_SERVICE_SECRETS_DIR`
+  (`<GC_SERVICE_STATE_ROOT>/secrets`) in their environment, alongside the
+  existing `GC_SERVICE_*` variables. The directory is scaffolded at `0700`
+  by the service state-root setup and is the sanctioned home for
+  pack-managed credentials (bot tokens etc.), so pack services can rely on
+  the explicit contract instead of deriving the path from
+  `GC_SERVICE_STATE_ROOT`. See #3429.
+- `gc nudge drain --inject` now prepends a one-line current-time stamp
+  (operator-local + UTC + epoch) to its `UserPromptSubmit` hook output, giving
+  agents a live clock in context every turn. The local zone follows the host
+  (`time.Local`/`$TZ`) or the `GC_OPERATOR_TZ` override; disable with
+  `GC_INJECT_CLOCK=0`. Folded into the existing nudge inject, so it adds zero
+  extra hook subprocesses per turn. See #3036.
+- The supervisor now merges a machine-local secrets file
+  (`${GC_HOME}/secrets.env`, dotenv syntax) into the launchd plist / systemd
+  unit environment on every service-file regeneration. This fixes provider
+  credentials being dropped when `gc start` runs from a shell that did not
+  export them (e.g. at login or after a reboot), which previously caused
+  silent provider auth failures. Only keys already eligible for the supervisor
+  environment are merged (provider credentials plus `GC_SUPERVISOR_ENV`
+  opt-ins); a value exported in the calling shell still takes precedence, and
+  `GC_SUPERVISOR_OMIT_PROVIDER_CREDS=1` suppresses provider credentials from
+  both sources.
+- `GC_DOLT_SYNC_PUSH_TIMEOUT_SECS` configures the SQL-mode push wall-clock
+  ceiling for `gc dolt sync` (default 1800s, replacing the prior fixed 120s
+  that SIGKILLed large first pushes). Metadata queries keep their own 120s
+  bound.
+- **ENOSPC pre-flight for managed Dolt** (`GC_DOLT_MIN_FREE_BYTES`,
+  `GC_DOLT_WARN_FREE_BYTES`): managed-Dolt startup and the store-maintenance
+  compaction loop now check container free space via `statvfs(2)` before
+  performing disk-growing operations. Below the critical floor (default
+  500 MiB) startup is refused and compaction is skipped; below the soft floor
+  (default 2 GiB) a `gc.store.disk_warn` event is emitted and operations
+  proceed. Fails open on probe error and is disabled entirely when
+  `GC_DOLT_MIN_FREE_BYTES=0`. Uses `f_bavail` (APFS-safe — excludes purgeable
+  space). Addresses the root trigger of the 2026-06-01 fleet-drain incident.
+
+### Fixed
+
+- The synthetic bundled-pack cache key now folds in the running binary's
+  embedded-pack content hash, so two `gc` binaries with different bundled-pack
+  content resolve to different cache directories instead of fighting over one.
+  Previously the cache directory was keyed only on namespace+source+commit, so a
+  version-skewed deploy (controller and agents on different `gc` builds) left
+  both binaries materializing one shared directory in turn: each `gc import
+  install` was promptly clobbered by the other binary, re-wedging every `gc bd`
+  citywide with "bundled pack cache content hash does not match current binary"
+  roughly hourly. With the content hash in the key, `gc import install` for a
+  given binary sticks for that binary regardless of other versions running.
+  Note: deploying a binary with changed bundled-pack content still requires a
+  one-time `gc import install` (or bootstrap materialize) to populate the new
+  cache directory; that install is now durable rather than transient (ga-s9p).
+
+- Pool respawn after `gc runtime drain-ack` no longer waits up to a full patrol
+  interval (default 60 s) before the replacement session starts. The async kill
+  goroutine now pokes the controller once after the session is gone so Phase 2
+  (finalize bead + spawn replacement) runs on the next event tick. Fixes the
+  `TestLifecycle_DrainAckResponsiveRespawn/prequeued_respawn_2364` Tier B
+  nightly regression (ga-ryhnhd, #2364, #2251).
+
+- `gc dolt sync` now emits per-mode diagnostics on push failure instead of a
+  generic "push failed": a TIMEOUT message naming the ceiling and
+  `GC_DOLT_SYNC_PUSH_TIMEOUT_SECS` on exit 124, the underlying exit code on
+  other failures, and the underlying dolt stderr. The replayed stderr cannot
+  leak `GC_DOLT_PASSWORD`: the password reaches dolt via the `DOLT_CLI_PASSWORD`
+  environment variable, never as an argv flag. `GC_DOLT_SYNC_PUSH_TIMEOUT_SECS`
+  rejects every numeric-zero form (`0`, `00`, `000`, ...) -- not just the
+  literal `0` -- because GNU `timeout` treats a zero duration as "disable the
+  timeout", which would push unbounded. A failure to create the stderr-capture
+  temp file now degrades to a per-database error rather than aborting the whole
+  run.
+- Interactive `gc session new` tmux sessions now scroll tmux scrollback on the
+  mouse wheel instead of leaking the wheel to the focused TUI (Claude Code's own
+  history, a pager, or the shell). The gastown pack binds `WheelUpPane`→copy-mode
+  and `WheelDownPane`→passthrough, and the runtime resolves interactive sessions
+  to mouse-on across every create seam so tmux preserves the `mouse on` set at
+  session create: the `gc session new` CLI — both the managed-deferred reconciler
+  start (`templateParamsToConfig`, for `session_origin=manual` sessions) and the
+  unmanaged direct start (`workerSessionCreateHints`) — plus the API
+  provider/named paths (`sessionCreateHints`). Resume keeps mouse-on too
+  (`sessionResumeHints`), so the wheel survives suspend/restart. Headless agent
+  sessions stay mouse-off (controller-poll safety) — they resolve `MouseOn` from
+  the agent template path (`cfgAgent.MouseModeOn()`), which is unchanged and has
+  neither the `manual`/`named` interactive marker. Replaces the portharbour
+  po-vtg2 city-local `set-hook` stopgap with the in-source fix. Refs: ga-c4w.
+
+## [1.2.1] - 2026-05-31
+
+### Fixed
+
+- Built-in pack auto-includes now skip packs already reachable from rig pack
+  graphs, preventing duplicate maintenance agents when a rig pack imports a
+  built-in pack transitively.
+- CI, docs, the managed minimum check, and install helpers now pin Dolt 2.1.0
+  so hotfix validation and runtime dependency checks use the same Dolt floor.
+
+## [1.2.0] - 2026-05-25
+
 ### Added
 
 - Claude Opus 4.8 is now listed in built-in Claude model choices and default
@@ -14,6 +207,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains available for cities that need the prior Opus target. Anthropic's
   published regular-usage pricing is unchanged from Opus 4.7: $5/MTok input
   and $25/MTok output.
+- `[daemon].dolt_start_address_in_use_retry_window` configures how long the
+  managed dolt start path waits on the originally requested port when bind
+  fails with "address already in use" before falling back to a higher port.
+  Defaults to `30s`, which roughly covers half of Linux's default TCP
+  TIME_WAIT and prevents an external `kill -TERM` / supervisor restart / OOM
+  kill of the dolt subprocess from perpetuating a rebound orphan on a
+  non-canonical port. Each port gets at most one wait per
+  `startManagedDoltProcessWithOptions` invocation, so the worst-case wall
+  time per startup is bounded by `(retry_window + per-attempt-startup) ×
+  min(5, distinct-ports-tried)` rather than `retry_window × 5`. Set to `0s`
+  to disable the retry (legacy fall-back-immediately behavior). Operators
+  with a recovery-latency monitor may want to raise their alert threshold
+  by ~30s to absorb the new wait under contended port conditions; the
+  worst-case per startup remains well under one minute at defaults.
+  During a same-port retry the managed-dolt state file briefly reports
+  `Running:false, PID:0` for up to `retry_window` while the wait elapses;
+  state-readers (`gc dolt-state status`, rig endpoint port projection,
+  order routing) treat this as transient not-running and recover on the
+  next successful bind. The provider-op timeout for `start` remains `120s`;
+  an operator who raises `dolt_start_address_in_use_retry_window` materially
+  above the default should also raise that timeout to keep headroom for the
+  5-attempt cap.
+- `[daemon].dolt_stop_timeout` typos are now caught by `ValidateDurations`
+  at config load (previously only `ValidateNonNegativeDurations` covered it,
+  so an invalid string like `"30sec"` silently collapsed to zero).
+
+### Fixed
+
+- `gc mail reply` and `gc handoff` now store created mail in the wisp tier,
+  matching `gc mail send`. Operators should use `gc mail` commands or
+  explicit both-tier/wisp-aware bead queries for mail visibility; default
+  issue-tier `bd list` output and git sync do not include wisp-tier messages.
+- Built-in pack auto-include graph traversal now avoids redundant pack reads
+  while preserving non-transitive import boundaries and later transitive
+  expansion of shallow-seen packs.
 
 ## [1.2.0] - 2026-05-25
 
@@ -24,9 +252,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   envelopes for script and dashboard consumers. `gc mail inbox --json` and
   `gc mail count --json` always include the resolved `recipients` array,
   including single-recipient targets.
+- Native `bd` store selection now links the upstream Beads/Dolt Go library
+  stack into `gc` when the default beads provider is built. This intentionally
+  increases binary size and supply-chain surface through the Dolt/Vitess and
+  cloud-provider SDK dependency closure; deployments that do not want that
+  path can keep using `GC_BEADS_FORCE_FALLBACK=1` or `GC_BEADS=file`. CI now
+  runs `make check-native-dependency-surface` to fail on unreviewed native
+  dependency-family growth or `gc` binary-size growth.
 
 ### Fixed
 
+- `gc runtime drain-ack` now pokes the city controller socket after setting
+  the drain-ack flag, so the reconciler stops and respawns a drained pool
+  worker on the current patrol tick instead of waiting up to four ticks
+  (~120 s/step → ~30–90 s/step). Closes #2364 (pre-queued work) and #2251
+  (cold-pool arrival after drain-ack), which shared the same missing-poke
+  root cause.
 - `gc --json-schema` manifest output no longer includes the removed
   `transport` field. Consumers should use each role schema's `x-gc-jsonl`
   extension, when present, to determine JSONL record-count behavior.

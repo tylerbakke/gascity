@@ -23,6 +23,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/sessionlog"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
@@ -1231,6 +1232,91 @@ func TestReconcileSessionBeads_DaemonMaxWakesPerTickOverride(t *testing.T) {
 	}
 	if env.sp.IsRunning(names[override]) {
 		t.Fatalf("%s should have been deferred once budget hit", names[override])
+	}
+}
+
+// TestExecutePlannedStarts_WakeBudgetPrioritizesLeastRecentlyWoken proves the
+// per-tick wake budget is FAIR. When the budget cannot cover every ready
+// candidate, the least-recently-woken (longest-waiting) session must win a slot
+// rather than being starved behind more-recently-woken siblings that sort ahead
+// of it in the stable dependency/topo order. Without fairness the same
+// back-of-order sessions are deferred_by_wake_budget every tick.
+func TestExecutePlannedStarts_WakeBudgetPrioritizesLeastRecentlyWoken(t *testing.T) {
+	sp := runtime.NewFake()
+	store := beads.NewMemStore()
+	clk := &clock.Fake{Time: time.Date(2026, 6, 4, 3, 30, 0, 0, time.UTC)}
+	budget := 2
+	cfg := &config.City{Daemon: config.DaemonConfig{MaxWakesPerTick: &budget}}
+
+	mkTP := func(name string) TemplateParams {
+		return TemplateParams{
+			Command:      "claude",
+			SessionName:  name,
+			TemplateName: name,
+			ResolvedProvider: &config.ResolvedProvider{
+				Name:          "claude",
+				Command:       "claude",
+				PromptMode:    "arg",
+				ResumeFlag:    "--resume",
+				ResumeStyle:   "flag",
+				SessionIDFlag: "--session-id",
+			},
+		}
+	}
+
+	// "starved" is LAST in slice/topo order (the stable order would defer it),
+	// but it was woken longest ago, so a fair budget must still wake it.
+	specs := []struct{ name, lastWoke string }{
+		{"front-1", "2026-06-04T03:29:00Z"},
+		{"front-2", "2026-06-04T03:29:00Z"},
+		{"starved", "2020-01-01T00:00:00Z"},
+	}
+	desired := map[string]TemplateParams{}
+	var candidates []startCandidate
+	for i, s := range specs {
+		sess, err := store.Create(beads.Bead{
+			Title:  s.name,
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"session_name":   s.name,
+				"agent_name":     s.name,
+				"template":       s.name,
+				"state":          "creating",
+				"generation":     "1",
+				"instance_token": "test-token",
+				"live_hash":      runtime.LiveFingerprint(runtime.Config{Command: "test-cmd"}),
+				"last_woke_at":   s.lastWoke,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", s.name, err)
+		}
+		sCopy := sess
+		tp := mkTP(s.name)
+		desired[s.name] = tp
+		candidates = append(candidates, startCandidate{session: &sCopy, tp: tp, order: i})
+	}
+
+	woken := executePlannedStarts(
+		context.Background(),
+		candidates,
+		cfg,
+		desired,
+		sp,
+		store,
+		"",
+		clk,
+		events.Discard,
+		5*time.Second,
+		ioDiscard{},
+		ioDiscard{},
+	)
+	if woken != budget {
+		t.Fatalf("woken = %d, want %d", woken, budget)
+	}
+	if !sp.IsRunning("starved") {
+		t.Fatal("least-recently-woken 'starved' was deferred behind recently-woken siblings — wake budget is not fair (starvation)")
 	}
 }
 
@@ -3713,6 +3799,87 @@ func TestCommitStartResult_AtomicBatchFailureLeavesClaimIntact(t *testing.T) {
 	}
 }
 
+// session.woke is the durable-commit notification: subscribers must never
+// observe a wake whose metadata commit then fails (the reconciler reports
+// failure and retries, so the "fact" the event announced never landed).
+// When the atomic start batch fails no session.woke is emitted; on success
+// exactly one is. Regression test for ga-kmoj9c.
+func TestCommitStartResult_SessionWokeEmittedOnlyAfterDurableCommit(t *testing.T) {
+	successResult := func(session *beads.Bead) startResult {
+		return startResult{
+			prepared: preparedStart{
+				candidate: startCandidate{
+					session: session,
+					tp: TemplateParams{
+						SessionName:  "sky",
+						TemplateName: "helper",
+					},
+				},
+				coreHash: "core",
+				liveHash: "live",
+			},
+			outcome:  "success",
+			started:  time.Date(2026, 3, 18, 12, 0, 0, 0, time.UTC),
+			finished: time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC),
+		}
+	}
+	sessionMeta := func() map[string]string {
+		return map[string]string{
+			"session_name": "sky",
+			"state":        "creating",
+		}
+	}
+	clk := &clock.Fake{Time: time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC)}
+
+	t.Run("metadata batch failure suppresses the event", func(t *testing.T) {
+		store := &failingMetadataBatchStore{MemStore: beads.NewMemStore(), failBatch: true}
+		session, err := store.Create(beads.Bead{
+			Title:    "helper",
+			Type:     sessionBeadType,
+			Labels:   []string{sessionBeadLabel},
+			Metadata: sessionMeta(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := events.NewFake()
+		if commitStartResult(successResult(&session), store, clk, rec, 0, ioDiscard{}, ioDiscard{}) {
+			t.Fatal("commitStartResult returned true, want false when metadata batch fails")
+		}
+		woke, err := rec.List(events.Filter{Type: events.SessionWoke})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(woke) != 0 {
+			t.Fatalf("session.woke events = %d, want 0 when the durable commit failed", len(woke))
+		}
+	})
+
+	t.Run("successful commit emits exactly one event", func(t *testing.T) {
+		store := beads.NewMemStore()
+		session, err := store.Create(beads.Bead{
+			Title:    "helper",
+			Type:     sessionBeadType,
+			Labels:   []string{sessionBeadLabel},
+			Metadata: sessionMeta(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := events.NewFake()
+		if !commitStartResult(successResult(&session), store, clk, rec, 0, ioDiscard{}, ioDiscard{}) {
+			t.Fatal("commitStartResult returned false for successful start")
+		}
+		woke, err := rec.List(events.Filter{Type: events.SessionWoke})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(woke) != 1 {
+			t.Fatalf("session.woke events = %d, want exactly 1 after the durable commit", len(woke))
+		}
+	})
+}
+
 func TestRefreshConfiguredNamedStartCandidateAddsCurrentSkillFingerprint(t *testing.T) {
 	resetSkillCatalogCache()
 	cityPath := t.TempDir()
@@ -5320,6 +5487,7 @@ func TestExecutePreparedStartWave_SkipsStaleKeyProbeWhenSessionAlreadyRunning(t 
 }
 
 func TestExecutePreparedStartWave_AlreadyRunningRequiresLiveProcess(t *testing.T) {
+	skipSlowCmdGCTest(t, "waits through stale session-key detection; run make test-cmd-gc-process for full coverage")
 	sp := &zombieAfterStartProvider{Fake: runtime.NewFake()}
 	if err := sp.Start(context.Background(), "test-agent", runtime.Config{ProcessNames: []string{"claude"}}); err != nil {
 		t.Fatalf("Start existing session: %v", err)
@@ -5358,11 +5526,139 @@ func TestExecutePreparedStartWave_AlreadyRunningRequiresLiveProcess(t *testing.T
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
 	r := results[0]
+	// The dead agent process must not be silently adopted as alive: the
+	// stale session is recycled (stop + fresh start), and because the
+	// recycled start dies again with the same stale resume key, the
+	// post-start probe still reports the death so recordWakeFailure can
+	// clear the key for the next attempt.
+	if got := fakeRuntimeCallCount(sp.Fake, "Stop"); got != 1 {
+		t.Fatalf("Stop calls = %d, want 1 (zombie recycle)", got)
+	}
+	if got := fakeRuntimeCallCount(sp.Fake, "Start"); got != 2 {
+		t.Fatalf("Start calls = %d, want 2 (setup + recycled start)", got)
+	}
 	if r.err == nil {
-		t.Fatal("expected already-running dead agent process to fail liveness validation")
+		t.Fatal("expected recycled start that dies again to fail liveness validation")
 	}
 	if !strings.Contains(r.err.Error(), "died during startup") {
 		t.Fatalf("unexpected error: %v", r.err)
+	}
+}
+
+func TestExecutePreparedStartWave_RecyclesZombieSession(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "test-agent", runtime.Config{ProcessNames: []string{"claude"}}); err != nil {
+		t.Fatalf("Start existing session: %v", err)
+	}
+	// Simulate a session that survived a supervisor restart with its pane
+	// alive but its agent process gone (e.g. the CLI exited to the shell).
+	sp.Zombies["test-agent"] = true
+	item := preparedStart{
+		candidate: startCandidate{
+			session: &beads.Bead{
+				ID: "gc-102",
+				Metadata: map[string]string{
+					"session_name": "test-agent",
+					"template":     "worker",
+				},
+			},
+			tp: TemplateParams{
+				Command:      "claude",
+				SessionName:  "test-agent",
+				TemplateName: "worker",
+			},
+		},
+		cfg: runtime.Config{
+			Command:      "claude",
+			ProcessNames: []string{"claude"},
+		},
+	}
+
+	results := executePreparedStartWave(
+		context.Background(),
+		[]preparedStart{item},
+		sp,
+		nil,
+		10*time.Second,
+	)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	r := results[0]
+	if r.err != nil {
+		t.Fatalf("zombie session should be recycled, not wedge the start: %v", r.err)
+	}
+	if r.outcome != "success" {
+		t.Fatalf("outcome = %q, want success", r.outcome)
+	}
+	if got := fakeRuntimeCallCount(sp, "Stop"); got != 1 {
+		t.Fatalf("Stop calls = %d, want 1 (zombie recycle)", got)
+	}
+	if got := fakeRuntimeCallCount(sp, "Start"); got != 2 {
+		t.Fatalf("Start calls = %d, want 2 (setup + recycled start)", got)
+	}
+}
+
+func TestExecutePreparedStartWave_RecyclesZombieSessionDespitePendingCreateMismatch(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "test-agent", runtime.Config{ProcessNames: []string{"claude"}}); err != nil {
+		t.Fatalf("Start existing session: %v", err)
+	}
+	// The surviving session carries a previous incarnation's identity and
+	// its agent process is dead. Identity mismatch must not preempt the
+	// recycle: rolling the pending create back would just recreate the
+	// bead next tick and hit the same zombie forever.
+	if err := sp.SetMeta("test-agent", "GC_SESSION_ID", "gc-previous-incarnation"); err != nil {
+		t.Fatalf("SetMeta: %v", err)
+	}
+	sp.Zombies["test-agent"] = true
+	item := preparedStart{
+		candidate: startCandidate{
+			session: &beads.Bead{
+				ID: "gc-103",
+				Metadata: map[string]string{
+					"session_name":         "test-agent",
+					"template":             "worker",
+					"pending_create_claim": "true",
+					"instance_token":       "tok-current",
+				},
+			},
+			tp: TemplateParams{
+				Command:      "claude",
+				SessionName:  "test-agent",
+				TemplateName: "worker",
+			},
+		},
+		cfg: runtime.Config{
+			Command:      "claude",
+			ProcessNames: []string{"claude"},
+		},
+	}
+
+	results := executePreparedStartWave(
+		context.Background(),
+		[]preparedStart{item},
+		sp,
+		nil,
+		10*time.Second,
+	)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	r := results[0]
+	if r.err != nil {
+		t.Fatalf("zombie session should be recycled despite identity mismatch: %v", r.err)
+	}
+	if r.outcome != "success" {
+		t.Fatalf("outcome = %q, want success", r.outcome)
+	}
+	if got := fakeRuntimeCallCount(sp, "Stop"); got != 1 {
+		t.Fatalf("Stop calls = %d, want 1 (zombie recycle)", got)
+	}
+	if got := fakeRuntimeCallCount(sp, "Start"); got != 2 {
+		t.Fatalf("Start calls = %d, want 2 (setup + recycled start)", got)
 	}
 }
 
@@ -6301,5 +6597,163 @@ func TestStopTargetThroughWorkerBoundary_CityStopLeavesSessionAsleep(t *testing.
 	}
 	if got.Metadata["suspended_at"] != "" {
 		t.Fatalf("suspended_at = %q, want empty", got.Metadata["suspended_at"])
+	}
+}
+
+func TestClearStaleResumeKeyMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+	seed := beads.Bead{
+		Metadata: map[string]string{
+			"session_key":         "11111111-2222-3333-4444-555555555555",
+			"started_config_hash": "v1:deadbeef",
+			"resume_flag":         "--resume",
+		},
+	}
+	created, err := store.Create(seed)
+	if err != nil {
+		t.Fatalf("create bead: %v", err)
+	}
+	bead := &beads.Bead{
+		ID:       created.ID,
+		Metadata: map[string]string{},
+	}
+	for k, v := range seed.Metadata {
+		bead.Metadata[k] = v
+	}
+	// Seed the same metadata into the store so the read-back assertion isn't
+	// purely about the in-memory bead.
+	if err := store.SetMetadataBatch(bead.ID, bead.Metadata); err != nil {
+		t.Fatalf("seed metadata: %v", err)
+	}
+
+	clearStaleResumeKeyMetadata(bead, store)
+
+	if got := bead.Metadata["session_key"]; got != "" {
+		t.Fatalf("in-memory session_key = %q, want empty", got)
+	}
+	if got := bead.Metadata["started_config_hash"]; got != "" {
+		t.Fatalf("in-memory started_config_hash = %q, want empty", got)
+	}
+	if got := bead.Metadata["continuation_reset_pending"]; got != "true" {
+		t.Fatalf("in-memory continuation_reset_pending = %q, want true", got)
+	}
+	// resume_flag should be untouched — it's a provider property, not stale state.
+	if got := bead.Metadata["resume_flag"]; got != "--resume" {
+		t.Fatalf("in-memory resume_flag = %q, want preserved", got)
+	}
+
+	persisted, err := store.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got := persisted.Metadata["session_key"]; got != "" {
+		t.Fatalf("persisted session_key = %q, want empty", got)
+	}
+	if got := persisted.Metadata["continuation_reset_pending"]; got != "true" {
+		t.Fatalf("persisted continuation_reset_pending = %q, want true", got)
+	}
+}
+
+func TestClearStaleResumeKeyMetadataNilSafety(t *testing.T) {
+	// Should not panic on a nil bead or a bead with nil metadata + nil store.
+	clearStaleResumeKeyMetadata(nil, nil)
+
+	bead := &beads.Bead{ID: "ch-nilmeta"}
+	clearStaleResumeKeyMetadata(bead, nil)
+	if bead.Metadata == nil {
+		t.Fatalf("bead.Metadata should be initialized")
+	}
+	if got := bead.Metadata["continuation_reset_pending"]; got != "true" {
+		t.Fatalf("continuation_reset_pending = %q, want true", got)
+	}
+}
+
+func TestSessionTranscriptProvider(t *testing.T) {
+	cases := []struct {
+		name     string
+		rp       *config.ResolvedProvider
+		metadata map[string]string
+		want     string
+	}{
+		{
+			name: "builtin ancestor wins",
+			rp:   &config.ResolvedProvider{BuiltinAncestor: "claude", Command: "claude-wrapper"},
+			want: "claude",
+		},
+		{
+			name: "command base name fallback",
+			rp:   &config.ResolvedProvider{Command: "/usr/local/bin/claude --dangerously-skip-permissions"},
+			want: "claude",
+		},
+		{
+			name:     "metadata provider_kind fallback",
+			rp:       &config.ResolvedProvider{},
+			metadata: map[string]string{"provider_kind": "kimi"},
+			want:     "kimi",
+		},
+		{
+			name:     "metadata provider fallback",
+			rp:       nil,
+			metadata: map[string]string{"provider": "codex"},
+			want:     "codex",
+		},
+		{
+			name: "empty when nothing resolves",
+			rp:   nil,
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sessionTranscriptProvider(tc.rp, tc.metadata)
+			if got != tc.want {
+				t.Fatalf("sessionTranscriptProvider() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStaleResumeKeyProbe(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
+	// os.UserHomeDir consults USERPROFILE first on some platforms; clear it so
+	// the test is reproducible.
+	t.Setenv("USERPROFILE", "")
+
+	workDir := "/tmp/projects/example_one"
+	key := "11111111-2222-3333-4444-555555555555"
+
+	// Missing transcript: claude is probeable and reports absent, so the guard
+	// would treat the resume key as stale.
+	if present, probeable := staleResumeKeyProbe("claude", workDir, key); !probeable || present {
+		t.Fatalf("missing claude transcript: probeable=%v present=%v, want probeable && !present", probeable, present)
+	}
+
+	// Create the keyed transcript where claude would store it (canonical slug:
+	// '/' and '.' map to '-', '_' is preserved).
+	slug := sessionlog.ProjectSlug(workDir)
+	projDir := filepath.Join(home, ".claude", "projects", slug)
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, key+".jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if present, probeable := staleResumeKeyProbe("claude", workDir, key); !probeable || !present {
+		t.Fatalf("present claude transcript: probeable=%v present=%v, want probeable && present", probeable, present)
+	}
+
+	// Codex resolves transcripts by cwd/date, not a keyed file, so it is never
+	// probeable and the guard leaves its metadata untouched.
+	if _, probeable := staleResumeKeyProbe("codex", workDir, key); probeable {
+		t.Fatal("codex probeable = true, want false")
+	}
+	// Empty inputs are not probeable.
+	if _, probeable := staleResumeKeyProbe("claude", "", key); probeable {
+		t.Fatal("empty workDir probeable = true, want false")
+	}
+	if _, probeable := staleResumeKeyProbe("claude", workDir, ""); probeable {
+		t.Fatal("empty key probeable = true, want false")
 	}
 }

@@ -67,10 +67,10 @@ Store.MolCook / Store.MolCookOn
 ### Review Quorum Formula
 
 `internal/bootstrap/packs/core/formulas/mol-review-quorum.toml` is a Gas
-City-owned review quorum formula scaffold. It is a core `graph.v2` formula,
-not a separate lifecycle controller. The graph has exactly two reviewer lanes,
-with lane IDs, providers, models, and dispatch targets supplied by formula
-variables, followed by a configured synthesis step.
+City-owned review quorum formula scaffold. It declares
+`formula_compiler = ">=2.0.0"`, not a separate lifecycle controller. The graph
+has exactly two reviewer lanes, with lane IDs, providers, models, and dispatch
+targets supplied by formula variables, followed by a configured synthesis step.
 
 The reviewer lane identity and runtime binding are intentionally configured in
 one obvious place: formula vars. `lane_one_id`, `lane_one_provider`,
@@ -237,7 +237,7 @@ wisp_gc_interval = "5m"
 wisp_ttl = "24h"
 ```
 
-See [Formula Files](../../docs/reference/formula.md) for the file format itself.
+See [the formula specs](../../docs/reference/specs/formula-spec-v2.md) for the file format itself.
 
 ## Testing
 
@@ -261,7 +261,7 @@ See [Formula Files](../../docs/reference/formula.md) for the file format itself.
 
 ## See Also
 
-- [Formula Files](../../docs/reference/formula.md) for the file layout
+- [the formula specs](../../docs/reference/specs/formula-spec-v2.md) for the file layout
 - [Dispatch](dispatch.md) for sling-based formula routing
 - [Orders](orders.md) for formula-backed scheduled work
 - [Bead Store](beads.md) for the `MolCook` interface boundary

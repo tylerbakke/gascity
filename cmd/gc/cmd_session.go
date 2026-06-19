@@ -225,7 +225,8 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	}
 
 	// Store the canonical qualified name so the reconciler can match it
-	// via findAgentByTemplate (which compares against QualifiedName()).
+	// via findAgentByTemplate (which resolves canonical, V1 dir+name, and
+	// legacy bound identities).
 	canonicalTemplate := found.QualifiedName()
 	configuredOwner := sessionNewAliasOwner(cfg, &found)
 	reservationIDs := []string{alias, explicitName}
@@ -1227,8 +1228,8 @@ func buildAttachmentCache(sessions []session.Info, observe ...func(session.Info)
 }
 
 const (
-	resetPendingReason = "reset-pending"
-	circuitOpenReason  = "circuit-open"
+	resetPendingReason = session.LifecycleReasonResetPending
+	circuitOpenReason  = session.LifecycleReasonCircuitOpen
 )
 
 // sessionReason computes the REASON column for a session in gc session list.
@@ -1254,14 +1255,11 @@ func sessionReason(s session.Info, beadIndex map[string]beads.Bead, cfg *config.
 	if lifecycle.BaseState == session.BaseStateArchived && !lifecycle.ContinuityEligible {
 		return "-"
 	}
-	if resetPendingReasonVisible(s, b, sp, now) {
-		return resetPendingReason
+	var isRunning func(string) bool
+	if sp != nil {
+		isRunning = sp.IsRunning
 	}
-	if circuitOpenReasonVisible(b) {
-		return circuitOpenReason
-	}
-
-	if reason := session.LifecycleDisplayReason(b.Status, b.Metadata, now); reason != "" {
+	if reason := session.LifecycleDisplayReasonWithLiveness(b.Status, b.Metadata, now, s.SessionName, isRunning); reason != "" {
 		return reason
 	}
 
@@ -1282,20 +1280,6 @@ func sessionReason(s session.Info, beadIndex map[string]beads.Bead, cfg *config.
 	}
 
 	return "-"
-}
-
-// resetPendingReasonVisible keeps the fallback renderer aligned with the API
-// lifecycle reason rules for live reset requests.
-func resetPendingReasonVisible(s session.Info, b beads.Bead, sp runtime.Provider, now time.Time) bool {
-	var isRunning func(string) bool
-	if sp != nil {
-		isRunning = sp.IsRunning
-	}
-	return session.LifecycleResetPendingReasonVisible(b.Status, b.Metadata, now, s.SessionName, isRunning)
-}
-
-func circuitOpenReasonVisible(b beads.Bead) bool {
-	return strings.TrimSpace(b.Metadata[sessionCircuitStateMetadata]) == circuitOpen.String()
 }
 
 func pinAwakeWakeReasonVisible(b beads.Bead, cfg *config.City, now time.Time) bool {
@@ -1709,6 +1693,15 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	// Capture the session bead state BEFORE close so we have its assignment
+	// identifiers (session_name, alias, etc.) for the post-close work-release
+	// pass. Lookup is best-effort: if the session bead is already missing we
+	// fall back to a synthetic shell carrying only the resolved session ID.
+	closedSessionBead, sessionBeadErr := store.Get(sessionID)
+	if sessionBeadErr != nil {
+		closedSessionBead = beads.Bead{ID: sessionID}
+	}
+
 	closeResult, err := handle.CloseDetailed(context.Background())
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1719,6 +1712,17 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 			fmt.Fprintf(stderr, "gc session close: warning: withdrawing queued wait nudges: %v\n", err) //nolint:errcheck // best-effort stderr
 		}
 	}
+
+	// Release any work beads still assigned to the closed session so the
+	// pool scale-check picks up the freed demand on the next reconcile tick.
+	// Each Update fires the bd on_update hook, which emits a bead.updated
+	// event the supervisor's CachingStore absorbs — the cache-update event
+	// the close path was previously missing (gastownhall/gascity#2625).
+	var rigStores map[string]beads.Store
+	if cityErr == nil && cfg != nil {
+		rigStores = buildStandaloneRigStores(cfg, cityPath, stderr)
+	}
+	unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", stderr)
 
 	if asJSON {
 		if err := writeSessionActionJSON(stdout, sessionActionResult{

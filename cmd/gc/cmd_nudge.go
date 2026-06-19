@@ -20,7 +20,9 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
+	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
@@ -36,8 +38,10 @@ const (
 	defaultQueuedNudgeDeadRetention = 1 * time.Hour
 	defaultNudgePollInterval        = 2 * time.Second
 	defaultNudgePollQuiescence      = 3 * time.Second
-	defaultNudgePollStartGrace      = 15 * time.Second
-	defaultNudgeWaitIdleTimeout     = 30 * time.Second
+	// A controller wake can legitimately take a couple of minutes when the
+	// session has to rematerialize a worktree and complete startup dialog.
+	defaultNudgePollStartGrace  = 5 * time.Minute
+	defaultNudgeWaitIdleTimeout = 30 * time.Second
 )
 
 var errNudgeSessionFenceMismatch = errors.New("queued nudge session fence mismatch")
@@ -115,6 +119,11 @@ func (t nudgeTarget) agentKey() string {
 }
 
 func (t nudgeTarget) pollerKey() string {
+	// Queue items keep alias-oriented Agent values for matching/readability;
+	// poller ownership prefers the concrete session ID so live generations that
+	// share one runtime session name do not reuse each other's sidecar. Keep
+	// the concrete-ID precedence aligned with session.PollerKeyFromBead for
+	// session-bead-derived poller launches.
 	if t.sessionID != "" {
 		return t.sessionID
 	}
@@ -350,6 +359,27 @@ func nonNilQueuedNudges(items []queuedNudge) []queuedNudge {
 }
 
 func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdout, stderr io.Writer) int {
+	// On every prompt, emit a live clock (operator-local + UTC + epoch) as
+	// UserPromptSubmit hook context. When a nudge also fires we fold the clock
+	// into that nudge's single provider-formatted payload (see the combined
+	// write below); otherwise this deferred fallback emits the clock on its
+	// own. Either way exactly one provider hook context is written per
+	// invocation, so JSON formats (codex/gemini) stay one valid document rather
+	// than two concatenated objects. See clock_inject.go.
+	emittedHookContext := false
+	var injectPrefix string
+	if inject {
+		// Read the provider hook input once (UserPromptSubmit JSON on stdin,
+		// pipe-only — see readHookStdin) and build the shared inject prefix:
+		// the clock line plus, when context pressure crosses its threshold,
+		// the context-usage guidance (see context_inject.go).
+		injectPrefix = clockInjectLine() + contextInjectLine(readHookStdin())
+		defer func() {
+			if !emittedHookContext && injectPrefix != "" {
+				_ = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", injectPrefix)
+			}
+		}()
+	}
 	targetID := os.Getenv("GC_ALIAS")
 	if targetID == "" {
 		targetID = os.Getenv("GC_SESSION_ID")
@@ -389,13 +419,17 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 		}
 		return 1
 	}
+	deliveryStore := openNudgeBeadStore(target.cityPath)
 	items, rejected := splitQueuedNudgesForTarget(target, items)
 	if len(rejected) > 0 {
-		_ = recordQueuedNudgeFailure(target.cityPath, queuedNudgeIDs(rejected), errNudgeSessionFenceMismatch, time.Now())
+		_ = recordQueuedNudgeFailureWithStore(target.cityPath, deliveryStore, queuedNudgeIDs(rejected), errNudgeSessionFenceMismatch, time.Now())
 	}
-	deliveryStore := openNudgeBeadStore(target.cityPath)
-	items, blocked, err := splitQueuedNudgesForDelivery(deliveryStore, items)
+	candidates := items
+	items, blocked, err := splitQueuedNudgesForDelivery(deliveryStore, candidates)
 	if err != nil {
+		// Release the claims so the next drain or poller pass retries
+		// promptly instead of waiting out the in-flight lease.
+		_ = releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(candidates))
 		if inject {
 			fmt.Fprintf(stderr, "gc nudge drain: validating claimed nudges: %v\n", err) //nolint:errcheck
 			return 0
@@ -405,12 +439,10 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 	}
 	if len(blocked) > 0 {
 		if err := terminalizeBlockedQueuedNudges(target.cityPath, blocked); err != nil {
-			if inject {
-				fmt.Fprintf(stderr, "gc nudge drain: withdrawing blocked nudges: %v\n", err) //nolint:errcheck
-				return 0
-			}
+			// Best-effort: blocked-item bookkeeping must not abort delivery
+			// of the remaining items. The blocked items stay in-flight and
+			// lease expiry returns them to pending for a later pass.
 			fmt.Fprintf(stderr, "gc nudge drain: withdrawing blocked nudges: %v\n", err) //nolint:errcheck
-			return 1
 		}
 	}
 	if len(items) == 0 {
@@ -428,12 +460,15 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 	}
 	var writeErr error
 	if inject {
-		writeErr = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", out)
+		// Fold the clock into the nudge so a single provider-formatted payload
+		// carries both; this is the one place the combined context is written.
+		emittedHookContext = true
+		writeErr = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", injectPrefix+out)
 	} else {
 		_, writeErr = io.WriteString(stdout, out)
 	}
 	if writeErr != nil {
-		_ = recordQueuedNudgeFailure(target.cityPath, queuedNudgeIDs(items), writeErr, time.Now())
+		_ = recordQueuedNudgeFailureWithStore(target.cityPath, deliveryStore, queuedNudgeIDs(items), writeErr, time.Now())
 		if inject {
 			return 0
 		}
@@ -488,7 +523,7 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 		return 1
 	}
 
-	release, err := acquireNudgePollerLease(target.cityPath, target.sessionName)
+	release, err := acquireNudgePollerLease(target.cityPath, target.sessionName, target.pollerKey())
 	if err != nil {
 		if errors.Is(err, errNudgePollerRunning) {
 			return 0
@@ -506,9 +541,23 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 	}
 	var missingSince time.Time
 	for {
-		obs, err := workerObserveNudgeTarget(target, store, sp)
+		obs, err := nudgeObserveTarget(target, store, sp)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc nudge poll: %v\n", err) //nolint:errcheck
+			// Transient observation failures (store hiccup, runtime probe
+			// race) must not kill the poller while queued work is pending:
+			// for an idle session this sidecar is the only delivery path, so
+			// exiting here strands the queue until something re-launches a
+			// poller. Reuse the missing-session grace window; persistent
+			// failures still exit once it elapses or the queue drains.
+			now := time.Now()
+			if shouldKeepNudgePollerAlive(target, missingSince, now) {
+				if missingSince.IsZero() {
+					missingSince = now
+				}
+				time.Sleep(interval)
+				continue
+			}
 			return 1
 		}
 		if !obs.Running {
@@ -679,6 +728,42 @@ func requestManagedNudgeWake(target nudgeTarget, store beads.Store) error {
 }
 
 func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtime.Provider) (worker.Handle, error) {
+	if target.sessionName != "" {
+		if target.sessionID != "" || target.continuationEpoch != "" {
+			obs, err := workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionName)
+			if err == nil {
+				matches, matchErr := nudgeTargetLiveGenerationMatches(target, obs, sp)
+				if matchErr != nil {
+					return nil, matchErr
+				}
+				if !matches {
+					return nil, fmt.Errorf("%w: live runtime %q no longer matches session generation %q", runtime.ErrSessionNotFound, target.sessionName, target.pollerKey())
+				}
+				if !obs.Running && target.sessionID != "" {
+					return workerHandleForSessionWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
+				}
+			}
+			if err != nil && !errors.Is(err, runtime.ErrSessionNotFound) && !errors.Is(err, session.ErrSessionNotFound) {
+				return nil, err
+			}
+		}
+		handle, err := runtimeWorkerHandleWithConfig(
+			target.cityPath,
+			store,
+			sp,
+			target.cfg,
+			target.sessionName,
+			strings.TrimSpace(target.providerName()),
+			strings.TrimSpace(target.sessionTransport()),
+			nil,
+		)
+		if err == nil {
+			return handle, nil
+		}
+		if target.sessionID == "" || !errors.Is(err, runtime.ErrSessionNotFound) {
+			return nil, err
+		}
+	}
 	if target.sessionID != "" {
 		return workerHandleForSessionWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
 	}
@@ -695,10 +780,63 @@ func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtim
 }
 
 func workerObserveNudgeTarget(target nudgeTarget, store beads.Store, sp runtime.Provider) (worker.LiveObservation, error) {
+	if target.sessionName != "" {
+		obs, err := workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionName)
+		if err != nil {
+			return worker.LiveObservation{}, err
+		}
+		matches, err := nudgeTargetLiveGenerationMatches(target, obs, sp)
+		if err != nil {
+			return worker.LiveObservation{}, err
+		}
+		if !matches {
+			obs.Running = false
+			obs.Alive = false
+			obs.Attached = false
+			obs.LastActivity = nil
+		}
+		return obs, nil
+	}
 	if target.sessionID != "" {
 		return workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
 	}
 	return workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionName)
+}
+
+func nudgeTargetLiveGenerationMatches(target nudgeTarget, obs worker.LiveObservation, sp runtime.Provider) (bool, error) {
+	if !obs.Running || (target.sessionID == "" && target.continuationEpoch == "") {
+		return true, nil
+	}
+	if target.sessionID != "" {
+		for _, liveID := range []string{obs.SessionID, obs.RuntimeSessionID} {
+			liveID = strings.TrimSpace(liveID)
+			if liveID != "" && liveID != target.sessionID {
+				return false, nil
+			}
+		}
+	}
+	if sp == nil || target.sessionName == "" {
+		return true, nil
+	}
+	if target.sessionID != "" {
+		liveID, err := sp.GetMeta(target.sessionName, "GC_SESSION_ID")
+		if err != nil && !runtime.IsSessionGone(err) {
+			return false, err
+		}
+		if strings.TrimSpace(liveID) != "" && strings.TrimSpace(liveID) != target.sessionID {
+			return false, nil
+		}
+	}
+	if target.continuationEpoch != "" {
+		liveEpoch, err := sp.GetMeta(target.sessionName, "GC_CONTINUATION_EPOCH")
+		if err != nil && !runtime.IsSessionGone(err) {
+			return false, err
+		}
+		if strings.TrimSpace(liveEpoch) != "" && strings.TrimSpace(liveEpoch) != target.continuationEpoch {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func deliverSessionNudgeWithProvider(target nudgeTarget, sp runtime.Provider, mode nudgeDeliveryMode, stdout, stderr io.Writer) int {
@@ -912,6 +1050,10 @@ func parseNudgeDeliveryMode(raw string) (nudgeDeliveryMode, error) {
 }
 
 func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store beads.Store, sp runtime.Provider, quiescence time.Duration, obs worker.LiveObservation) (bool, error) {
+	matches, err := nudgeTargetLiveGenerationMatches(target, obs, sp)
+	if err != nil || !matches {
+		return false, err
+	}
 	if !pollerSessionIdleEnough(target, sp, quiescence, obs) {
 		return false, nil
 	}
@@ -919,27 +1061,34 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store beads.Store, sp ru
 	if err != nil || len(items) == 0 {
 		return false, err
 	}
-	items, rejected := splitQueuedNudgesForTarget(target, items)
-	if len(rejected) > 0 {
-		if recErr := recordQueuedNudgeFailure(target.cityPath, queuedNudgeIDs(rejected), errNudgeSessionFenceMismatch, time.Now()); recErr != nil {
-			return false, recErr
-		}
-	}
 	deliveryStore := store
 	if deliveryStore == nil {
 		deliveryStore = openNudgeBeadStore(target.cityPath)
 	}
-	items, blocked, err := splitQueuedNudgesForDelivery(deliveryStore, items)
+	// Bookkeeping for fence-mismatched and blocked items is best-effort: a
+	// failure there must not abort delivery of the remaining claimable items.
+	// Items whose bookkeeping failed stay in-flight; lease expiry returns
+	// them to pending and a later pass retries.
+	var bookkeepErr error
+	items, rejected := splitQueuedNudgesForTarget(target, items)
+	if len(rejected) > 0 {
+		if recErr := recordQueuedNudgeFailureWithStore(target.cityPath, deliveryStore, queuedNudgeIDs(rejected), errNudgeSessionFenceMismatch, time.Now()); recErr != nil {
+			bookkeepErr = fmt.Errorf("dead-lettering fence-mismatched nudges: %w", recErr)
+		}
+	}
+	candidates := items
+	items, blocked, err := splitQueuedNudgesForDelivery(deliveryStore, candidates)
 	if err != nil {
-		return false, err
+		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(candidates))
+		return false, errors.Join(bookkeepErr, err, relErr)
 	}
 	if len(blocked) > 0 {
-		if err := terminalizeBlockedQueuedNudges(target.cityPath, blocked); err != nil {
-			return false, err
+		if termErr := terminalizeBlockedQueuedNudges(target.cityPath, blocked); termErr != nil {
+			bookkeepErr = errors.Join(bookkeepErr, fmt.Errorf("withdrawing blocked nudges: %w", termErr))
 		}
 	}
 	if len(items) == 0 {
-		return false, nil
+		return false, bookkeepErr
 	}
 	var msg string
 	if target.sessionTransport() == "acp" {
@@ -949,7 +1098,8 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store beads.Store, sp ru
 	}
 	handle, err := workerHandleForNudgeTarget(target, store, sp)
 	if err != nil {
-		return false, err
+		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
+		return false, errors.Join(bookkeepErr, err, relErr)
 	}
 	result, err := handle.Nudge(context.Background(), worker.NudgeRequest{
 		Text:     msg,
@@ -961,21 +1111,25 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store beads.Store, sp ru
 		telemetry.RecordNudge(context.Background(), target.agentKey(), err)
 		if errors.Is(err, runtime.ErrSessionNotFound) {
 			if recErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items)); recErr != nil {
-				return false, recErr
+				return false, errors.Join(bookkeepErr, recErr)
 			}
-			return false, nil
+			return false, bookkeepErr
 		}
-		if recErr := recordQueuedNudgeFailure(target.cityPath, queuedNudgeIDs(items), err, time.Now()); recErr != nil {
-			return false, recErr
+		if recErr := recordQueuedNudgeFailureWithStore(target.cityPath, deliveryStore, queuedNudgeIDs(items), err, time.Now()); recErr != nil {
+			return false, errors.Join(bookkeepErr, recErr)
 		}
-		return false, nil
+		return false, bookkeepErr
 	}
 	if !result.Delivered {
-		return false, nil
+		// The runtime declined without an error (e.g. the session stopped
+		// between observation and delivery). Release the claims so the next
+		// pass retries promptly instead of waiting out the in-flight lease.
+		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
+		return false, errors.Join(bookkeepErr, relErr)
 	}
 	telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
 	stampLastNudgeDeliveredAt(deliveryStore, target.sessionID, time.Now())
-	return true, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items))
+	return true, errors.Join(bookkeepErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)))
 }
 
 func stampLastNudgeDeliveredAt(store beads.Store, sessionID string, t time.Time) {
@@ -1012,6 +1166,14 @@ func maybeStartNudgePoller(target nudgeTarget) {
 	if target.sessionName == "" {
 		return
 	}
+	// Reap stale poller PID files before deciding whether to spawn. Owning
+	// processes only remove their PID file via the release closure, so any
+	// poller that is killed/crashes/os.Exit's leaves the .pid behind forever.
+	// This low-frequency hook keeps the pollers directory from growing without
+	// bound. The sibling .pid.lock is intentionally left in place (removing it
+	// races concurrent acquirers — see reapStaleNudgePoller). Best-effort:
+	// never block a spawn.
+	_ = reapStaleNudgePollers(target.cityPath)
 	// Supervisor-hosted dispatcher owns delivery in supervisor mode; the
 	// per-session poller would race with it and reintroduce the bd-shellout
 	// load it was designed to eliminate.
@@ -1149,16 +1311,16 @@ func terminalizeBlockedQueuedNudges(cityPath string, blocked map[string][]queued
 }
 
 func ensureNudgePoller(cityPath, agentName, sessionName string) error {
-	pidPath := nudgePollerPIDPath(cityPath, sessionName)
+	pidPath := nudgePollerPIDPath(cityPath, sessionName, agentName)
 	return withNudgePollerPIDLock(pidPath, func() error {
-		if running, _ := existingPollerPID(pidPath); running {
+		if running, _ := existingPollerPID(pidPath, cityPath, sessionName, agentName); running {
 			return nil
 		}
 		exe, err := os.Executable()
 		if err != nil {
 			return err
 		}
-		cmd := exec.Command(exe, "nudge", "poll", "--city", cityPath, "--session", sessionName, agentName)
+		cmd := exec.Command(exe, nudgepoller.CommandArgs(cityPath, sessionName, agentName)...)
 		cmd.Env = os.Environ()
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
@@ -1232,8 +1394,8 @@ func deadReason(item queuedNudge) string {
 	return "dead-letter"
 }
 
-func newQueuedNudge(agentName, message, source string, now time.Time) queuedNudge {
-	return newQueuedNudgeWithOptions(agentName, message, source, now, queuedNudgeOptions{})
+func newQueuedNudge(agentName, message string, now time.Time) queuedNudge {
+	return newQueuedNudgeWithOptions(agentName, message, "session", now, queuedNudgeOptions{})
 }
 
 func newQueuedNudgeWithOptions(agentName, message, source string, now time.Time, opts queuedNudgeOptions) queuedNudge {
@@ -1297,12 +1459,6 @@ func queuedNudgeClaimableForTarget(target nudgeTarget, item queuedNudge) bool {
 	return true
 }
 
-func claimDueQueuedNudges(cityPath, agentName string, now time.Time) ([]queuedNudge, error) {
-	return claimDueQueuedNudgesMatching(cityPath, now, func(item queuedNudge) bool {
-		return item.Agent == agentName
-	})
-}
-
 func claimDueQueuedNudgesForTarget(cityPath string, target nudgeTarget, now time.Time) ([]queuedNudge, error) {
 	return claimDueQueuedNudgesMatching(cityPath, now, func(item queuedNudge) bool {
 		return queuedNudgeClaimableForTarget(target, item)
@@ -1311,6 +1467,7 @@ func claimDueQueuedNudgesForTarget(cityPath string, target nudgeTarget, now time
 
 func claimDueQueuedNudgesMatching(cityPath string, now time.Time, match func(queuedNudge) bool) ([]queuedNudge, error) {
 	store := openNudgeBeadStore(cityPath)
+	defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort
 	var claimed []queuedNudge
 	err := withNudgeQueueState(cityPath, func(state *nudgeQueueState) error {
 		if err := recoverExpiredInFlightNudges(state, store, now); err != nil {
@@ -1346,6 +1503,7 @@ func claimDueQueuedNudgesMatching(cityPath string, now time.Time, match func(que
 
 func listQueuedNudges(cityPath, agentName string, now time.Time) ([]queuedNudge, []queuedNudge, []queuedNudge, error) {
 	store := openNudgeBeadStore(cityPath)
+	defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort
 	var pending []queuedNudge
 	var inFlight []queuedNudge
 	var dead []queuedNudge
@@ -1381,6 +1539,7 @@ func listQueuedNudges(cityPath, agentName string, now time.Time) ([]queuedNudge,
 
 func listQueuedNudgesForTarget(cityPath string, target nudgeTarget, now time.Time) ([]queuedNudge, []queuedNudge, []queuedNudge, error) {
 	store := openNudgeBeadStore(cityPath)
+	defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort
 	var pending []queuedNudge
 	var inFlight []queuedNudge
 	var dead []queuedNudge
@@ -1466,8 +1625,13 @@ func takeQueuedNudgesByID(items []queuedNudge, id string, removed []queuedNudge)
 }
 
 func enqueueQueuedNudgeWithStore(cityPath string, store beads.Store, item queuedNudge) error {
+	ownStore := false
 	if store == nil {
 		store = openNudgeBeadStore(cityPath)
+		ownStore = true
+	}
+	if ownStore {
+		defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort
 	}
 	beadID, created, err := ensureQueuedNudgeBead(store, item)
 	if err != nil {
@@ -1564,6 +1728,7 @@ func ackQueuedNudgesWithOutcome(cityPath string, ids []string, outcome, reason, 
 		return nil
 	}
 	store := openNudgeBeadStore(cityPath)
+	defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort
 	want := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		want[id] = true
@@ -1612,6 +1777,7 @@ func releaseQueuedNudgeClaims(cityPath string, ids []string) error {
 		return nil
 	}
 	store := openNudgeBeadStore(cityPath)
+	defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort
 	want := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		want[id] = true
@@ -1646,21 +1812,38 @@ func releaseQueuedNudgeClaims(cityPath string, ids []string) error {
 }
 
 func recordQueuedNudgeFailure(cityPath string, ids []string, cause error, now time.Time) error {
-	_, err := recordQueuedNudgeFailureDetailed(cityPath, ids, cause, now)
+	return recordQueuedNudgeFailureWithStore(cityPath, nil, ids, cause, now)
+}
+
+func recordQueuedNudgeFailureWithStore(cityPath string, store beads.Store, ids []string, cause error, now time.Time) error {
+	_, err := recordQueuedNudgeFailureDetailed(cityPath, store, ids, cause, now)
 	return err
 }
 
-func recordQueuedNudgeFailureDetailed(cityPath string, ids []string, cause error, now time.Time) ([]queuedNudge, error) {
+// The dead-lettered slice is part of the helper's API (tests assert on it and
+// the *Detailed name promises it), even though the only production caller today
+// is recordQueuedNudgeFailureWithStore, which discards it.
+//
+//nolint:unparam // first result is an intentional diagnostic API
+func recordQueuedNudgeFailureDetailed(cityPath string, store beads.Store, ids []string, cause error, now time.Time) ([]queuedNudge, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	store := openNudgeBeadStore(cityPath)
+	ownStore := false
+	if store == nil {
+		store = openNudgeBeadStore(cityPath)
+		ownStore = true
+	}
+	if ownStore {
+		defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort
+	}
 	want := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		want[id] = true
 	}
 	var deadLettered []queuedNudge
 	err := withNudgeQueueState(cityPath, func(state *nudgeQueueState) error {
+		deadLettered = deadLettered[:0]
 		if err := recoverExpiredInFlightNudges(state, store, now); err != nil {
 			return err
 		}
@@ -1704,15 +1887,24 @@ func recordQueuedNudgeFailureDetailed(cityPath string, ids []string, cause error
 		state.InFlight = inFlight
 		state.Pending = append(state.Pending, requeued...)
 		state.Dead = append(state.Dead, dead...)
-		for _, item := range dead {
-			if err := markQueuedNudgeTerminal(store, item, "failed", item.LastError, "", now); err != nil {
-				return err
-			}
-		}
 		sortQueuedNudges(state)
 		return nil
 	})
-	return deadLettered, err
+	if err != nil {
+		return nil, err
+	}
+	// Mark backing beads terminal outside the queue lock, best-effort. The
+	// dead-letter transition above is authoritative; a failed bead write must
+	// not roll it back, or the items bounce between InFlight and Pending
+	// forever and stale backlogs wedge every delivery pass that claims them.
+	// pruneDeadQueuedNudges repairs dead entries whose backing bead missed
+	// terminal state, so drift converges on later queue operations.
+	for _, item := range deadLettered {
+		if markErr := markQueuedNudgeTerminal(store, item, "failed", item.LastError, "", now); markErr != nil && nudgeWarningWriter != nil {
+			fmt.Fprintf(nudgeWarningWriter, "gc nudge: warning: marking dead-lettered nudge %q terminal: %v\n", item.ID, markErr) //nolint:errcheck
+		}
+	}
+	return deadLettered, nil
 }
 
 func failedQueuedNudge(item queuedNudge, cause error, now time.Time) (queuedNudge, bool) {
@@ -1871,14 +2063,78 @@ func withNudgeQueueState(cityPath string, fn func(*nudgeQueueState) error) error
 	return nudgequeue.WithState(cityPath, fn)
 }
 
-func nudgePollerPIDPath(cityPath, sessionName string) string {
-	return citylayout.RuntimePath(cityPath, "nudges", "pollers", sessionName+".pid")
+func nudgePollerPIDPath(cityPath, sessionName, agentName string) string {
+	return citylayout.RuntimePath(cityPath, "nudges", "pollers", nudgepoller.PollerFileStem(sessionName, agentName)+".pid")
+}
+
+// reapStaleNudgePollers removes orphaned nudge poller PID files left behind by
+// pollers that were killed, crashed, or os.Exit'd without running their release
+// closure. A *.pid file is stale when its contents are unparseable or its PID
+// is no longer alive. The sibling .pid.lock file is deliberately NOT removed —
+// it is the stable per-key flock mutex inode and removing it under the lock
+// would race concurrent acquirers (see reapStaleNudgePoller). The work is done
+// under the same per-file lock the lease path uses so a concurrently starting
+// poller is never raced. It is best-effort: a missing pollers directory is a
+// no-op and per-file errors are accumulated and returned without aborting the
+// sweep.
+func reapStaleNudgePollers(cityPath string) error {
+	pollersDir := citylayout.RuntimePath(cityPath, "nudges", "pollers")
+	entries, err := os.ReadDir(pollersDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading nudge pollers dir: %w", err)
+	}
+	var errs []error
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".pid") {
+			continue
+		}
+		pidPath := filepath.Join(pollersDir, entry.Name())
+		if err := reapStaleNudgePoller(pidPath); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// reapStaleNudgePoller removes pidPath when the PID it names is unparseable or
+// no longer alive. It takes the per-file lock so the liveness check and removal
+// cannot race a poller acquiring the same lease, mirroring exactly what the
+// lease release closure does (which is safe).
+func reapStaleNudgePoller(pidPath string) error {
+	return withNudgePollerPIDLock(pidPath, func() error {
+		data, err := os.ReadFile(pidPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read nudge poller pid %q: %w", pidPath, err)
+		}
+		pidText := strings.TrimSpace(string(data))
+		var pid int
+		if n, parseErr := fmt.Sscanf(pidText, "%d", &pid); parseErr == nil && n == 1 && pidutil.Alive(pid) {
+			return nil
+		}
+		// Remove ONLY the stale .pid. The sibling .pid.lock is intentionally
+		// left in place: it is the stable per-key flock mutex inode. Calling
+		// os.Remove on it while we hold LOCK_EX would let a third concurrent
+		// acquirer create a brand-new lock inode and run its critical section
+		// alongside a blocked acquirer that inherited the now-orphaned inode,
+		// breaking mutual exclusion and double-spawning pollers — exactly what
+		// the lease exists to prevent. Leave the lock inode permanently stable.
+		if err := os.Remove(pidPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale nudge poller pid %q: %w", pidPath, err)
+		}
+		return nil
+	})
 }
 
 var errNudgePollerRunning = errors.New("nudge poller already running")
 
-func acquireNudgePollerLease(cityPath, sessionName string) (func(), error) {
-	pidPath := nudgePollerPIDPath(cityPath, sessionName)
+func acquireNudgePollerLease(cityPath, sessionName, agentName string) (func(), error) {
+	pidPath := nudgePollerPIDPath(cityPath, sessionName, agentName)
 	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
 		return nil, fmt.Errorf("creating nudge poller dir: %w", err)
 	}
@@ -1898,7 +2154,7 @@ func acquireNudgePollerLease(cityPath, sessionName string) (func(), error) {
 		case err == nil && strings.TrimSpace(string(current)) == strings.TrimSpace(string(pid)):
 			return nil
 		case err == nil:
-			if running, _ := existingPollerPID(pidPath); running {
+			if running, _ := existingPollerPID(pidPath, cityPath, sessionName, agentName); running {
 				return errNudgePollerRunning
 			}
 		case !errors.Is(err, os.ErrNotExist):
@@ -1912,7 +2168,7 @@ func acquireNudgePollerLease(cityPath, sessionName string) (func(), error) {
 	return release, nil
 }
 
-func existingPollerPID(pidPath string) (bool, error) {
+func existingPollerPID(pidPath, cityPath, sessionName, agentName string) (bool, error) {
 	data, err := os.ReadFile(pidPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -1928,7 +2184,10 @@ func existingPollerPID(pidPath string) (bool, error) {
 	if _, err := fmt.Sscanf(pidText, "%d", &pid); err != nil || pid <= 0 {
 		return false, nil
 	}
-	if err := syscall.Kill(pid, 0); err == nil || errors.Is(err, syscall.EPERM) {
+	if cityPath == "" || sessionName == "" || agentName == "" {
+		return false, nil
+	}
+	if pidutil.AliveWithCmdline(pid, nudgepoller.CmdlineMatcher(cityPath, sessionName, agentName)) {
 		return true, nil
 	}
 	return false, nil

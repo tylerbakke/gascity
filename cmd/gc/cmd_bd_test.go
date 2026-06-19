@@ -284,6 +284,98 @@ func TestResolveBdScopeTargetUsesRedirectedWorktreeRig(t *testing.T) {
 	}
 }
 
+// TestResolveBdScopeTargetUsesGCRIGEnv covers the bug where GC_RIG env (set by
+// the controller on every rig agent) was silently ignored, causing gc bd list to
+// hit the city HQ database and return empty results instead of rig-scoped results.
+// See gastownhall/gascity#gcy-6ul.
+func TestResolveBdScopeTargetUsesGCRIGEnv(t *testing.T) {
+	setCwd(t, t.TempDir())
+	origProbe := bdBeadExists
+	defer func() { bdBeadExists = origProbe }()
+	bdBeadExists = func(_ string, _ execStoreTarget, _ string) bool { return false }
+
+	cityDir := filepath.Join(t.TempDir(), "city")
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "gascity"},
+		Rigs: []config.Rig{
+			{Name: "chatehr", Path: filepath.Join("rigs", "chatehr"), Prefix: "ch"},
+			{Name: "wren", Path: filepath.Join("rigs", "wren"), Prefix: "projectwrenunity"},
+		},
+	}
+
+	t.Run("GC_RIG env routes to rig when no flag and no bead-id args", func(t *testing.T) {
+		t.Setenv("GC_RIG", "chatehr")
+		got, err := resolveBdScopeTarget(cfg, cityDir, "", []string{"list", "--assignee=chatehr/gastown.refinery", "--status=open"})
+		if err != nil {
+			t.Fatalf("resolveBdScopeTarget() error = %v", err)
+		}
+		want := execStoreTarget{
+			ScopeRoot: filepath.Join(cityDir, "rigs", "chatehr"),
+			ScopeKind: "rig",
+			Prefix:    "ch",
+			RigName:   "chatehr",
+		}
+		if got != want {
+			t.Fatalf("resolveBdScopeTarget() = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("explicit --rig flag overrides GC_RIG env", func(t *testing.T) {
+		t.Setenv("GC_RIG", "chatehr")
+		got, err := resolveBdScopeTarget(cfg, cityDir, "wren", []string{"list"})
+		if err != nil {
+			t.Fatalf("resolveBdScopeTarget() error = %v", err)
+		}
+		want := execStoreTarget{
+			ScopeRoot: filepath.Join(cityDir, "rigs", "wren"),
+			ScopeKind: "rig",
+			Prefix:    "projectwrenunity",
+			RigName:   "wren",
+		}
+		if got != want {
+			t.Fatalf("resolveBdScopeTarget() = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("bead-id prefix detection wins over GC_RIG env", func(t *testing.T) {
+		t.Setenv("GC_RIG", "chatehr")
+		// Restore bdBeadExists to return true for a wren bead
+		origProbe2 := bdBeadExists
+		defer func() { bdBeadExists = origProbe2 }()
+		bdBeadExists = func(_ string, target execStoreTarget, beadID string) bool {
+			return beadID == "projectwrenunity-0xk" && target.RigName == "wren"
+		}
+		got, err := resolveBdScopeTarget(cfg, cityDir, "", []string{"show", "projectwrenunity-0xk"})
+		if err != nil {
+			t.Fatalf("resolveBdScopeTarget() error = %v", err)
+		}
+		want := execStoreTarget{
+			ScopeRoot: filepath.Join(cityDir, "rigs", "wren"),
+			ScopeKind: "rig",
+			Prefix:    "projectwrenunity",
+			RigName:   "wren",
+		}
+		if got != want {
+			t.Fatalf("resolveBdScopeTarget() = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("unknown GC_RIG env falls through to city root", func(t *testing.T) {
+		t.Setenv("GC_RIG", "nonexistent-rig")
+		got, err := resolveBdScopeTarget(cfg, cityDir, "", []string{"list"})
+		if err != nil {
+			t.Fatalf("resolveBdScopeTarget() error = %v", err)
+		}
+		// Must land on city root, not the (unknown) GC_RIG rig.
+		if got.ScopeKind != "city" {
+			t.Fatalf("resolveBdScopeTarget() ScopeKind = %q, want %q", got.ScopeKind, "city")
+		}
+		if got.ScopeRoot != cityDir {
+			t.Fatalf("resolveBdScopeTarget() ScopeRoot = %q, want %q", got.ScopeRoot, cityDir)
+		}
+	})
+}
+
 func TestResolveBdScopeTargetErrorsOnForeignRedirect(t *testing.T) {
 	cityDir := t.TempDir()
 	worktreeDir := filepath.Join(cityDir, ".gc", "worktrees", "frontend", "polecats", "polecat-1")
@@ -578,11 +670,10 @@ func TestGcBdSuppressesBdAutoExportInChildEnv(t *testing.T) {
 	// See TestResolveBdScopeTarget for rationale: isolate cwd so any
 	// `.beads/redirect` in the ambient working tree doesn't surface here.
 	setCwd(t, cityDir)
-	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
-name = "demo"
-`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeBuiltinImportsFixture(t, cityDir, "core", "bd")
 
 	binDir := t.TempDir()
 	script := filepath.Join(binDir, "bd")
@@ -1941,6 +2032,26 @@ func TestGcBdSurfacesSilentFallbackAsLoudError_ClosePath(t *testing.T) {
 	}
 }
 
+func TestGcBdSurfacesSilentFallbackAsLoudError_ReleaseIfCurrentPath(t *testing.T) {
+	silentFallbackTestSetup(t, silentFallbackFakeBdScript)
+
+	var stdout, stderr bytes.Buffer
+	got := doBd([]string{"release-if-current", "demo-abc", "worker-1"}, &stdout, &stderr)
+	if got != bdSilentFallbackExitCode {
+		t.Fatalf("doBd(release-if-current) = %d, want %d (silent-fallback exit code); stderr=%q stdout=%q",
+			got, bdSilentFallbackExitCode, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "managed Dolt unreachable") {
+		t.Fatalf("stderr missing loud-fail message; stderr=%q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "auto-importing") {
+		t.Fatalf("original bd stderr not passed through; stderr=%q", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "released") {
+		t.Fatalf("release-if-current reported success despite silent fallback; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
 // TestGcBdHappyPathExitsZeroWithoutFallbackMarker is the inverse: a clean
 // bd run that produces no auto-import marker must NOT be converted into the
 // loud-fail. This guards against false positives where bd's stderr happens
@@ -2067,4 +2178,494 @@ func TestHeadLimitedWriter(t *testing.T) {
 			t.Fatalf("String() = %q, want empty", got)
 		}
 	})
+}
+
+// TestGcBdHeartbeatRewritesToMetadataUpdate pins the gastownhall/gascity#1855
+// worker-heartbeat write half: `gc bd heartbeat <id>` must forward to bd as
+// `update <id> --set-metadata gc.last_heartbeat_at=<RFC3339 UTC>`. The exact
+// key (with the _at suffix) is what the gas-city-dashboard will read
+// (dashboard #324) to tell a live worker from a dead one, and the stamp must
+// be valid RFC3339 in UTC even when the local clock is in another zone.
+func TestGcBdHeartbeatRewritesToMetadataUpdate(t *testing.T) {
+	origNow := bdHeartbeatNow
+	t.Cleanup(func() { bdHeartbeatNow = origNow })
+	// Pin the clock to a non-UTC zone to prove the rewrite normalizes to UTC.
+	fixed := time.Date(2026, 5, 31, 12, 0, 0, 0, time.FixedZone("PST", -8*3600))
+	bdHeartbeatNow = func() time.Time { return fixed }
+
+	// The fake bd captures its forwarded args so the assertion can inspect them.
+	capture := filepath.Join(t.TempDir(), "gc-bd-args.txt")
+	silentFallbackTestSetup(t, "#!/bin/sh\nprintf '%s' \"$*\" > \"${CAPTURE_PATH}\"\n")
+	t.Setenv("CAPTURE_PATH", capture)
+
+	var stdout, stderr bytes.Buffer
+	if got := doBd([]string{"heartbeat", "demo-abc"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("doBd(heartbeat) = %d, want 0; stderr=%q", got, stderr.String())
+	}
+
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const prefix = "update demo-abc --set-metadata " + heartbeatMetadataKey + "="
+	gotArgs := string(data)
+	stamp, ok := strings.CutPrefix(gotArgs, prefix)
+	if !ok {
+		t.Fatalf("forwarded args = %q, want prefix %q", gotArgs, prefix)
+	}
+	parsed, err := time.Parse(time.RFC3339, stamp)
+	if err != nil {
+		t.Fatalf("heartbeat stamp %q is not valid RFC3339: %v", stamp, err)
+	}
+	if _, offset := parsed.Zone(); offset != 0 {
+		t.Fatalf("heartbeat stamp %q is not UTC (zone offset %d)", stamp, offset)
+	}
+	if want := fixed.UTC().Format(time.RFC3339); stamp != want {
+		t.Fatalf("heartbeat stamp = %q, want %q", stamp, want)
+	}
+}
+
+// TestRewriteBdHeartbeatArgs covers the arg-rewrite edge cases without the
+// full city/bd harness: exactly one issue id is required, and non-heartbeat
+// commands pass through untouched so the generic bd passthrough is intact.
+func TestRewriteBdHeartbeatArgs(t *testing.T) {
+	t.Run("rejects wrong arity, flag-as-id, or whitespace id", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"heartbeat"},
+			{"heartbeat", "demo-abc", "extra"},
+			{"heartbeat", "--flag"},
+			{"heartbeat", ""},
+			{"heartbeat", "  "},        // all-whitespace
+			{"heartbeat", " demo-abc"}, // leading space
+			{"heartbeat", "demo-abc "}, // trailing space
+			{"heartbeat", "demo abc"},  // internal space
+		} {
+			got, err := rewriteBdHeartbeatArgs(args)
+			if err == nil {
+				t.Fatalf("rewriteBdHeartbeatArgs(%q) = (%q, nil), want usage error", args, got)
+			}
+		}
+	})
+	t.Run("rewrites a clean id to a set-metadata update", func(t *testing.T) {
+		out, err := rewriteBdHeartbeatArgs([]string{"heartbeat", "demo-abc"})
+		if err != nil {
+			t.Fatalf("rewriteBdHeartbeatArgs unexpected error: %v", err)
+		}
+		if len(out) != 4 || out[0] != "update" || out[1] != "demo-abc" || out[2] != "--set-metadata" {
+			t.Fatalf("rewriteBdHeartbeatArgs = %q, want [update demo-abc --set-metadata ...]", out)
+		}
+	})
+	t.Run("passes non-heartbeat args through unchanged", func(t *testing.T) {
+		in := []string{"list", "-s", "open"}
+		out, err := rewriteBdHeartbeatArgs(in)
+		if err != nil {
+			t.Fatalf("rewriteBdHeartbeatArgs(%q) unexpected error: %v", in, err)
+		}
+		if len(out) != len(in) || out[0] != "list" || out[2] != "open" {
+			t.Fatalf("rewriteBdHeartbeatArgs(%q) = %q, want passthrough", in, out)
+		}
+	})
+}
+
+// TestBdMutationWriteID covers the compatibility shim (first-ID extraction).
+func TestBdMutationWriteID(t *testing.T) {
+	t.Run("extracts id from write subcommands", func(t *testing.T) {
+		cases := []struct {
+			args []string
+			want string
+		}{
+			{[]string{"update", "gcy-dv7", "--title", "x"}, "gcy-dv7"},
+			{[]string{"update", "--title", "x", "gcy-dv7"}, "gcy-dv7"},
+			{[]string{"close", "gcy-dv7"}, "gcy-dv7"},
+			{[]string{"close", "--reason", "done", "gcy-dv7"}, "gcy-dv7"},
+			{[]string{"close", "--force", "--json", "gcy-dv7"}, "gcy-dv7"},
+			{[]string{"reopen", "gcy-dv7"}, "gcy-dv7"},
+			{[]string{"delete", "--force", "gcy-dv7"}, "gcy-dv7"},
+			{[]string{"delete", "--force", "--json", "gcy-dv7"}, "gcy-dv7"},
+			// double-dash separator
+			{[]string{"update", "--", "gcy-dv7"}, "gcy-dv7"},
+		}
+		for _, tc := range cases {
+			got, ok := bdMutationWriteID(tc.args)
+			if !ok || got != tc.want {
+				t.Errorf("bdMutationWriteID(%q) = (%q, %v), want (%q, true)", tc.args, got, ok, tc.want)
+			}
+		}
+	})
+	t.Run("returns false for read or unrecognized subcommands", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"show", "gcy-dv7"},
+			{"list", "-s", "open"},
+			{"query", "gcy-dv7"},
+			{},
+			{"create", "new task"},
+		} {
+			if _, ok := bdMutationWriteID(args); ok {
+				t.Errorf("bdMutationWriteID(%q) returned ok=true, want false", args)
+			}
+		}
+	})
+	// Regression: short ID "gcy-dv7" must NOT be confused for "gcy-wisp-dv78"
+	// by the caller — the returned token is the exact string in args.
+	t.Run("returns the exact supplied token (gcy-g4o regression)", func(t *testing.T) {
+		got, ok := bdMutationWriteID([]string{"update", "gcy-dv7", "--status", "open"})
+		if !ok || got != "gcy-dv7" {
+			t.Errorf("bdMutationWriteID: got (%q, %v), want (\"gcy-dv7\", true)", got, ok)
+		}
+	})
+}
+
+// TestBdMutationWriteIDs covers the full scanner used by the pre-flight guard.
+func TestBdMutationWriteIDs(t *testing.T) {
+	type result struct {
+		ids       []string
+		ok        bool
+		ambiguous bool
+	}
+	cases := []struct {
+		name string
+		args []string
+		want result
+	}{
+		// --- Basic extraction ---
+		{
+			name: "single id, no flags",
+			args: []string{"close", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "id before flags",
+			args: []string{"update", "gcy-dv7", "--title", "x"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "id after long value flag",
+			args: []string{"update", "--title", "new title", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+
+		// --- Short flags (previously broken) ---
+		{
+			name: "short -s value flag before id",
+			args: []string{"update", "-s", "closed", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "short -a value flag before id",
+			args: []string{"update", "-a", "alice", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "short -t value flag before id",
+			args: []string{"update", "-t", "task", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "short -p value flag before id",
+			args: []string{"update", "-p", "P2", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "short -d value flag before id",
+			args: []string{"update", "-d", "description text", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "short -e value flag before id",
+			args: []string{"update", "-e", "60", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "short -r reason flag for close before id",
+			args: []string{"close", "-r", "done", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "short -C directory flag before id",
+			args: []string{"close", "-C", "/some/path", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+
+		// --- --flag=value form ---
+		{
+			name: "--flag=value does not consume next token",
+			args: []string{"update", "--status=closed", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "--title=value with id after",
+			args: []string{"update", "--title=new title", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+
+		// --- Message / notes flags whose values may contain bead tokens ---
+		{
+			name: "notes value contains bead token",
+			args: []string{"update", "--notes", "see gcy-dv7 for context", "gcy-real"},
+			want: result{ids: []string{"gcy-real"}, ok: true},
+		},
+		{
+			name: "append-notes value contains bead token",
+			args: []string{"update", "--append-notes", "related: gcy-dv7", "gcy-real"},
+			want: result{ids: []string{"gcy-real"}, ok: true},
+		},
+
+		// --- Batch IDs ---
+		{
+			name: "batch close multiple ids",
+			args: []string{"close", "id1", "id2", "id3"},
+			want: result{ids: []string{"id1", "id2", "id3"}, ok: true},
+		},
+		{
+			name: "batch delete multiple ids with --force",
+			args: []string{"delete", "--force", "id1", "id2", "id3"},
+			want: result{ids: []string{"id1", "id2", "id3"}, ok: true},
+		},
+		{
+			name: "batch update with flags interspersed",
+			args: []string{"update", "--status", "closed", "id1", "id2"},
+			want: result{ids: []string{"id1", "id2"}, ok: true},
+		},
+
+		// --- Double-dash terminator ---
+		{
+			name: "double-dash: everything after is positional",
+			args: []string{"update", "--", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "double-dash: multiple ids after",
+			args: []string{"close", "--force", "--", "id1", "id2"},
+			want: result{ids: []string{"id1", "id2"}, ok: true},
+		},
+
+		// --- Fail-closed: ambiguous unknown flags ---
+		// gcy-g4o demonstrated break: `close --session gcy-realbead gcy-dv7`
+		// Previously the hand-rolled scanner lacked --session → returned
+		// "gcy-realbead" as the ID, leaving gcy-dv7 unguarded. Now --session
+		// is in the known set so it is correctly handled, but an *unknown*
+		// value flag must trigger ambiguous.
+		{
+			name: "known --session flag handled correctly for close",
+			args: []string{"close", "--session", "sess-id-abc", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "unknown value flag triggers fail-closed",
+			args: []string{"close", "--unknown-future-flag", "gcy-realbead", "gcy-dv7"},
+			want: result{ok: true, ambiguous: true},
+		},
+		{
+			name: "unknown short flag triggers fail-closed",
+			args: []string{"update", "-z", "something", "gcy-dv7"},
+			want: result{ok: true, ambiguous: true},
+		},
+
+		// --- Non-write subcommands ---
+		{
+			name: "show is not a write command",
+			args: []string{"show", "gcy-dv7"},
+			want: result{ok: false},
+		},
+		{
+			name: "list is not a write command",
+			args: []string{"list", "-s", "open"},
+			want: result{ok: false},
+		},
+		{
+			name: "empty args",
+			args: []string{},
+			want: result{ok: false},
+		},
+
+		// --- No IDs supplied (e.g. "last touched" fallback) ---
+		{
+			name: "update with no ids (last-touched fallback)",
+			args: []string{"update", "--status", "closed"},
+			want: result{ids: nil, ok: true},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids, ok, ambiguous := bdMutationWriteIDs(tc.args)
+			if ok != tc.want.ok {
+				t.Errorf("ok = %v, want %v", ok, tc.want.ok)
+			}
+			if ambiguous != tc.want.ambiguous {
+				t.Errorf("ambiguous = %v, want %v", ambiguous, tc.want.ambiguous)
+			}
+			if !bdTestSlicesEqual(ids, tc.want.ids) {
+				t.Errorf("ids = %v, want %v", ids, tc.want.ids)
+			}
+		})
+	}
+}
+
+func bdTestSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestParseBdReleaseIfCurrentArgs(t *testing.T) {
+	id, assignee, ok, err := parseBdReleaseIfCurrentArgs([]string{"release-if-current", "gc-abc", "worker-1"})
+	if err != nil {
+		t.Fatalf("parseBdReleaseIfCurrentArgs unexpected error: %v", err)
+	}
+	if !ok || id != "gc-abc" || assignee != "worker-1" {
+		t.Fatalf("parseBdReleaseIfCurrentArgs = (%q, %q, %v), want gc-abc worker-1 true", id, assignee, ok)
+	}
+	if _, _, ok, err := parseBdReleaseIfCurrentArgs([]string{"list"}); ok || err != nil {
+		t.Fatalf("non-release command parsed as release: ok=%v err=%v", ok, err)
+	}
+	for _, args := range [][]string{
+		{"release-if-current"},
+		{"release-if-current", "gc-abc"},
+		{"release-if-current", "gc-abc", "worker-1", "extra"},
+		{"release-if-current", "", "worker-1"},
+		{"release-if-current", "gc abc", "worker-1"},
+		{"release-if-current", "gc-abc", "worker 1"},
+	} {
+		if _, _, ok, err := parseBdReleaseIfCurrentArgs(args); !ok || err == nil {
+			t.Fatalf("parseBdReleaseIfCurrentArgs(%q) = ok=%v err=%v, want release usage error", args, ok, err)
+		}
+	}
+}
+
+func TestDoBdReleaseIfCurrentUpdatesOnlyMatchingAssignment(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"demo\"\n\n[beads]\nprovider = \"file\"\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	store, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity: %v", err)
+	}
+	created, err := store.Create(beads.Bead{Title: "work", Assignee: "worker-1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Update(created.ID, beads.UpdateOpts{Status: strPtr("in_progress")}); err != nil {
+		t.Fatalf("Update status: %v", err)
+	}
+
+	target := execStoreTarget{ScopeRoot: cityDir, ScopeKind: "city", Prefix: "gc"}
+	var stdout, stderr bytes.Buffer
+	if got := doBdReleaseIfCurrent(cityDir, target, created.ID, "worker-2", &stdout, &stderr); got != 0 {
+		t.Fatalf("doBdReleaseIfCurrent wrong assignee = %d, want 0; stderr=%q", got, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "skipped" {
+		t.Fatalf("wrong-assignee output = %q, want skipped", stdout.String())
+	}
+	got, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get after skipped release: %v", err)
+	}
+	if got.Status != "in_progress" || got.Assignee != "worker-1" {
+		t.Fatalf("skipped release mutated bead: %+v", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if got := doBdReleaseIfCurrent(cityDir, target, created.ID, "worker-1", &stdout, &stderr); got != 0 {
+		t.Fatalf("doBdReleaseIfCurrent matching assignee = %d, want 0; stderr=%q", got, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "released" {
+		t.Fatalf("matching-assignee output = %q, want released", stdout.String())
+	}
+	got, err = store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get after release: %v", err)
+	}
+	if got.Status != "open" || got.Assignee != "" {
+		t.Fatalf("released bead = %+v, want open and unassigned", got)
+	}
+}
+
+func TestDoBdReleaseIfCurrentWorksForBdStoreFallback(t *testing.T) {
+	clearInheritedBeadsEnv(t)
+	origCityFlag := cityFlag
+	origRigFlag := rigFlag
+	defer func() {
+		cityFlag = origCityFlag
+		rigFlag = origRigFlag
+	}()
+	cityFlag = ""
+	rigFlag = ""
+
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "file"
+
+[[rigs]]
+name = "frontend"
+path = "frontend"
+prefix = "fe"
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
+		t.Fatalf("write rig metadata: %v", err)
+	}
+	fakeBin := t.TempDir()
+	sqlLog := filepath.Join(fakeBin, "sql.log")
+	fakeBD := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"sql\" ] && [ \"$2\" = \"--json\" ]; then\n" +
+		"  printf '%s\\n' \"$3\" > " + strconv.Quote(sqlLog) + "\n" +
+		"  printf '{\"rows_affected\":1,\"schema_version\":1}\\n'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"printf 'unexpected bd args:' >&2\n" +
+		"printf ' %s' \"$@\" >&2\n" +
+		"printf '\\n' >&2\n" +
+		"exit 2\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "bd"), []byte(fakeBD), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	setCwd(t, cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
+	t.Setenv("GC_BEADS_FORCE_FALLBACK", "1")
+
+	store, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	if _, ok := underlyingPolicyStoreForTest(store).(*beads.BdStore); !ok {
+		t.Fatalf("openStoreAtForCity returned %T, want policy-wrapped *beads.BdStore", underlyingPolicyStoreForTest(store))
+	}
+
+	target := execStoreTarget{ScopeRoot: rigDir, ScopeKind: "rig", Prefix: "fe"}
+	var stdout, stderr bytes.Buffer
+	if got := doBdReleaseIfCurrent(cityDir, target, "fe-abc", "worker-1", &stdout, &stderr); got != 0 {
+		t.Fatalf("doBdReleaseIfCurrent = %d, want 0; stderr=%q", got, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "released" {
+		t.Fatalf("output = %q, want released", stdout.String())
+	}
+	query, err := os.ReadFile(sqlLog)
+	if err != nil {
+		t.Fatalf("read SQL log: %v", err)
+	}
+	wantQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP WHERE id = 'fe-abc' AND status = 'in_progress' AND assignee = 'worker-1'"
+	if strings.TrimSpace(string(query)) != wantQuery {
+		t.Fatalf("SQL query = %q, want %q", strings.TrimSpace(string(query)), wantQuery)
+	}
 }

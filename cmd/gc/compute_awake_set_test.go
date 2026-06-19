@@ -7,6 +7,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
 var now = time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
@@ -287,6 +288,106 @@ func TestNamedOnDemand_NoWork(t *testing.T) {
 	assertAsleep(t, result, "hello-world--refinery")
 }
 
+func TestNamedOnDemand_ResetPendingWakesWithoutDemand(t *testing.T) {
+	template := "fixture/build-agent"
+	identity := "fixture/reset-target"
+	sessionName := "fixture--reset-target"
+
+	result := ComputeAwakeSet(AwakeInput{
+		Agents:        []AwakeAgent{{QualifiedName: template}},
+		NamedSessions: []AwakeNamedSession{{Identity: identity, Template: template, Mode: "on_demand"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID:                       "mc-reset",
+			SessionName:              sessionName,
+			Template:                 template,
+			State:                    "asleep",
+			NamedIdentity:            identity,
+			ContinuationResetPending: true,
+		}},
+		ScaleCheckCounts: map[string]int{template: 0},
+		Now:              now,
+	})
+
+	assertAwake(t, result, sessionName)
+	assertReason(t, result, sessionName, "reset-pending")
+}
+
+func TestNamedOnDemand_ResetPendingPreservesAssignedWorkDemand(t *testing.T) {
+	template := "fixture/build-agent"
+	identity := "fixture/reset-target"
+	sessionName := "fixture--reset-target"
+
+	result := ComputeAwakeSet(AwakeInput{
+		Agents:        []AwakeAgent{{QualifiedName: template}},
+		NamedSessions: []AwakeNamedSession{{Identity: identity, Template: template, Mode: "on_demand"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID:                       "mc-reset",
+			SessionName:              sessionName,
+			Template:                 template,
+			State:                    "asleep",
+			NamedIdentity:            identity,
+			ContinuationResetPending: true,
+		}},
+		WorkBeads:        []AwakeWorkBead{{ID: "work-1", Assignee: identity, Status: "open", Ready: true}},
+		ScaleCheckCounts: map[string]int{template: 0},
+		Now:              now,
+	})
+
+	assertAwake(t, result, sessionName)
+	assertReason(t, result, sessionName, "reset-pending")
+	if !result[sessionName].HasAssignedWork {
+		t.Fatalf("HasAssignedWork = false, want true")
+	}
+}
+
+func TestNamedOnDemand_ResetPendingWaitHoldStaysAsleep(t *testing.T) {
+	template := "fixture/build-agent"
+	identity := "fixture/reset-target"
+	sessionName := "fixture--reset-target"
+
+	result := ComputeAwakeSet(AwakeInput{
+		Agents:        []AwakeAgent{{QualifiedName: template}},
+		NamedSessions: []AwakeNamedSession{{Identity: identity, Template: template, Mode: "on_demand"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID:                       "mc-reset",
+			SessionName:              sessionName,
+			Template:                 template,
+			State:                    "asleep",
+			NamedIdentity:            identity,
+			ContinuationResetPending: true,
+			WaitHold:                 true,
+		}},
+		ScaleCheckCounts: map[string]int{template: 0},
+		Now:              now,
+	})
+
+	assertAsleep(t, result, sessionName)
+}
+
+func TestNamedOnDemand_ResetPendingWaitsForRestartRequestToClear(t *testing.T) {
+	template := "fixture/build-agent"
+	identity := "fixture/reset-target"
+	sessionName := "fixture--reset-target"
+
+	result := ComputeAwakeSet(AwakeInput{
+		Agents:        []AwakeAgent{{QualifiedName: template}},
+		NamedSessions: []AwakeNamedSession{{Identity: identity, Template: template, Mode: "on_demand"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID:                       "mc-reset",
+			SessionName:              sessionName,
+			Template:                 template,
+			State:                    "asleep",
+			NamedIdentity:            identity,
+			RestartRequested:         true,
+			ContinuationResetPending: true,
+		}},
+		ScaleCheckCounts: map[string]int{template: 0},
+		Now:              now,
+	})
+
+	assertAsleep(t, result, sessionName)
+}
+
 func TestNamedOnDemand_ExactNamedIdentityAssigneeWakes(t *testing.T) {
 	result := ComputeAwakeSet(AwakeInput{
 		Agents:        []AwakeAgent{{QualifiedName: "hello-world/refinery"}},
@@ -480,7 +581,7 @@ func TestScaled_Demand2_OneActive(t *testing.T) {
 	assertAsleep(t, result, "polecat-mc-2") // asleep ephemerals not reused
 }
 
-func TestScaled_NewDemandDoesNotUseActiveAssignedSessions(t *testing.T) {
+func TestScaled_AssignedSessionsFillScaleSlotsBeforeCreatingSessions(t *testing.T) {
 	result := ComputeAwakeSet(AwakeInput{
 		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
 		SessionBeads: []AwakeSessionBead{
@@ -517,8 +618,7 @@ func TestScaled_NewDemandDoesNotUseActiveAssignedSessions(t *testing.T) {
 		suffix := strconv.Itoa(i)
 		assertAwake(t, result, "polecat-assigned-"+suffix)
 		assertReason(t, result, "polecat-assigned-"+suffix, "assigned-work")
-		assertAwake(t, result, "polecat-new-"+suffix)
-		assertReason(t, result, "polecat-new-"+suffix, "scaled:creating")
+		assertAsleep(t, result, "polecat-new-"+suffix)
 	}
 }
 
@@ -730,6 +830,46 @@ func TestDrained_WithAssignedWork_Wakes(t *testing.T) {
 	})
 	assertAwake(t, result, "polecat-mc-1")
 	assertReason(t, result, "polecat-mc-1", "assigned-work")
+}
+
+func TestScaleDemandCountsAssignedSessionBeforeKeepingIdlePoolSibling(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "gascity/gc.run-operator"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-old", SessionName: "gc__run-operator-mc-old", Template: "gascity/gc.run-operator", State: "active"},
+			{ID: "mc-new", SessionName: "gc__run-operator-mc-new", Template: "gascity/gc.run-operator", State: "active"},
+		},
+		WorkBeads: []AwakeWorkBead{{
+			ID: "ga-work", Assignee: "gc__run-operator-mc-new", Status: "in_progress",
+		}},
+		ScaleCheckCounts: map[string]int{"gascity/gc.run-operator": 1},
+		RunningSessions:  map[string]bool{"gc__run-operator-mc-old": true, "gc__run-operator-mc-new": true},
+		Now:              now,
+	})
+
+	assertAsleep(t, result, "gc__run-operator-mc-old")
+	assertAwake(t, result, "gc__run-operator-mc-new")
+	assertReason(t, result, "gc__run-operator-mc-new", "assigned-work")
+}
+
+func TestScaleDemandCountsAssignedSessionBeforeKeepingStartPendingPoolSibling(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "gascity/gc.run-operator"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-pending", SessionName: "gc__run-operator-mc-pending", Template: "gascity/gc.run-operator", State: string(sessionpkg.StateStartPending)},
+			{ID: "mc-new", SessionName: "gc__run-operator-mc-new", Template: "gascity/gc.run-operator", State: "active"},
+		},
+		WorkBeads: []AwakeWorkBead{{
+			ID: "ga-work", Assignee: "gc__run-operator-mc-new", Status: "in_progress",
+		}},
+		ScaleCheckCounts: map[string]int{"gascity/gc.run-operator": 1},
+		RunningSessions:  map[string]bool{"gc__run-operator-mc-new": true},
+		Now:              now,
+	})
+
+	assertAsleep(t, result, "gc__run-operator-mc-pending")
+	assertAwake(t, result, "gc__run-operator-mc-new")
+	assertReason(t, result, "gc__run-operator-mc-new", "assigned-work")
 }
 
 func TestDrained_PinnedStaysAsleepUntilUndrained(t *testing.T) {
@@ -1860,7 +2000,7 @@ func TestNamedAlways_SuspensionPropagation(t *testing.T) {
 			cfg: config.City{
 				Workspace: config.Workspace{Name: "test"},
 				Agents:    []config.Agent{{Name: "witness", Dir: "myrig"}},
-				Rigs:      []config.Rig{{Name: "myrig", Path: "/tmp/myrig", Suspended: true}},
+				Rigs:      []config.Rig{{Name: "myrig", Path: "/tmp/myrig", SuspendedOnStart: true}},
 				NamedSessions: []config.NamedSession{
 					{Template: "witness", Dir: "myrig", Mode: "always"},
 				},
@@ -1879,7 +2019,7 @@ func TestNamedAlways_SuspensionPropagation(t *testing.T) {
 		{
 			name: "city_suspended",
 			cfg: config.City{
-				Workspace: config.Workspace{Name: "test", Suspended: true},
+				Workspace: config.Workspace{Name: "test", SuspendedOnStart: true},
 				Agents:    []config.Agent{{Name: "witness"}},
 				NamedSessions: []config.NamedSession{
 					{Template: "witness", Mode: "always"},
@@ -1890,7 +2030,7 @@ func TestNamedAlways_SuspensionPropagation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := &tt.cfg.Agents[0]
-			if !isAgentEffectivelySuspended(&tt.cfg, a) {
+			if !isAgentEffectivelySuspendedWith(&tt.cfg, a, suspensionstate.State{}) {
 				t.Fatalf("expected agent to be effectively suspended")
 			}
 			qn := a.QualifiedName()
@@ -1903,6 +2043,98 @@ func TestNamedAlways_SuspensionPropagation(t *testing.T) {
 			assertAsleep(t, result, "witness")
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Ad-hoc session grace period (ga-dr4)
+// ---------------------------------------------------------------------------
+
+func TestGracePeriod_ProtectsManualFromIdleSleep(t *testing.T) {
+	// A manual session created 3 min ago with ChatIdleTimeout=2min should
+	// normally be idle-slept. But the 10-min grace period protects it.
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "gascity/claude"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID: "mc-1", SessionName: "s-mc-1", Template: "gascity/claude", State: "active",
+			ManualSession: true, IdleSince: now.Add(-3 * time.Minute),
+			CreatedAt: now.Add(-3 * time.Minute),
+		}},
+		RunningSessions:   map[string]bool{"s-mc-1": true},
+		ChatIdleTimeout:   2 * time.Minute,
+		ManualGracePeriod: 10 * time.Minute,
+		Now:               now,
+	})
+	assertAwake(t, result, "s-mc-1")
+}
+
+func TestGracePeriod_Expired_IdleSleepApplies(t *testing.T) {
+	// A manual session created 15 min ago, idle for 3 min, with
+	// ChatIdleTimeout=2min. Grace period (10m) has expired → idle sleep.
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "gascity/claude"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID: "mc-1", SessionName: "s-mc-1", Template: "gascity/claude", State: "active",
+			ManualSession: true, IdleSince: now.Add(-3 * time.Minute),
+			CreatedAt: now.Add(-15 * time.Minute),
+		}},
+		RunningSessions:   map[string]bool{"s-mc-1": true},
+		ChatIdleTimeout:   2 * time.Minute,
+		ManualGracePeriod: 10 * time.Minute,
+		Now:               now,
+	})
+	assertAsleep(t, result, "s-mc-1")
+}
+
+func TestGracePeriod_ZeroDisabled_IdleSleepApplies(t *testing.T) {
+	// ManualGracePeriod=0 disables the grace period. Normal idle sleep applies.
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "gascity/claude"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID: "mc-1", SessionName: "s-mc-1", Template: "gascity/claude", State: "active",
+			ManualSession: true, IdleSince: now.Add(-3 * time.Minute),
+			CreatedAt: now.Add(-3 * time.Minute),
+		}},
+		RunningSessions:   map[string]bool{"s-mc-1": true},
+		ChatIdleTimeout:   2 * time.Minute,
+		ManualGracePeriod: 0,
+		Now:               now,
+	})
+	assertAsleep(t, result, "s-mc-1")
+}
+
+func TestGracePeriod_NonManualSession_NoEffect(t *testing.T) {
+	// Grace period should NOT protect non-manual (ephemeral) sessions.
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat", SleepAfterIdle: 2 * time.Minute}},
+		SessionBeads: []AwakeSessionBead{{
+			ID: "mc-1", SessionName: "polecat-mc-1", Template: "hello-world/polecat", State: "active",
+			IdleSince: now.Add(-3 * time.Minute),
+			CreatedAt: now.Add(-3 * time.Minute),
+		}},
+		ScaleCheckCounts:  map[string]int{"hello-world/polecat": 1},
+		RunningSessions:   map[string]bool{"polecat-mc-1": true},
+		ManualGracePeriod: 10 * time.Minute,
+		Now:               now,
+	})
+	assertAsleep(t, result, "polecat-mc-1")
+}
+
+func TestGracePeriod_ReasonIsGracePeriod(t *testing.T) {
+	// When grace period protects a session from idle sleep, the reason
+	// should remain "manual" (the desired-set reason), not change.
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "gascity/claude"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID: "mc-1", SessionName: "s-mc-1", Template: "gascity/claude", State: "active",
+			ManualSession: true, IdleSince: now.Add(-3 * time.Minute),
+			CreatedAt: now.Add(-3 * time.Minute),
+		}},
+		RunningSessions:   map[string]bool{"s-mc-1": true},
+		ChatIdleTimeout:   2 * time.Minute,
+		ManualGracePeriod: 10 * time.Minute,
+		Now:               now,
+	})
+	assertReason(t, result, "s-mc-1", "manual")
 }
 
 func TestScaledPool_NotAffectedByRunningOverride(t *testing.T) {

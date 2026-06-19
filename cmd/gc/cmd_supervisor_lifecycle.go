@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	osuser "os/user"
@@ -87,6 +89,71 @@ var (
 	supervisorProcessGroupPollPeriod                    = 20 * time.Millisecond
 	supervisorRuntimeGOOS                               = goruntime.GOOS
 	supervisorWorkspaceServiceCleanupWarnings io.Writer = os.Stderr
+	// supervisorInstallForce is set true by --force on 'gc supervisor install'.
+	// It permits overwriting an existing service unit that references a
+	// different gc binary. Exposed as a var so tests can override it directly.
+	supervisorInstallForce bool
+
+	// supervisorServiceManagerActive reports whether the platform service
+	// manager (launchd on macOS, systemd --user on Linux) considers the
+	// supervisor running. Fallback liveness signal when the control-socket
+	// ping fails (gascity#2984). With GC_SUPERVISOR_SYSTEMD_UNIT set, the
+	// delegated unit is the only authoritative service-manager signal —
+	// gc's own user unit is irrelevant, and a system-scope unit (whose
+	// socket is typically unreachable from the operator's shell) must not
+	// be gated on per-user manager availability; the is-active probe
+	// degrades to false on its own when the manager is unreachable.
+	supervisorServiceManagerActive = func() bool {
+		d, delegated, err := supervisorSystemdDelegation()
+		if err != nil {
+			// Invalid scope: report nothing rather than probing a unit the
+			// operator did not configure; lifecycle commands surface the
+			// configuration error itself.
+			return false
+		}
+		if delegated {
+			return delegatedUnitActive(d)
+		}
+		switch supervisorRuntimeGOOS {
+		case "darwin":
+			return supervisorLaunchdActive(supervisorLaunchdLabel())
+		case "linux":
+			if !supervisorSystemctlUserAvailable() {
+				return false
+			}
+			return supervisorSystemctlActive(supervisorSystemdServiceName())
+		default:
+			return false
+		}
+	}
+	// supervisorAPIReachable reports whether the supervisor HTTP API answers
+	// on its configured loopback address. Complements the service-manager
+	// signal for supervisors not managed by launchd/systemd (gascity#2984).
+	supervisorAPIReachable = func() bool {
+		cfg, err := supervisorLoadConfig(supervisor.ConfigPath())
+		if err != nil {
+			return false
+		}
+		// Normalize wildcard binds to loopback before dialing, mirroring
+		// cmd_service.go: a 0.0.0.0/:: bind is not itself a dialable address
+		// (and 0.0.0.0 GETs fail on macOS).
+		bind := cfg.Supervisor.BindOrDefault()
+		switch bind {
+		case "", "0.0.0.0":
+			bind = "127.0.0.1"
+		case "::", "[::]":
+			bind = "::1"
+		}
+		url := fmt.Sprintf("http://%s/v0/cities",
+			net.JoinHostPort(bind, strconv.Itoa(cfg.Supervisor.PortOrDefault())))
+		client := &http.Client{Timeout: 750 * time.Millisecond}
+		resp, err := client.Get(url)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close() //nolint:errcheck
+		return resp.StatusCode >= 200 && resp.StatusCode < 300
+	}
 )
 
 const supervisorServiceFileMode os.FileMode = 0o600
@@ -157,6 +224,12 @@ func supervisorWorkspaceServiceStateRoots(scope supervisorWorkspaceServiceCleanu
 	return roots
 }
 
+// cleanupSupervisorWorkspaceServices terminates workspace-service processes
+// owned by this supervisor's GC_HOME/registry scope. A second sweep with
+// different matching rules (service-name + state-root + exact-argv +
+// ppid 1) runs before every proxy_process spawn — see
+// internal/workspacesvc/orphan_reap.go. Keep the two mechanisms in mind
+// when changing either.
 func cleanupSupervisorWorkspaceServices(scope supervisorWorkspaceServiceCleanupScope) error {
 	procs, err := findSupervisorWorkspaceServiceProcesses(scope)
 	if err != nil {
@@ -343,7 +416,13 @@ func newSupervisorRunCmd(stdout, stderr io.Writer) *cobra.Command {
 
 This is the canonical long-running control loop. It reads ~/.gc/cities.toml
 for registered cities, manages them from one process, and hosts the shared
-API server.`,
+API server.
+
+Output is teed into ~/.gc/supervisor.log so 'gc supervisor logs' works
+regardless of how the supervisor was invoked. Set GC_SUPERVISOR_LOG_TEE=0
+in the supervisor's environment to disable the tee when the service manager
+already captures output (e.g. a hand-managed systemd unit with
+StandardOutput=journal).`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if doSupervisorRun(stdout, stderr) != 0 {
@@ -395,6 +474,14 @@ func doSupervisorStart(stdout, stderr io.Writer) int {
 }
 
 func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
+	delegation, delegated, err := supervisorSystemdDelegation()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc supervisor start: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if delegated {
+		return delegatedSupervisorStart(delegation, stdout, stderr, jsonOut)
+	}
 	if msg, blocked := platformSupervisorHomeOverrideError(); blocked {
 		fmt.Fprintf(stderr, "gc supervisor start: %s\n", msg) //nolint:errcheck // best-effort stderr
 		return 1
@@ -463,6 +550,39 @@ func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 }
 
 func ensureSupervisorRunning(stdout, stderr io.Writer) int {
+	delegation, delegated, err := supervisorSystemdDelegation()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if delegated {
+		// The operator-managed unit owns install and start; never write
+		// or load gc's own service files in delegated mode.
+		if supervisorAliveHook() != 0 {
+			return 0
+		}
+		// A bounded systemctl-start timeout is not terminal: fall through to
+		// the same socket-then-fallback liveness check that confirms a late
+		// start. Only an ordinary systemctl failure is terminal.
+		if err := runDelegatedSystemctlTimeout(delegation, "start", delegatedSystemctlJobTimeout); err != nil && !isDelegatedSystemctlTimeout(err) {
+			fmt.Fprintf(stderr, "gc: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if waitForSupervisorPID() != 0 {
+			return 0
+		}
+		// The socket never answered — the expected state for a
+		// system-scope unit under another uid. Trust the same fallback
+		// evidence status does (unit active, then API) before calling
+		// the start a failure.
+		if delegatedLivenessWithoutSocket(delegation) != "" {
+			return 0
+		}
+		// A delegated supervisor logs to the journal, not gc's fork-mode
+		// log file — point readiness-timeout diagnostics at the unit.
+		fmt.Fprintf(stderr, "gc: supervisor did not become ready after '%s'; check '%s'\n", delegation.commandHint("start"), delegation.commandHint("status")) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	if msg, blocked := platformSupervisorHomeOverrideError(); blocked {
 		fmt.Fprintf(stderr, "gc supervisor start: %s\n", msg) //nolint:errcheck // best-effort stderr
 		return 1
@@ -500,6 +620,94 @@ func platformSupervisorHomeOverrideError() (string, bool) {
 		return "", false
 	}
 	return fmt.Sprintf("HOME override %q differs from the user home %q; platform supervisor requires the real HOME. Keep HOME unchanged and use GC_HOME for isolated runs", envHome, lookup.HomeDir), true
+}
+
+// supervisorSystemdExecStartBinary returns the gc binary path embedded in the
+// ExecStart line of a systemd unit file, or "" if the line is absent or
+// cannot be parsed. The path may be quoted (strconv.Quote format) or bare.
+func supervisorSystemdExecStartBinary(unit string) string {
+	const prefix = "ExecStart="
+	for _, line := range strings.Split(unit, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(line, prefix)
+		if len(rest) == 0 {
+			return ""
+		}
+		if rest[0] == '"' {
+			// Find the closing quote, honoring backslash escapes.
+			i := 1
+			for i < len(rest) {
+				if rest[i] == '\\' {
+					i += 2
+					continue
+				}
+				if rest[i] == '"' {
+					i++
+					break
+				}
+				i++
+			}
+			unquoted, err := strconv.Unquote(rest[:i])
+			if err != nil {
+				return rest[:i]
+			}
+			return unquoted
+		}
+		// Unquoted: take up to the first space.
+		if idx := strings.IndexByte(rest, ' '); idx >= 0 {
+			return rest[:idx]
+		}
+		return rest
+	}
+	return ""
+}
+
+// supervisorLaunchdPlistGCPath returns the first ProgramArguments string
+// (the gc binary path) from a launchd plist, or "" if not found.
+func supervisorLaunchdPlistGCPath(plist string) string {
+	idx := strings.Index(plist, "<key>ProgramArguments</key>")
+	if idx < 0 {
+		return ""
+	}
+	rest := plist[idx:]
+	arrayStart := strings.Index(rest, "<array>")
+	if arrayStart < 0 {
+		return ""
+	}
+	rest = rest[arrayStart+len("<array>"):]
+	strStart := strings.Index(rest, "<string>")
+	if strStart < 0 {
+		return ""
+	}
+	rest = rest[strStart+len("<string>"):]
+	strEnd := strings.Index(rest, "</string>")
+	if strEnd < 0 {
+		return ""
+	}
+	raw := rest[:strEnd]
+	// Reverse xmlEscape: apply multi-char entities before &amp; to avoid
+	// double-unescaping sequences like &amp;lt;.
+	r := strings.NewReplacer("&lt;", "<", "&gt;", ">", "&quot;", "\"", "&apos;", "'", "&amp;", "&")
+	return r.Replace(raw)
+}
+
+// supervisorSameBinary reports whether path a and path b refer to the same
+// gc binary. It first compares cleaned string paths (handles both pointing
+// at the same location), then falls back to inode comparison (handles one
+// being a symlink to the other).
+func supervisorSameBinary(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	infoA, errA := os.Stat(a)
+	infoB, errB := os.Stat(b)
+	if errA == nil && errB == nil {
+		return os.SameFile(infoA, infoB)
+	}
+	return false
 }
 
 func waitForSupervisorPID() int {
@@ -554,7 +762,12 @@ func newSupervisorLogsCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Tail the supervisor log file",
 		Long: `Tail the machine-wide supervisor log file.
 
-Shows recent log output from background and service-managed supervisor runs.`,
+Shows recent log output from background and service-managed supervisor runs.
+
+When GC_SUPERVISOR_LOG_TEE=0 is set in this shell, the supervisor may be
+writing only to the service manager's log: an existing log file is still
+tailed (with a staleness warning), and when the file is absent the command
+points at the service manager's log instead.`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if doSupervisorLogs(numLines, follow, stdout, stderr) != 0 {
@@ -568,11 +781,62 @@ Shows recent log output from background and service-managed supervisor runs.`,
 	return cmd
 }
 
+// supervisorLogsJournalCmd builds the journalctl invocation for the
+// gc-managed systemd unit, mirroring the requested -n/-f flags.
+func supervisorLogsJournalCmd(numLines int, follow bool) string {
+	journalCmd := fmt.Sprintf("journalctl --user -u %s -n %d", supervisorSystemdServiceName(), numLines)
+	if follow {
+		journalCmd += " -f"
+	}
+	return journalCmd
+}
+
+// supervisorLogsTeeDisabledHint builds the operator-facing pointer printed by
+// `gc supervisor logs` when GC_SUPERVISOR_LOG_TEE=0 disables the supervisor
+// log tee and no log file exists: there is nothing to tail, so direct the
+// operator at the service manager's log instead (journalctl on linux).
+func supervisorLogsTeeDisabledHint(goos string, numLines int, follow bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "gc supervisor logs: log tee is disabled (%s=0); supervisor output goes to the service manager log\n", supervisorLogTeeEnv)
+	if goos == "linux" {
+		fmt.Fprintf(&b, "gc supervisor logs: try: %s\n", supervisorLogsJournalCmd(numLines, follow))
+	}
+	return b.String()
+}
+
+// supervisorLogsTeeDisabledWarning builds the warning printed before tailing
+// an existing log file while GC_SUPERVISOR_LOG_TEE=0 is set in the CLI's
+// environment. The file may still be live: manual `gc supervisor start`,
+// `gc start` restarts, and gc-generated service units all write it via
+// fd/unit redirection regardless of the env, and a service unit's
+// Environment= is invisible to this process.
+func supervisorLogsTeeDisabledWarning(goos, logPath string, numLines int, follow bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "gc supervisor logs: warning: %s=0 is set in this environment; if the supervisor honors it, %s is stale\n", supervisorLogTeeEnv, logPath)
+	if goos == "linux" {
+		fmt.Fprintf(&b, "gc supervisor logs: service manager log: %s\n", supervisorLogsJournalCmd(numLines, follow))
+	}
+	return b.String()
+}
+
 func doSupervisorLogs(numLines int, follow bool, stdout, stderr io.Writer) int {
 	logPath := supervisorLogPath()
 	if _, err := os.Stat(logPath); os.IsNotExist(err) {
+		if supervisorLogTeeDisabled() {
+			// No log file and the tee is disabled in this shell: nothing to
+			// tail, so point the operator at the service manager's log.
+			fmt.Fprint(stderr, supervisorLogsTeeDisabledHint(goruntime.GOOS, numLines, follow)) //nolint:errcheck // best-effort stderr
+			return 1
+		}
 		fmt.Fprintf(stderr, "gc supervisor logs: log file not found: %s\n", logPath) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if supervisorLogTeeDisabled() {
+		// The file exists even though this shell disables the tee. Most
+		// deployment shapes write it via fd/unit redirection independent of
+		// the env, so the file is likely live; warn and tail instead of
+		// misdirecting incident debugging away from real logs.
+		fmt.Fprint(stderr, supervisorLogsTeeDisabledWarning(goruntime.GOOS, logPath, numLines, follow)) //nolint:errcheck // best-effort stderr
 	}
 
 	args := []string{"-n", fmt.Sprintf("%d", numLines)}
@@ -592,7 +856,7 @@ func doSupervisorLogs(numLines int, follow bool, stdout, stderr io.Writer) int {
 }
 
 func newSupervisorInstallCmd(stdout, stderr io.Writer) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install the supervisor as a platform service",
 		Long: `Install the machine-wide supervisor as a platform service that
@@ -605,9 +869,24 @@ starts on login.`,
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&supervisorInstallForce, "force", false,
+		"overwrite an existing service unit even if it references a different gc binary")
+	return cmd
 }
 
 func doSupervisorInstall(stdout, stderr io.Writer) int {
+	delegation, delegated, err := supervisorSystemdDelegation()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if delegated {
+		// The operator-managed unit owns the supervisor lifecycle;
+		// installing gc's own service alongside it would leave two
+		// service managers fighting over one supervisor.
+		fmt.Fprintf(stderr, "gc supervisor install: %s is set (delegated to unit %q); gc does not install its own service files in delegated mode. Unset %s to manage gc's own service.\n", supervisorSystemdUnitEnv, delegation.Unit, supervisorSystemdUnitEnv) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	if msg, blocked := platformSupervisorHomeOverrideError(); blocked {
 		fmt.Fprintf(stderr, "gc supervisor install: %s\n", msg) //nolint:errcheck // best-effort stderr
 		return 1
@@ -649,6 +928,17 @@ preserved sessions, then retry uninstall.`,
 }
 
 func doSupervisorUninstall(stdout, stderr io.Writer) int {
+	delegation, delegated, derr := supervisorSystemdDelegation()
+	if derr != nil {
+		fmt.Fprintf(stderr, "gc supervisor uninstall: %v\n", derr) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if delegated {
+		// Uninstall is a legitimate migration step (removing gc's legacy
+		// unit after delegating), so warn rather than refuse: only
+		// gc-owned service files are touched, never the delegated unit.
+		fmt.Fprintf(stderr, "gc supervisor uninstall: warning: %s is set (delegated to unit %q); uninstall removes only gc's own service files and does not touch the delegated unit\n", supervisorSystemdUnitEnv, delegation.Unit) //nolint:errcheck // best-effort stderr
+	}
 	data, err := buildSupervisorServiceData()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc supervisor uninstall: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -798,6 +1088,9 @@ var supervisorServiceEnvKeys = map[string]bool{
 	"GC_DOLT_LOGLEVEL":                         true,
 	"GC_DOLT_PASSWORD":                         true,
 	"GC_DOLT_USER":                             true,
+	"T3_HOME":                                  true,
+	"T3_WS_URL":                                true,
+	"T3CODE_HOME":                              true,
 	"HOME":                                     true,
 	"LANG":                                     true,
 	"LC_ALL":                                   true,
@@ -819,6 +1112,10 @@ var supervisorServiceFixedEnvKeys = map[string]bool{
 func supervisorServiceExtraEnv() []supervisorServiceEnvVar {
 	env := make(map[string]string)
 	explicitEnvKeys := supervisorServiceExplicitEnvKeys(os.Getenv("GC_SUPERVISOR_ENV"))
+	explicitEnvKeySet := make(map[string]bool, len(explicitEnvKeys))
+	for _, key := range explicitEnvKeys {
+		explicitEnvKeySet[key] = true
+	}
 	for _, entry := range os.Environ() {
 		key, val, ok := strings.Cut(entry, "=")
 		if !ok || val == "" || !shouldPersistSupervisorEnv(key) {
@@ -830,6 +1127,29 @@ func supervisorServiceExtraEnv() []supervisorServiceEnvVar {
 		if val := os.Getenv(key); val != "" {
 			env[key] = val
 		}
+	}
+	// Merge a persistent machine-local secrets file (${GC_HOME}/secrets.env)
+	// as a fallback tier. `gc start` snapshots the calling shell's env into
+	// the service file, so a credential that lives only in this file and was
+	// never exported into the invoking shell would otherwise be dropped —
+	// yielding a blank value and a silent provider auth failure. A non-empty
+	// value already in env (from the shell scan or a GC_SUPERVISOR_ENV opt-in)
+	// still takes precedence; the file only fills keys those tiers left unset.
+	// As elsewhere in this function, an empty value counts as unset. A file
+	// entry must clear the same gate the other tiers use — the persist
+	// allowlist or an explicit opt-in — so a stray key cannot bloat the
+	// service env.
+	for key, val := range supervisorSecretsEnvFileEntries() {
+		if val == "" {
+			continue
+		}
+		if _, ok := env[key]; ok {
+			continue
+		}
+		if !shouldPersistSupervisorEnv(key) && !explicitEnvKeySet[key] {
+			continue
+		}
+		env[key] = val
 	}
 	// Fall back to `launchctl getenv` for known-allowlisted keys and
 	// for GC_SUPERVISOR_ENV opt-ins. Without this, launchctl-set
@@ -887,6 +1207,40 @@ func shouldPersistSupervisorEnv(key string) bool {
 
 func isProviderCredentialEnv(key string) bool {
 	return processenv.IsProviderCredentialEnv(key)
+}
+
+// supervisorSecretsEnvFileName is the dotenv-style file under GC_HOME that
+// supervisorServiceExtraEnv merges as a persistent, machine-local source of
+// provider credentials and other allowlisted service env.
+const supervisorSecretsEnvFileName = "secrets.env"
+
+// supervisorSecretsEnvFilePath returns the absolute path to the supervisor
+// secrets file (${GC_HOME}/secrets.env).
+func supervisorSecretsEnvFilePath() string {
+	return filepath.Join(supervisor.DefaultHome(), supervisorSecretsEnvFileName)
+}
+
+// supervisorSecretsEnvFileEntries reads ${GC_HOME}/secrets.env and returns its
+// parsed key/value pairs. A missing file is the normal case and yields nil. A
+// present-but-unreadable or malformed file is logged to stderr and ignored so
+// a bad secrets file never blocks supervisor install/start; the caller still
+// gates whatever is returned on the persist allowlist or an explicit
+// GC_SUPERVISOR_ENV opt-in.
+func supervisorSecretsEnvFileEntries() map[string]string {
+	path := supervisorSecretsEnvFilePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "gc: reading supervisor secrets file %q: %v\n", path, err)
+		}
+		return nil
+	}
+	entries, err := processenv.ParseEnvFile(string(data))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gc: parsing supervisor secrets file %q: %v\n", path, err)
+		return nil
+	}
+	return entries
 }
 
 func supervisorServiceExplicitEnvKeys(raw string) []string {
@@ -1019,8 +1373,19 @@ func systemdEnv(name, value string) string {
 	return name + "=" + strconv.Quote(value)
 }
 
+// supervisorSystemdQuotePath quotes a path for use in a systemd ExecStart line.
+// Paths that contain no spaces, double-quotes, or backslashes are returned as-is;
+// all others are wrapped in strconv.Quote to produce Go-style double-quoted strings,
+// which systemd unit parsers understand as the quoted-exec-path format.
+func supervisorSystemdQuotePath(s string) string {
+	if strings.ContainsAny(s, " \"\\") {
+		return strconv.Quote(s)
+	}
+	return s
+}
+
 func renderSupervisorTemplate(tmplStr string, data *supervisorServiceData) (string, error) {
-	funcMap := template.FuncMap{"xmlesc": xmlEscape, "systemdenv": systemdEnv, "systemdpath": strconv.Quote}
+	funcMap := template.FuncMap{"xmlesc": xmlEscape, "systemdenv": systemdEnv, "systemdpath": supervisorSystemdQuotePath}
 	tmpl, err := template.New("service").Funcs(funcMap).Parse(tmplStr)
 	if err != nil {
 		return "", err
@@ -1375,6 +1740,17 @@ func installSupervisorLaunchd(data *supervisorServiceData, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "gc supervisor install: reading existing plist: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if hadCurrent && !supervisorInstallForce {
+		if existingBinary := supervisorLaunchdPlistGCPath(string(existing)); existingBinary != "" && !supervisorSameBinary(existingBinary, data.GCPath) {
+			fmt.Fprintf(stderr, //nolint:errcheck // best-effort stderr
+				"gc supervisor install: existing plist %q references binary %q but the current gc binary resolves to %q; "+
+					"refusing to overwrite a plist installed from a different binary. "+
+					"Install gc to a stable location first (e.g. 'make install'), then rerun 'gc supervisor install'. "+
+					"To override, pass --force.\n",
+				path, existingBinary, data.GCPath)
+			return 1
+		}
+	}
 	if contentUnchanged && supervisorAliveHook() != 0 {
 		fmt.Fprintf(stdout, "Installed launchd service: %s\n", path) //nolint:errcheck // best-effort stdout
 		return 0
@@ -1422,7 +1798,10 @@ func uninstallSupervisorLaunchd(_ *supervisorServiceData, stdout, stderr io.Writ
 	path := supervisorLaunchdPlistPath()
 	active := supervisorLaunchdActive(supervisorLaunchdLabel())
 	if sockPath, _ := runningSupervisorSocket(); sockPath != "" {
-		if code := stopSupervisorWithWait(stdout, stderr, true, 30*time.Second); code != 0 {
+		// Socket-protocol stop, never the delegated redirect: uninstall is
+		// cleaning up gc's OWN service and must not stop an operator's
+		// delegated unit (or require systemctl on darwin) as a side effect.
+		if code := stopSupervisorViaSocket(stdout, stderr, true, 30*time.Second); code != 0 {
 			return code
 		}
 	} else if active {
@@ -1492,6 +1871,27 @@ func stopSupervisorSystemdForWarmRefresh(service string) ([]string, error) {
 }
 
 func installSupervisorSystemd(data *supervisorServiceData, stdout, stderr io.Writer) int {
+	// Check the binary guard before probing systemd so a refused install
+	// emits no systemctl calls.
+	path := supervisorSystemdServicePath()
+	existing, err := os.ReadFile(path)
+	hadCurrent := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(stderr, "gc supervisor install: reading existing unit: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if hadCurrent && !supervisorInstallForce {
+		if existingBinary := supervisorSystemdExecStartBinary(string(existing)); existingBinary != "" && !supervisorSameBinary(existingBinary, data.GCPath) {
+			fmt.Fprintf(stderr, //nolint:errcheck // best-effort stderr
+				"gc supervisor install: existing unit %q references binary %q but the current gc binary resolves to %q; "+
+					"refusing to overwrite a unit installed from a different binary. "+
+					"Install gc to a stable location first (e.g. 'make install'), then rerun 'gc supervisor install'. "+
+					"To override, pass --force.\n",
+				path, existingBinary, data.GCPath)
+			return 1
+		}
+	}
+
 	// Bail out before we touch the unit file when there is no per-user
 	// systemd manager to load it. Otherwise daemon-reload + enable both
 	// fail and the rollback path tries daemon-reload again, producing
@@ -1516,15 +1916,8 @@ func installSupervisorSystemd(data *supervisorServiceData, stdout, stderr io.Wri
 		return 1
 	}
 
-	path := supervisorSystemdServicePath()
 	service := supervisorSystemdServiceName()
 	legacyPresent := legacySupervisorTargetsCurrentHome(legacySupervisorSystemdServicePath())
-	existing, err := os.ReadFile(path)
-	hadCurrent := err == nil
-	if err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(stderr, "gc supervisor install: reading existing unit: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1651,7 +2044,10 @@ func uninstallSupervisorSystemd(_ *supervisorServiceData, stdout, stderr io.Writ
 			fmt.Fprintf(stderr, "gc supervisor uninstall: systemd service %s is active but the control socket is unavailable; run 'gc supervisor start' to re-adopt sessions, then retry uninstall\n", service) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		if code := stopSupervisorWithWait(stdout, stderr, true, 30*time.Second); code != 0 {
+		// Socket-protocol stop, never the delegated redirect: uninstall is
+		// cleaning up gc's OWN unit and must not stop an operator's
+		// delegated unit as a side effect.
+		if code := stopSupervisorViaSocket(stdout, stderr, true, 30*time.Second); code != 0 {
 			return code
 		}
 	}

@@ -665,6 +665,45 @@ func TestResolvedWorkerRuntimeTransportUsesResumeMetadataForLegacyACPWithSameCom
 	}
 }
 
+func TestResolvedWorkerRuntimeTransportUsesConfiguredTmuxForCommandOnlyBead(t *testing.T) {
+	resolved := &config.ResolvedProvider{
+		Name:        "kimi",
+		Command:     "aimux",
+		Args:        []string{"run", "kimi"},
+		SupportsACP: true,
+		ACPCommand:  "kimi-acp",
+	}
+
+	got := resolvedWorkerRuntimeTransport(session.Info{
+		Template: "gascity/workflows.kimi",
+		Provider: "kimi",
+		Command:  "aimux run kimi -- --yolo --no-thinking --model kimi-k2.6",
+	}, resolved, config.SessionTransportTmux, nil)
+	if got != config.SessionTransportTmux {
+		t.Fatalf("resolvedWorkerRuntimeTransport() = %q, want tmux", got)
+	}
+}
+
+func TestResolvedWorkerRuntimeTransportUsesStoredACPCommandBeforeConfiguredTmux(t *testing.T) {
+	resolved := &config.ResolvedProvider{
+		Name:        "kimi",
+		Command:     "aimux",
+		Args:        []string{"run", "kimi"},
+		SupportsACP: true,
+		ACPCommand:  "kimi-acp",
+		ACPArgs:     []string{"run", "kimi"},
+	}
+
+	got := resolvedWorkerRuntimeTransport(session.Info{
+		Template: "gascity/workflows.kimi",
+		Provider: "kimi",
+		Command:  "kimi-acp run kimi --resume session-1",
+	}, resolved, config.SessionTransportTmux, nil)
+	if got != config.SessionTransportACP {
+		t.Fatalf("resolvedWorkerRuntimeTransport() = %q, want acp", got)
+	}
+}
+
 func TestResolvedWorkerRuntimeWithConfigErrorsForAmbiguousLegacyACPTransportWithSameCommand(t *testing.T) {
 	cityDir := t.TempDir()
 	writePhase0InterfaceCity(t, cityDir, `[workspace]
@@ -853,6 +892,43 @@ func TestResolveWorkerRuntimeProviderWithConfigMetadataIdentifiesProviderSession
 	}
 	if got := resolved.Name; got != "agent-provider" {
 		t.Fatalf("agent resolved.Name = %q, want agent-provider", got)
+	}
+}
+
+func TestResolvedWorkerRuntimeWithConfigUsesCurrentAgentProviderOverStaleSessionProvider(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "myrig", Provider: "agent-provider"},
+		},
+		Providers: map[string]config.ProviderSpec{
+			"stale-provider": {
+				Command: "true",
+				Args:    []string{"stale"},
+			},
+			"agent-provider": {
+				Command: "true",
+				Args:    []string{"agent"},
+			},
+		},
+	}
+
+	resolved, err := resolvedWorkerRuntimeWithConfigAndMetadata("", cfg, session.Info{
+		Template: "myrig/worker",
+		Provider: "stale-provider",
+		WorkDir:  "/tmp/work",
+	}, "", map[string]string{
+		"session_origin": "ephemeral",
+		"agent_name":     "myrig/worker",
+	})
+	if err != nil {
+		t.Fatalf("resolvedWorkerRuntimeWithConfigAndMetadata: %v", err)
+	}
+	if resolved == nil {
+		t.Fatal("resolvedWorkerRuntimeWithConfigAndMetadata() = nil")
+	}
+	if got := resolved.Provider; got != "agent-provider" {
+		t.Fatalf("resolved.Provider = %q, want agent-provider", got)
 	}
 }
 
@@ -2259,5 +2335,20 @@ func TestWorkerSessionRuntimeResolverWithConfigFallsBackToPersistedProviderWhenC
 	}
 	if got, want := runtimeCfg.Provider, info.Provider; got != want {
 		t.Fatalf("Provider = %q, want %q", got, want)
+	}
+}
+
+// TestWorkerSessionCreateHintsEnablesMouse locks ga-c4w finding #1 for the
+// UNMANAGED `gc session new` direct-start path (controller down): the CLI builds
+// its runtime hints via workerSessionCreateHints, NOT the internal/api
+// sessionCreateHints seam the original fix patched. Without MouseOn here the
+// wheel→scrollback feature never reaches `gc session new` when the city runs
+// unmanaged. Pool/headless agents never use this function — they resolve MouseOn
+// via the reconciler's templateParamsToConfig (guarded by
+// TestResolveTemplateHeadlessAgentStaysMouseOff), so this stays poll-safe.
+func TestWorkerSessionCreateHintsEnablesMouse(t *testing.T) {
+	hints := workerSessionCreateHints(&config.ResolvedProvider{Name: "stub"})
+	if !hints.MouseOn {
+		t.Error("workerSessionCreateHints().MouseOn = false, want true (gc session new unmanaged-direct wheel→scrollback, ga-c4w)")
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/gastownhall/gascity/internal/hooks"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 	"github.com/spf13/cobra"
@@ -52,16 +53,23 @@ func standaloneBuildAgentsFnWithSessionBeads(
 }
 
 // computeSuspendedNames builds a set of session names for agents marked
-// suspended in the config or belonging to suspended rigs. Also includes
-// all agents when the city itself is suspended (workspace.suspended).
-// Used by the reconciler to distinguish suspended agents from true orphans
-// during Phase 2 cleanup.
+// suspended in the config or runtime state, or belonging to suspended
+// rigs. Also includes all agents when the city itself is suspended.
+// Used by the reconciler to distinguish suspended agents from true
+// orphans during Phase 2 cleanup.
 func computeSuspendedNames(cfg *config.City, cityName, cityPath string) map[string]bool {
+	citySt, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
+	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
+	return computeSuspendedNamesWith(cfg, cityName, cityPath, citySt, suspState)
+}
+
+func computeSuspendedNamesWith(cfg *config.City, cityName, cityPath string, citySt suspensionstate.State, suspState suspensionstate.State) map[string]bool {
 	names := make(map[string]bool)
 	st := cfg.Workspace.SessionTemplate
 
-	// City-level suspend: all agents are suspended.
-	if cfg.Workspace.Suspended {
+	// City-level suspend (runtime override ∪ workspace.suspended_on_start):
+	// every agent is effectively suspended.
+	if effectiveCitySuspended(cfg, citySt) {
 		for _, a := range cfg.Agents {
 			names[startupSessionName(cityName, a.QualifiedName(), st)] = true
 		}
@@ -75,14 +83,15 @@ func computeSuspendedNames(cfg *config.City, cityName, cityPath string) map[stri
 			names[startupSessionName(cityName, qn, st)] = true
 		}
 	}
-	// Agents in suspended rigs.
-	suspendedRigPaths := make(map[string]bool)
-	for _, r := range cfg.Rigs {
-		if r.Suspended {
-			suspendedRigPaths[filepath.Clean(r.Path)] = true
+	// Agents in effectively-suspended rigs.
+	suspNames := buildEffectiveSuspendedRigNames(cfg, suspState)
+	if len(suspNames) > 0 {
+		suspendedRigPaths := make(map[string]bool)
+		for _, r := range cfg.Rigs {
+			if suspNames[r.Name] {
+				suspendedRigPaths[filepath.Clean(r.Path)] = true
+			}
 		}
-	}
-	if len(suspendedRigPaths) > 0 {
 		for _, a := range cfg.Agents {
 			if a.Suspended || a.Dir == "" {
 				continue // Already counted or no rig scope.
@@ -144,7 +153,7 @@ func computePoolDeathHandlers(cfg *config.City, cityName, cityPath string, sp ru
 		for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, st, sp) {
 			_, instanceName := config.ParseQualifiedName(qualifiedInstance)
 			instance := deepCopyAgent(&a, instanceName, a.Dir)
-			cmd := instance.EffectiveOnDeath()
+			cmd := instance.EffectiveOnDeathForBeads(cfg.Beads)
 			if cmd == "" {
 				continue
 			}
@@ -887,6 +896,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	dt := newDrainTracker()
 	poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, open, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs)
 	poolDesired := retainScaleCheckPartialPoolDesired(
+		cfg,
 		PoolDesiredCounts(ComputePoolDesiredStates(
 			cfg, poolWorkBeads, open, dsResult.ScaleCheckCounts)),
 		sessionBeads,
@@ -899,7 +909,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	awakeAssignedWorkBeads := filterAssignedWorkBeadsForSessionWake(cfg, cityPath, open, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs)
 	reconcileSessionBeadsAtPathWithNamedDemand(
 		sigCtx, cityPath, open, ds, cfgNames, cfg, sp, oneShotStore,
-		nil, awakeAssignedWorkBeads, rigStores, nil, dt, poolDesired,
+		nil, awakeAssignedWorkBeads, rigStores, nil, dt, nil, poolDesired,
 		dsResult.NamedSessionDemand,
 		dsResult.snapshotQueryPartial(),
 		nil, cityName,
@@ -1091,7 +1101,7 @@ func stageHookFiles(copyFiles []runtime.CopyEntry, cityPath, workDir string, hoo
 	}
 
 	providerSet := hookProviderSet(hookProviders)
-	// workDir-based hooks: gemini, codex, opencode, copilot, cursor, pi, omp.
+	// workDir-based hooks: gemini, codex, antigravity, opencode, mimocode, copilot, cursor, pi, omp, kimi.
 	for _, provider := range orderedWorkDirHookProviders {
 		if !providerSet[provider.name] {
 			continue
@@ -1125,9 +1135,18 @@ func stageHookFiles(copyFiles []runtime.CopyEntry, cityPath, workDir string, hoo
 			}
 		}
 		if !alreadyStaged {
+			// .gc/settings.json uses path-only fingerprinting (Probed: false) so
+			// that binary-upgrade rewrites of the managed settings file do not
+			// cascade stale-session drains. The legacy hooks/claude.json path is
+			// user-authored and uses content hashing. (ga-zfm)
+			probed := settingsRel != path.Join(".gc", "settings.json")
+			var contentHash string
+			if probed {
+				contentHash = runtime.HashPathContent(settingsAbs)
+			}
 			copyFiles = append(copyFiles, runtime.CopyEntry{
 				Src: settingsAbs, RelDst: settingsRel,
-				Probed: true, ContentHash: runtime.HashPathContent(settingsAbs),
+				Probed: probed, ContentHash: contentHash,
 			})
 		}
 	}
@@ -1142,7 +1161,9 @@ type workDirHookProvider struct {
 var orderedWorkDirHookProviders = []workDirHookProvider{
 	{name: "gemini", relPaths: []string{path.Join(".gemini", "settings.json")}},
 	{name: "codex", relPaths: []string{path.Join(".codex", "hooks.json")}},
+	{name: "antigravity", relPaths: []string{path.Join(".agents", "hooks.json")}},
 	{name: "opencode", relPaths: []string{path.Join(".opencode", "plugins", "gascity.js")}},
+	{name: "mimocode", relPaths: []string{path.Join(".mimocode", "plugin", "gascity.js")}},
 	{name: "copilot", relPaths: []string{
 		path.Join(".github", "hooks", "gascity.json"),
 		path.Join(".github", "copilot-instructions.md"),
@@ -1150,6 +1171,10 @@ var orderedWorkDirHookProviders = []workDirHookProvider{
 	{name: "cursor", relPaths: []string{path.Join(".cursor", "hooks.json")}},
 	{name: "pi", relPaths: []string{path.Join(".pi", "extensions", "gc-hooks.js")}},
 	{name: "omp", relPaths: []string{path.Join(".omp", "hooks", "gc-hook.ts")}},
+	{name: "kimi", relPaths: []string{
+		path.Join(".kimi", "config.toml"),
+		path.Join(".kimi", "hooks", "gascity-session-start.py"),
+	}},
 }
 
 func hookFileProvidersForResolved(resolved *config.ResolvedProvider, installHooks []string, providers map[string]config.ProviderSpec) []string {

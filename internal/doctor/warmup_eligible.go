@@ -14,6 +14,10 @@ func (c *BdBackupSizeCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
 // `gc start` warm-up scan.
+func (c *BdBackupStateCheck) WarmupEligible() bool { return false }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
 func (c *BeadsRoleCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
@@ -66,6 +70,10 @@ func (c *DoltConfigCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
 // `gc start` warm-up scan.
+func (c *DoltJournalSizeCheck) WarmupEligible() bool { return false }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
 func (c *DoltNomsSizeCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
@@ -98,6 +106,10 @@ func (c *EventsLogCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
 // `gc start` warm-up scan.
+func (c *FormulaRequirementsCheck) WarmupEligible() bool { return false }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
 func (c *ImplicitImportCacheCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
@@ -107,6 +119,10 @@ func (c *InstructionsFileCheck) WarmupEligible() bool { return false }
 // WarmupEligible returns false; this check is not part of the
 // `gc start` warm-up scan.
 func (c *NestedWorktreePruneCheck) WarmupEligible() bool { return false }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
+func (c *NamedAlwaysMinConflictCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
 // `gc start` warm-up scan.
@@ -155,6 +171,10 @@ func (c *RigPathCheck) WarmupEligible() bool { return false }
 // WarmupEligible returns false; this check is not part of the
 // `gc start` warm-up scan.
 func (c *SkillCollisionCheck) WarmupEligible() bool { return false }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
+func (c *SupervisorHTTPCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
 // `gc start` warm-up scan.

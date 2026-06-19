@@ -52,6 +52,7 @@ type recorderInstruments struct {
 	nudgeTotal           metric.Int64Counter
 	configReloadTotal    metric.Int64Counter
 	controllerTotal      metric.Int64Counter
+	supervisorTotal      metric.Int64Counter
 	bdTotal              metric.Int64Counter
 	slingTotal           metric.Int64Counter
 
@@ -79,6 +80,17 @@ var (
 	instOnce sync.Once
 	inst     recorderInstruments
 )
+
+// ResetInstrumentsForTest re-arms the lazy instrument bindings (recorder and
+// invocation instruments) so the next Record* call re-registers them against
+// the current global MeterProvider. It exists so tests can swap in a
+// manual-reader SDK provider and observe emissions (mirroring ResetForTest).
+// Must be called only from tests, after swapping the global provider, and
+// again after restoring it.
+func ResetInstrumentsForTest() {
+	instOnce = sync.Once{}
+	invInstOnce = sync.Once{}
+}
 
 // initInstruments registers all recorder metric instruments against the current
 // global MeterProvider. Must be called after telemetry.Init so the real
@@ -117,6 +129,9 @@ func initInstruments() {
 		)
 		inst.controllerTotal, _ = m.Int64Counter("gc.controller.lifecycle.total",
 			metric.WithDescription("Total controller lifecycle events"),
+		)
+		inst.supervisorTotal, _ = m.Int64Counter("gc.supervisor.lifecycle.total",
+			metric.WithDescription("Total supervisor lifecycle events"),
 		)
 		inst.bdTotal, _ = m.Int64Counter("gc.bd.calls.total",
 			metric.WithDescription("Total bd CLI command invocations"),
@@ -405,6 +420,22 @@ func RecordControllerLifecycle(ctx context.Context, event string) {
 	)
 }
 
+// RecordSupervisorStarted records a supervisor startup with restart-cause
+// attribution (metrics + log event). previousExit classifies how the
+// previous supervisor instance exited: "clean", "crash", or "unknown".
+func RecordSupervisorStarted(ctx context.Context, previousExit string) {
+	initInstruments()
+	inst.supervisorTotal.Add(ctx, 1,
+		metric.WithAttributes(
+			attribute.String("event", "started"),
+			attribute.String("previous_exit", previousExit),
+		),
+	)
+	emit(ctx, "supervisor.started", otellog.SeverityInfo,
+		otellog.String("previous_exit", previousExit),
+	)
+}
+
 // RecordSling records a sling dispatch (metrics + log event).
 // target is the agent/pool qualified name, targetType is "agent" or "pool",
 // method is "bead" or "formula".
@@ -500,6 +531,28 @@ func RecordBDSlow(ctx context.Context, args []string, dir, agentID string) {
 		kvs = append(kvs, otellog.String("agent_id", event.AgentID))
 	}
 	emit(ctx, "bd.slow", otellog.SeverityWarn, kvs...)
+}
+
+// RecordCacheScanLarge records a beads-cache reconcile full scan whose
+// result size crossed the caller's warn threshold. The reconcile scan is
+// O(active beads) by design and is otherwise silent, so this event makes
+// store growth visible before it degrades every reconcile cycle. rig is the
+// cache's bead ID prefix; an empty prefix is recorded as "(no-prefix)" to
+// match the reconciler's success-log label, so prefix-less stores group
+// cleanly in telemetry backends. beadCount is the number of beads the scan
+// returned; threshold is the warn threshold that fired; elapsed is the
+// wall-clock duration of the backing list call.
+func RecordCacheScanLarge(ctx context.Context, rig string, beadCount, threshold int, elapsed time.Duration) {
+	rig = strings.TrimSpace(rig)
+	if rig == "" {
+		rig = "(no-prefix)"
+	}
+	emit(ctx, "beads.cache.scan_large", otellog.SeverityWarn,
+		otellog.String("rig", rig),
+		otellog.Int64("bead_count", int64(beadCount)),
+		otellog.Int64("threshold", int64(threshold)),
+		otellog.Int64("elapsed_ms", elapsed.Milliseconds()),
+	)
 }
 
 // ── Phase 2 recording functions ──────────────────────────────────────────

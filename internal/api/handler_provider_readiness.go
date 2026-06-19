@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/searchpath"
 	"gopkg.in/yaml.v3"
 )
@@ -51,15 +52,19 @@ var (
 	defaultProviderReadinessItems = []string{"claude", "codex", "gemini"}
 	defaultReadinessItems         = []string{"claude", "codex", "gemini", "github_cli"}
 	supportedProviderReadiness    = readinessItemSet{
-		"claude": {},
-		"codex":  {},
-		"gemini": {},
+		"antigravity": {},
+		"claude":      {},
+		"codex":       {},
+		"gemini":      {},
+		"mimocode":    {},
 	}
 	supportedReadiness = readinessItemSet{
-		"claude":     {},
-		"codex":      {},
-		"gemini":     {},
-		"github_cli": {},
+		"antigravity": {},
+		"claude":      {},
+		"codex":       {},
+		"gemini":      {},
+		"github_cli":  {},
+		"mimocode":    {},
 	}
 	readinessProbeSpecs = map[string]readinessProbeSpec{
 		"claude": {
@@ -79,6 +84,20 @@ var (
 			kind:        probeKindProvider,
 			probe: func(_ context.Context, homeDir string) providerProbeResult {
 				return probeGemini(homeDir)
+			},
+		},
+		"antigravity": {
+			displayName: "Antigravity",
+			kind:        probeKindProvider,
+			probe: func(_ context.Context, homeDir string) providerProbeResult {
+				return probeAntigravity(homeDir)
+			},
+		},
+		"mimocode": {
+			displayName: "MiMo Code",
+			kind:        probeKindProvider,
+			probe: func(_ context.Context, homeDir string) providerProbeResult {
+				return probeMimoCode(homeDir)
 			},
 		},
 		"github_cli": {
@@ -166,6 +185,18 @@ type cachedProviderProbeStore struct {
 func SupportsProviderReadiness(name string) bool {
 	_, ok := supportedProviderReadiness[strings.TrimSpace(name)]
 	return ok
+}
+
+// ProviderReadinessNames returns the readiness-aware provider names in
+// canonical onboarding order.
+func ProviderReadinessNames() []string {
+	names := make([]string, 0, len(supportedProviderReadiness))
+	for _, name := range config.BuiltinProviderOrder() {
+		if _, ok := supportedProviderReadiness[name]; ok {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // ProbeProviders returns readiness results for the requested provider names.
@@ -443,6 +474,66 @@ func probeGemini(homeDir string) providerProbeResult {
 	default:
 		return providerProbeResult{status: probeStatusInvalidConfiguration, detail: fmt.Sprintf("unknown Gemini auth type %q", selectedType)}
 	}
+}
+
+func probeAntigravity(homeDir string) providerProbeResult {
+	if _, ok := findProbeBinary("agy", homeDir); !ok {
+		return providerProbeResult{status: probeStatusNotInstalled, detail: "agy executable not found in probe PATH"}
+	}
+
+	data, err := os.ReadFile(filepath.Join(homeDir, ".gemini", "antigravity-cli", "antigravity-oauth-token"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return providerProbeResult{status: probeStatusNeedsAuth, detail: "missing ~/.gemini/antigravity-cli/antigravity-oauth-token"}
+		}
+		return providerProbeResult{status: probeStatusProbeError, detail: "failed to read Antigravity OAuth token"}
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return providerProbeResult{status: probeStatusNeedsAuth, detail: "Antigravity OAuth token is empty"}
+	}
+	return providerProbeResult{status: probeStatusConfigured}
+}
+
+func probeMimoCode(homeDir string) providerProbeResult {
+	if _, ok := findProbeBinary("mimo", homeDir); !ok {
+		return providerProbeResult{status: probeStatusNotInstalled, detail: "mimo executable not found in probe PATH"}
+	}
+
+	// XIAOMI_API_KEY is the headless auth path (mirrors the GitHub CLI
+	// token-env precedent); the auth.json credential store is the
+	// `mimo providers login` path.
+	if strings.TrimSpace(os.Getenv("XIAOMI_API_KEY")) != "" {
+		return providerProbeResult{status: probeStatusConfigured}
+	}
+
+	authPath := mimoCodeAuthPath(homeDir)
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return providerProbeResult{status: probeStatusNeedsAuth, detail: fmt.Sprintf("set XIAOMI_API_KEY or run `mimo providers login` (missing %s)", authPath)}
+		}
+		return providerProbeResult{status: probeStatusProbeError, detail: fmt.Sprintf("failed to read %s", authPath)}
+	}
+	var credentials map[string]json.RawMessage
+	if err := json.Unmarshal(data, &credentials); err != nil {
+		return providerProbeResult{status: probeStatusProbeError, detail: fmt.Sprintf("invalid JSON in %s", authPath)}
+	}
+	if len(credentials) == 0 {
+		return providerProbeResult{status: probeStatusNeedsAuth, detail: fmt.Sprintf("no credentials in %s; set XIAOMI_API_KEY or run `mimo providers login`", authPath)}
+	}
+	return providerProbeResult{status: probeStatusConfigured}
+}
+
+// mimoCodeAuthPath resolves the credential store written by
+// `mimo providers login`. mimo (an OpenCode fork) places it under the XDG
+// data root: $XDG_DATA_HOME when set to an absolute path, otherwise
+// ~/.local/share.
+func mimoCodeAuthPath(homeDir string) string {
+	dataRoot := filepath.Join(homeDir, ".local", "share")
+	if xdg := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); xdg != "" && filepath.IsAbs(xdg) {
+		dataRoot = xdg
+	}
+	return filepath.Join(dataRoot, "mimocode", "auth.json")
 }
 
 func probeGitHubCLI(ctx context.Context, homeDir string) providerProbeResult {

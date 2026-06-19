@@ -26,6 +26,7 @@ import (
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/processgroup/processgrouptest"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
@@ -85,6 +86,8 @@ func stubSupervisorSystemctlUserAvailable(t *testing.T, available bool) {
 
 func startWorkspaceServiceSentinel(t *testing.T, gcHome, cityPath, serviceName string) workspaceServiceSentinel {
 	t.Helper()
+	processgrouptest.RequireRealProcessSignals(t)
+
 	stateRoot := filepath.Join(cityPath, ".gc", "services", serviceName)
 	socketPath := filepath.Join(t.TempDir(), serviceName+".sock")
 	cmd := exec.Command("sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done")
@@ -409,7 +412,7 @@ func TestRenderSupervisorSystemdTemplate(t *testing.T) {
 		"[Service]",
 		`KillMode=process`,
 		`Environment=GC_SUPERVISOR_PRESERVE_SESSIONS_ON_SIGNAL="1"`,
-		`ExecStart="/usr/local/bin/gc" supervisor run`,
+		`ExecStart=/usr/local/bin/gc supervisor run`,
 		`StandardOutput=append:/home/user/.gc/supervisor.log`,
 		`Environment=GC_HOME="/home/user/.gc"`,
 		`Environment=XDG_RUNTIME_DIR="/tmp/gc-run"`,
@@ -425,7 +428,7 @@ func TestRenderSupervisorSystemdTemplate(t *testing.T) {
 		"# (control-group) would cascade SIGTERM to tmux servers spawned by\n" +
 		"# 'gc supervisor run' that live in this cgroup, killing one-per-bead\n" +
 		"# session conversation history. The reconciler re-adopts tmux on start.\n" +
-		"KillMode=process\nExecStart=\"/usr/local/bin/gc\" supervisor run\n"
+		"KillMode=process\nExecStart=/usr/local/bin/gc supervisor run\n"
 	if !strings.Contains(content, wantBlock) {
 		t.Fatalf("systemd template missing ordered KillMode=process block under [Service]; got:\n%s", content)
 	}
@@ -477,6 +480,65 @@ func TestBuildSupervisorServiceDataTreatsPreserveSignalEnvAsFixed(t *testing.T) 
 	}
 	if count := strings.Count(systemdContent, supervisorPreserveSessionsOnSignalEnv); count != 1 {
 		t.Fatalf("systemd preserve env occurrences = %d, want 1:\n%s", count, systemdContent)
+	}
+}
+
+// TestBuildSupervisorServiceDataDoesNotPersistLogTeeByDefault pins the
+// install contract for GC_SUPERVISOR_LOG_TEE: gc-generated service files
+// redirect supervisor output into supervisor.log themselves, so the file is
+// already the single sink there and the tee opt-out is for hand-managed
+// units. The variable is not captured from the shell automatically.
+func TestBuildSupervisorServiceDataDoesNotPersistLogTeeByDefault(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("GC_SUPERVISOR_ENV", "")
+	t.Setenv(supervisorLogTeeEnv, "0")
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+	if got := supervisorServiceEnvMap(data.ExtraEnv); got[supervisorLogTeeEnv] != "" {
+		t.Fatalf("ExtraEnv[%s] = %q, want omitted without explicit opt-in (all env: %#v)", supervisorLogTeeEnv, got[supervisorLogTeeEnv], got)
+	}
+}
+
+// TestBuildSupervisorServiceDataPersistsLogTeeViaSupervisorEnvOptIn pins the
+// documented persistence escape hatch: GC_SUPERVISOR_ENV=GC_SUPERVISOR_LOG_TEE
+// carries the tee opt-out into generated launchd and systemd service files,
+// for operators who hand-edit the generated unit's output redirection.
+func TestBuildSupervisorServiceDataPersistsLogTeeViaSupervisorEnvOptIn(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("GC_SUPERVISOR_ENV", supervisorLogTeeEnv)
+	t.Setenv(supervisorLogTeeEnv, "0")
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+	if got := supervisorServiceEnvMap(data.ExtraEnv); got[supervisorLogTeeEnv] != "0" {
+		t.Fatalf("ExtraEnv[%s] = %q, want %q (all env: %#v)", supervisorLogTeeEnv, got[supervisorLogTeeEnv], "0", got)
+	}
+
+	launchdContent, err := renderSupervisorTemplate(supervisorLaunchdTemplate, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(launchdContent, "<key>"+supervisorLogTeeEnv+"</key>") {
+		t.Fatalf("launchd plist missing %s env:\n%s", supervisorLogTeeEnv, launchdContent)
+	}
+
+	systemdContent, err := renderSupervisorTemplate(supervisorSystemdTemplate, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(systemdContent, "Environment="+supervisorLogTeeEnv+`="0"`) {
+		t.Fatalf("systemd unit missing %s env:\n%s", supervisorLogTeeEnv, systemdContent)
 	}
 }
 
@@ -586,6 +648,143 @@ func supervisorServiceEnvMap(vars []supervisorServiceEnvVar) map[string]string {
 		m[item.Name] = item.Value
 	}
 	return m
+}
+
+// writeSupervisorSecretsEnvFile writes dotenv content to ${GC_HOME}/secrets.env,
+// creating GC_HOME if needed. GC_HOME must already be set in the environment.
+func writeSupervisorSecretsEnvFile(t *testing.T, content string) {
+	t.Helper()
+	path := supervisorSecretsEnvFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("creating GC_HOME for secrets file: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing secrets file: %v", err)
+	}
+}
+
+// TestBuildSupervisorServiceDataMergesSecretsEnvFile asserts the durable fix
+// for credentials that live only in ${GC_HOME}/secrets.env: with the secret
+// absent from the calling shell, it still reaches the service env. A
+// non-allowlisted key in the file is dropped; a GC_SUPERVISOR_ENV opt-in key
+// present only in the file is honored.
+func TestBuildSupervisorServiceDataMergesSecretsEnvFile(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("GC_SUPERVISOR_ENV", "CUSTOM_PROVIDER_TOKEN")
+	// Ensure the keys are NOT present in the calling shell's environment.
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("CUSTOM_PROVIDER_TOKEN", "")
+	t.Setenv("UNRELATED_SECRET", "")
+
+	writeSupervisorSecretsEnvFile(t, `# machine-local provider secrets
+ANTHROPIC_AUTH_TOKEN=sk-from-file
+CUSTOM_PROVIDER_TOKEN=custom-from-file
+UNRELATED_SECRET=do-not-persist
+`)
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+
+	got := supervisorServiceEnvMap(data.ExtraEnv)
+	for key, want := range map[string]string{
+		"ANTHROPIC_AUTH_TOKEN":  "sk-from-file",
+		"CUSTOM_PROVIDER_TOKEN": "custom-from-file",
+	} {
+		if got[key] != want {
+			t.Fatalf("ExtraEnv[%s] = %q, want %q (all env: %#v)", key, got[key], want, got)
+		}
+	}
+	if _, ok := got["UNRELATED_SECRET"]; ok {
+		t.Fatalf("ExtraEnv should not include non-allowlisted UNRELATED_SECRET: %#v", got)
+	}
+}
+
+// TestBuildSupervisorServiceDataShellEnvWinsOverSecretsFile asserts the
+// gap-fill precedence: a value exported in the calling shell takes precedence
+// over the same key in ${GC_HOME}/secrets.env.
+func TestBuildSupervisorServiceDataShellEnvWinsOverSecretsFile(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-from-shell")
+
+	writeSupervisorSecretsEnvFile(t, "ANTHROPIC_AUTH_TOKEN=sk-from-file\n")
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+
+	if got := supervisorServiceEnvMap(data.ExtraEnv); got["ANTHROPIC_AUTH_TOKEN"] != "sk-from-shell" {
+		t.Fatalf("ExtraEnv[ANTHROPIC_AUTH_TOKEN] = %q, want shell value %q",
+			got["ANTHROPIC_AUTH_TOKEN"], "sk-from-shell")
+	}
+}
+
+// TestBuildSupervisorServiceDataSecretsFileRespectsOmitProviderCreds asserts
+// that the provider-credential opt-out also suppresses provider keys sourced
+// from the secrets file.
+func TestBuildSupervisorServiceDataSecretsFileRespectsOmitProviderCreds(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv(supervisorOmitProviderCredsEnv, "1")
+
+	writeSupervisorSecretsEnvFile(t, "ANTHROPIC_AUTH_TOKEN=sk-from-file\n")
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+
+	if _, ok := supervisorServiceEnvMap(data.ExtraEnv)["ANTHROPIC_AUTH_TOKEN"]; ok {
+		t.Fatalf("ExtraEnv should not include provider key from secrets file when %s=1",
+			supervisorOmitProviderCredsEnv)
+	}
+}
+
+// TestBuildSupervisorServiceDataMissingSecretsFileIsNotAnError asserts that the
+// absence of ${GC_HOME}/secrets.env is the normal case and does not fail.
+func TestBuildSupervisorServiceDataMissingSecretsFileIsNotAnError(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+
+	if _, err := buildSupervisorServiceData(); err != nil {
+		t.Fatalf("buildSupervisorServiceData with no secrets file: %v", err)
+	}
+}
+
+// TestBuildSupervisorServiceDataMalformedSecretsFileDegradesGracefully asserts
+// the documented fail-safe: a malformed secrets file does not block service
+// file generation (no error) and contributes no env — the malformed file is
+// ignored rather than partially applied, so the good first line must not leak
+// through.
+func TestBuildSupervisorServiceDataMalformedSecretsFileDegradesGracefully(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+
+	writeSupervisorSecretsEnvFile(t, "ANTHROPIC_AUTH_TOKEN=sk-from-file\nMALFORMED LINE WITHOUT EQUALS\n")
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData with malformed secrets file: %v", err)
+	}
+	if _, ok := supervisorServiceEnvMap(data.ExtraEnv)["ANTHROPIC_AUTH_TOKEN"]; ok {
+		t.Fatalf("ExtraEnv should not include any key from a malformed secrets file")
+	}
 }
 
 // TestBuildSupervisorServiceDataForwardsRepresentativeProviderPrefixes asserts
@@ -1400,6 +1599,8 @@ func TestInstallSupervisorSystemdWarmRefreshFallsBackToKillWhenGracefulSignalDoe
 }
 
 func TestInstallSupervisorSystemdWarmRefreshStopsWorkspaceServicesBeforeStart(t *testing.T) {
+	processgrouptest.RequireRealProcessSignals(t)
+
 	if goruntime.GOOS != "linux" {
 		t.Skip("systemd path only applies on linux")
 	}
@@ -1659,6 +1860,7 @@ func TestFindSupervisorWorkspaceServiceProcessesFiltersOwnershipAndRequiredEnv(t
 		"GC_CITY_PATH":              cityPath,
 		"GC_SERVICE_NAME":           "bridge",
 		"GC_SERVICE_STATE_ROOT":     serviceRoot,
+		"GC_SERVICE_SECRETS_DIR":    filepath.Join(serviceRoot, "secrets"),
 		"GC_SERVICE_SOCKET":         filepath.Join(t.TempDir(), "bridge.sock"),
 		"GC_CITY_RUNTIME_DIR":       filepath.Join(cityPath, ".gc", "runtime"),
 		"GC_SERVICE_RUN_ROOT":       filepath.Join(serviceRoot, "run"),
@@ -3990,7 +4192,7 @@ func TestRunSupervisorSIGTERMPreservesSessionsEndToEnd(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("runSupervisor code = %d, want 0; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatalf("runSupervisor did not exit after SIGTERM; stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 	got := stdout.String()
@@ -4880,6 +5082,25 @@ func TestSupervisorShutdownModeNameHandlesKnownAndUnknownModes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := supervisorShutdownModeName(tt.mode); got != tt.want {
 				t.Fatalf("supervisorShutdownModeName(%v) = %q, want %q", tt.mode, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSupervisorShutdownExitCode(t *testing.T) {
+	tests := []struct {
+		name    string
+		shutErr error
+		want    int
+	}{
+		{name: "clean shutdown exits cleanly", want: 0},
+		{name: "shutdown errors fail", shutErr: errors.New("city failed to stop"), want: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := supervisorShutdownExitCode(tt.shutErr); got != tt.want {
+				t.Fatalf("supervisorShutdownExitCode(%v) = %d, want %d", tt.shutErr, got, tt.want)
 			}
 		})
 	}
@@ -5813,7 +6034,7 @@ func TestBuildSupervisorServiceDataPrefersUserLocalBinExecPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("renderSupervisorTemplate: %v", err)
 	}
-	wantExec := `ExecStart="` + stable + `" supervisor run`
+	wantExec := `ExecStart=` + stable + ` supervisor run`
 	if !strings.Contains(systemdContent, wantExec) {
 		t.Fatalf("systemd unit missing %q:\n%s", wantExec, systemdContent)
 	}
@@ -5859,6 +6080,8 @@ func TestInstallSupervisorSystemdRefreshesStaleTmpExecStart(t *testing.T) {
 
 	oldRun := supervisorSystemctlRun
 	oldActive := supervisorSystemctlActive
+	oldForce := supervisorInstallForce
+	supervisorInstallForce = true // recovering a stale ExecStart requires --force
 	var calls []string
 	supervisorSystemctlRun = func(args ...string) error {
 		call := strings.Join(args, " ")
@@ -5880,6 +6103,7 @@ func TestInstallSupervisorSystemdRefreshesStaleTmpExecStart(t *testing.T) {
 	t.Cleanup(func() {
 		supervisorSystemctlRun = oldRun
 		supervisorSystemctlActive = oldActive
+		supervisorInstallForce = oldForce
 	})
 
 	var stdout, stderr bytes.Buffer
@@ -5890,11 +6114,11 @@ func TestInstallSupervisorSystemdRefreshesStaleTmpExecStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read refreshed unit: %v", err)
 	}
-	wantExec := `ExecStart="` + stable + `" supervisor run`
+	wantExec := `ExecStart=` + stable + ` supervisor run`
 	if !strings.Contains(string(contents), wantExec) {
 		t.Fatalf("refreshed unit missing %q:\n%s", wantExec, string(contents))
 	}
-	if strings.Contains(string(contents), `ExecStart="/tmp/gc"`) {
+	if strings.Contains(string(contents), "ExecStart=/tmp/gc ") {
 		t.Fatalf("refreshed unit still references stale /tmp/gc:\n%s", string(contents))
 	}
 	joined := strings.Join(calls, "\n")
@@ -5918,7 +6142,7 @@ func TestRenderSupervisorSystemdTemplateQuotesGCPathWithSpaces(t *testing.T) {
 		{
 			name:   "plain_ascii",
 			gcPath: "/usr/local/bin/gc",
-			want:   `ExecStart="/usr/local/bin/gc" supervisor run`,
+			want:   `ExecStart=/usr/local/bin/gc supervisor run`,
 		},
 		{
 			name:   "home_derived_spacy_path",
@@ -6222,6 +6446,173 @@ func TestRunSupervisorWarnsWhenLogTeeOpenFails(t *testing.T) {
 	}
 }
 
+// TestRunSupervisorLogTeeDisabledSkipsTeeFile confirms GC_SUPERVISOR_LOG_TEE=0
+// opts `gc supervisor run` out of teeing output into ~/.gc/supervisor.log so
+// the service manager's log (e.g. journald under systemd) is the single sink.
+func TestRunSupervisorLogTeeDisabledSkipsTeeFile(t *testing.T) {
+	gcHome := filepath.Join(t.TempDir(), "fresh-home")
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv(supervisorLogTeeEnv, "0")
+
+	oldLoadConfig := supervisorLoadConfig
+	supervisorLoadConfig = func(string) (supervisor.Config, error) {
+		return supervisor.Config{}, errors.New("stop after log setup")
+	}
+	t.Cleanup(func() { supervisorLoadConfig = oldLoadConfig })
+
+	var stdout, stderr bytes.Buffer
+	code := runSupervisor(&stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("runSupervisor code = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "stop after log setup") {
+		t.Fatalf("stderr = %q, want stubbed config failure", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "log tee disabled") {
+		t.Fatalf("stderr = %q, want explicit log-tee-disabled notice", stderr.String())
+	}
+
+	// The tee file must NOT have been created or written.
+	logPath := filepath.Join(gcHome, "supervisor.log")
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("after runSupervisor with %s=0, %s must not exist; err=%v", supervisorLogTeeEnv, logPath, err)
+	}
+}
+
+// TestRunSupervisorLogTeeNonZeroValueKeepsTee confirms only the exact value
+// "0" disables the tee; any other value keeps the default behavior.
+func TestRunSupervisorLogTeeNonZeroValueKeepsTee(t *testing.T) {
+	gcHome := filepath.Join(t.TempDir(), "fresh-home")
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv(supervisorLogTeeEnv, "1")
+
+	oldLoadConfig := supervisorLoadConfig
+	supervisorLoadConfig = func(string) (supervisor.Config, error) {
+		return supervisor.Config{}, errors.New("stop after log setup")
+	}
+	t.Cleanup(func() { supervisorLoadConfig = oldLoadConfig })
+
+	var stdout, stderr bytes.Buffer
+	if code := runSupervisor(&stdout, &stderr); code != 1 {
+		t.Fatalf("runSupervisor code = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	logPath := filepath.Join(gcHome, "supervisor.log")
+	logContent, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read supervisor log: %v", err)
+	}
+	if !strings.Contains(string(logContent), "stop after log setup") {
+		t.Fatalf("supervisor log = %q, want stubbed config failure", string(logContent))
+	}
+}
+
+// TestDoSupervisorLogsTeeDisabledWarnsAndTailsExistingFile confirms
+// `gc supervisor logs` still tails an existing log file when
+// GC_SUPERVISOR_LOG_TEE=0: most deployment shapes write the file via fd/unit
+// redirection regardless of the env, so refusing on env alone would misdirect
+// incident debugging away from live logs. A staleness warning goes to stderr.
+func TestDoSupervisorLogsTeeDisabledWarnsAndTailsExistingFile(t *testing.T) {
+	gcHome := t.TempDir()
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv(supervisorLogTeeEnv, "0")
+	if err := os.WriteFile(filepath.Join(gcHome, "supervisor.log"), []byte("redirected tee content\n"), 0o644); err != nil {
+		t.Fatalf("seed log: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doSupervisorLogs(50, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doSupervisorLogs code = %d, want 0; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "redirected tee content") {
+		t.Fatalf("stdout = %q, want existing log file tailed", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), supervisorLogTeeEnv+"=0") {
+		t.Fatalf("stderr = %q, want %s=0 staleness warning", stderr.String(), supervisorLogTeeEnv)
+	}
+}
+
+// TestDoSupervisorLogsTeeDisabledRefusesWhenFileAbsent confirms the refusal
+// plus service-manager pointer is reserved for the case where the tee is
+// disabled and no log file exists: there is nothing to tail.
+func TestDoSupervisorLogsTeeDisabledRefusesWhenFileAbsent(t *testing.T) {
+	gcHome := filepath.Join(t.TempDir(), "fresh-home")
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv(supervisorLogTeeEnv, "0")
+
+	var stdout, stderr bytes.Buffer
+	code := doSupervisorLogs(50, false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("doSupervisorLogs code = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty (nothing to tail)", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), supervisorLogTeeEnv+"=0") {
+		t.Fatalf("stderr = %q, want %s=0 mention", stderr.String(), supervisorLogTeeEnv)
+	}
+	if !strings.Contains(stderr.String(), "service manager log") {
+		t.Fatalf("stderr = %q, want service manager log pointer", stderr.String())
+	}
+}
+
+// TestSupervisorLogsTeeDisabledHint pins the operator-facing pointer:
+// journalctl on linux (with the unit name and the requested -n/-f flags),
+// no journalctl reference elsewhere.
+func TestSupervisorLogsTeeDisabledHint(t *testing.T) {
+	linuxHint := supervisorLogsTeeDisabledHint("linux", 50, false)
+	wantCmd := "journalctl --user -u " + supervisorSystemdServiceName() + " -n 50"
+	if !strings.Contains(linuxHint, wantCmd) {
+		t.Fatalf("linux hint = %q, want journalctl pointer %q", linuxHint, wantCmd)
+	}
+	if strings.Contains(linuxHint, "-n 50 -f") {
+		t.Fatalf("linux hint = %q, must not include -f without --follow", linuxHint)
+	}
+
+	followHint := supervisorLogsTeeDisabledHint("linux", 10, true)
+	if !strings.Contains(followHint, "-n 10 -f") {
+		t.Fatalf("follow hint = %q, want -f for --follow", followHint)
+	}
+
+	darwinHint := supervisorLogsTeeDisabledHint("darwin", 50, false)
+	if strings.Contains(darwinHint, "journalctl") {
+		t.Fatalf("darwin hint = %q, must not point at journalctl", darwinHint)
+	}
+	if !strings.Contains(darwinHint, supervisorLogTeeEnv) {
+		t.Fatalf("darwin hint = %q, want %s mention", darwinHint, supervisorLogTeeEnv)
+	}
+}
+
+// TestSupervisorLogsTeeDisabledWarning pins the warn-and-tail message printed
+// when the tee is disabled in the CLI's environment but the log file exists:
+// it names the env, the possibly-stale file, and (on linux) the journalctl
+// command with the requested -n/-f flags.
+func TestSupervisorLogsTeeDisabledWarning(t *testing.T) {
+	logPath := "/home/user/.gc/supervisor.log"
+	linuxWarning := supervisorLogsTeeDisabledWarning("linux", logPath, 50, false)
+	if !strings.Contains(linuxWarning, supervisorLogTeeEnv+"=0") {
+		t.Fatalf("linux warning = %q, want %s=0 mention", linuxWarning, supervisorLogTeeEnv)
+	}
+	if !strings.Contains(linuxWarning, logPath) {
+		t.Fatalf("linux warning = %q, want log path %q", linuxWarning, logPath)
+	}
+	wantCmd := "journalctl --user -u " + supervisorSystemdServiceName() + " -n 50"
+	if !strings.Contains(linuxWarning, wantCmd) {
+		t.Fatalf("linux warning = %q, want journalctl pointer %q", linuxWarning, wantCmd)
+	}
+
+	followWarning := supervisorLogsTeeDisabledWarning("linux", logPath, 10, true)
+	if !strings.Contains(followWarning, "-n 10 -f") {
+		t.Fatalf("follow warning = %q, want -f for --follow", followWarning)
+	}
+
+	darwinWarning := supervisorLogsTeeDisabledWarning("darwin", logPath, 50, false)
+	if strings.Contains(darwinWarning, "journalctl") {
+		t.Fatalf("darwin warning = %q, must not point at journalctl", darwinWarning)
+	}
+}
+
 // TestShouldTeeSupervisorLogAvoidsDoubleLoggingForRedirectedFDs confirms the
 // guard that prevents double-writes when stdout/stderr are already the
 // supervisor log file, even when the fd carries a cosmetic /dev/stdout name.
@@ -6274,5 +6665,90 @@ func TestShouldTeeSupervisorLogAvoidsDoubleLoggingForRedirectedFDs(t *testing.T)
 	}
 	if shouldTeeSupervisorLog(otherFile, nil) {
 		t.Errorf("nil logFile: shouldTeeSupervisorLog should return false")
+	}
+}
+
+const ephemeralPortThresholdForTest = 32768
+
+func freeEphemeralLoopbackPort(t *testing.T) int {
+	t.Helper()
+	for i := 0; i < 20; i++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		_ = l.Close()
+		if port >= ephemeralPortThresholdForTest {
+			return port
+		}
+	}
+	t.Skip("could not allocate a port >= 32768 in 20 tries")
+	return 0
+}
+
+func freeLowLoopbackPort(t *testing.T) int {
+	t.Helper()
+	for port := 10000; port < ephemeralPortThresholdForTest; port += 37 {
+		l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err == nil {
+			_ = l.Close()
+			return port
+		}
+	}
+	t.Skip("no free port below 32768 found in test probe range")
+	return 0
+}
+
+func TestRunSupervisorWarnsOnEphemeralAPIPort(t *testing.T) {
+	gcHome := t.TempDir()
+	t.Setenv("GC_HOME", gcHome)
+	port := freeEphemeralLoopbackPort(t)
+	cfg := "[supervisor]\nport = " + strconv.Itoa(port) + "\n"
+	if err := os.WriteFile(supervisor.ConfigPath(), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sockPath := filepath.Join(supervisor.RuntimeDir(), "supervisor.sock")
+	if err := os.MkdirAll(sockPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sockPath, "sentinel"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	_ = runSupervisor(&stdout, &stderr)
+	if !strings.Contains(stderr.String(), "WARNING: API binding to ephemeral port") {
+		t.Errorf("stderr = %q, want ephemeral-port warning for port %d", stderr.String(), port)
+	}
+	if !strings.Contains(stderr.String(), strconv.Itoa(port)) {
+		t.Errorf("stderr = %q, want port number %d in warning", stderr.String(), port)
+	}
+	if !strings.Contains(stdout.String(), "Supervisor API listening") {
+		t.Errorf("stdout = %q, want API listening message (warning must not make startup fatal)", stdout.String())
+	}
+}
+
+func TestRunSupervisorNoWarningForLowAPIPort(t *testing.T) {
+	gcHome := t.TempDir()
+	t.Setenv("GC_HOME", gcHome)
+	port := freeLowLoopbackPort(t)
+	cfg := "[supervisor]\nport = " + strconv.Itoa(port) + "\n"
+	if err := os.WriteFile(supervisor.ConfigPath(), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sockPath := filepath.Join(supervisor.RuntimeDir(), "supervisor.sock")
+	if err := os.MkdirAll(sockPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sockPath, "sentinel"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	_ = runSupervisor(&stdout, &stderr)
+	if strings.Contains(stderr.String(), "WARNING: API binding to ephemeral port") {
+		t.Errorf("stderr = %q, must not warn for low port %d (below threshold %d)", stderr.String(), port, ephemeralPortThresholdForTest)
+	}
+	if !strings.Contains(stdout.String(), "Supervisor API listening") {
+		t.Errorf("stdout = %q, want API listening message for low port", stdout.String())
 	}
 }

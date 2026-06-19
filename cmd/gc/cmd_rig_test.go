@@ -18,6 +18,8 @@ import (
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
 type mkdirAllErrorFS struct {
@@ -104,6 +106,136 @@ func TestDoRigAdd_Basic(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "my-frontend") {
 		t.Errorf("city.toml should contain rig name:\n%s", data)
+	}
+}
+
+func TestDoRigAdd_PreservesComments(t *testing.T) {
+	cityPath := t.TempDir()
+	cityToml := `# This is a city-level rationale comment.
+[workspace]
+name = "my-city"
+
+# Pack rationale: core tools are required.
+[packs.core]
+source = ".gc/system/packs/core"
+`
+	writeSchema2RigCity(t, cityPath, "my-city", cityToml, "")
+
+	rigPath := filepath.Join(t.TempDir(), "backend")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "bd")
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
+	}
+
+	data, err := os.ReadFile(filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	for _, want := range []string{
+		"# This is a city-level rationale comment.",
+		"# Pack rationale: core tools are required.",
+		"backend",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("city.toml missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestDoRigAddSqliteCityCreatesBdBackedRig(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(t.TempDir(), "tincan")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "sqlite-city"
+prefix = "ga"
+
+[beads]
+provider = "sqlite"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	logFile := filepath.Join(t.TempDir(), "bd.log")
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	script := fmt.Sprintf(`#!/bin/sh
+printf 'pwd=%%s BEADS_DIR=%%s args=%%s\n' "$PWD" "${BEADS_DIR:-}" "$*" >> %q
+case "$1" in
+  init)
+    mkdir -p "${BEADS_DIR:-$PWD/.beads}"
+    exit 0
+    ;;
+  list)
+    printf '[]\n'
+    exit 0
+    ;;
+  update)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, logFile)
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "tc", "", false, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigAdd = %d, want 0; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if got := rawBeadsProviderForScope(rigPath, cityPath); got != "bd" {
+		t.Fatalf("rawBeadsProviderForScope(rig) = %q, want bd", got)
+	}
+	if got := rawBeadsProviderForScope(cityPath, cityPath); got != "sqlite" {
+		t.Fatalf("rawBeadsProviderForScope(city) = %q, want sqlite", got)
+	}
+	metaData, err := os.ReadFile(filepath.Join(rigPath, ".beads", "metadata.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(metadata): %v", err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("Unmarshal(metadata): %v", err)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(meta["dolt_mode"])); got != "server" {
+		t.Fatalf("metadata dolt_mode = %q, want server", got)
+	}
+
+	store, err := openStoreAtForCity(rigPath, cityPath)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	if err := store.SetMetadata("tc-1", "gc.routed_to", "sample/session-a"); err != nil {
+		t.Fatalf("SetMetadata through rig store: %v", err)
+	}
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	log := string(logData)
+	for _, want := range []string{
+		"init --server -p tc --skip-hooks --database tc",
+		"update --json tc-1 --set-metadata gc.routed_to=sample/session-a",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("bd log missing %q:\n%s", want, log)
+		}
 	}
 }
 
@@ -940,6 +1072,43 @@ func TestDoRigListJSONShowsDefaultBranch(t *testing.T) {
 	t.Fatalf("rig my-frontend not found in JSON:\n%s", stdout.String())
 }
 
+// TestDoRigListJSONBuildsSessionProviderOnce guards against the rig-list --json
+// N+1: the running-status probe must build a single session provider and reuse
+// it across all rigs, not reconstruct one per rig.
+func TestDoRigListJSONBuildsSessionProviderOnce(t *testing.T) {
+	cityPath := t.TempDir()
+
+	var rigBlocks strings.Builder
+	for _, name := range []string{"rig-a", "rig-b", "rig-c"} {
+		rigPath := filepath.Join(t.TempDir(), name)
+		if err := os.MkdirAll(rigPath, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&rigBlocks, "\n[[rigs]]\nname = %q\npath = %q\n", name, rigPath)
+	}
+	cityToml := "[workspace]\nname = \"test-city\"\n\n[[agent]]\nname = \"mayor\"\n" + rigBlocks.String()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int
+	orig := rigListSessionProvider
+	rigListSessionProvider = func() runtime.Provider {
+		calls++
+		return &fakeAdoptionProvider{}
+	}
+	t.Cleanup(func() { rigListSessionProvider = orig })
+
+	var stdout, stderr bytes.Buffer
+	if code := doRigList(fsys.OSFS{}, cityPath, true, &stdout, &stderr); code != 0 {
+		t.Fatalf("doRigList returned %d, stderr: %s", code, stderr.String())
+	}
+
+	if calls != 1 {
+		t.Fatalf("session provider constructed %d times across 3 rigs, want exactly 1", calls)
+	}
+}
+
 func TestDoRigList_Empty(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
@@ -1025,13 +1194,20 @@ func TestDoRigSuspend(t *testing.T) {
 		t.Errorf("output = %q, want suspend message", stdout.String())
 	}
 
-	// Verify config written with suspended=true.
+	// Verify suspension recorded in runtime state, not city.toml.
+	st, err := suspensionstate.Load(fsys.OSFS{}, cityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !suspensionstate.IsRigSuspended(st, "frontend") {
+		t.Errorf("rig should be suspended in runtime state, got %+v", st)
+	}
 	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Rigs) != 1 || !cfg.Rigs[0].Suspended {
-		t.Errorf("rig should be suspended, got %+v", cfg.Rigs)
+	if len(cfg.Rigs) != 1 || cfg.Rigs[0].Suspended {
+		t.Errorf("city.toml should NOT have suspended=true, got %+v", cfg.Rigs)
 	}
 }
 
@@ -1064,7 +1240,7 @@ func TestDoRigSuspendAlreadySuspended(t *testing.T) {
 
 func TestDoRigResume(t *testing.T) {
 	cityPath := t.TempDir()
-	cityToml := "[workspace]\n\n[[rigs]]\nname = \"frontend\"\nsuspended = true\n"
+	cityToml := "[workspace]\n\n[[rigs]]\nname = \"frontend\"\nsuspended_on_start = true\n"
 	siteToml := "workspace_name = \"test-city\"\n\n[[rig]]\nname = \"frontend\"\npath = \"/some/path\"\n"
 	writeSchema2RigCity(t, cityPath, "test-city", cityToml, siteToml)
 
@@ -1077,13 +1253,24 @@ func TestDoRigResume(t *testing.T) {
 		t.Errorf("output = %q, want resume message", stdout.String())
 	}
 
-	// Verify config written with suspended=false.
+	// city.toml is intentionally NOT mutated; the explicit resume is
+	// recorded in .gc/runtime/rig-state.json and beats SuspendedOnStart.
 	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Rigs) != 1 || cfg.Rigs[0].Suspended {
-		t.Errorf("rig should not be suspended, got %+v", cfg.Rigs)
+	if len(cfg.Rigs) != 1 || !cfg.Rigs[0].SuspendedOnStart {
+		t.Errorf("city.toml suspended_on_start should remain set, got %+v", cfg.Rigs)
+	}
+	st, err := suspensionstate.Load(fsys.OSFS{}, cityPath)
+	if err != nil {
+		t.Fatalf("suspensionstate.Load: %v", err)
+	}
+	if v, ok := suspensionstate.ExplicitRig(st, "frontend"); !ok || v {
+		t.Errorf("frontend should have explicit resume in runtime state, got (%v, %v)", v, ok)
+	}
+	if suspensionstate.EffectiveRigSuspended(st, "frontend", cfg.Rigs[0].SuspendedOnStart) {
+		t.Error("explicit resume in runtime state must beat suspended_on_start=true")
 	}
 }
 
@@ -1120,7 +1307,7 @@ func TestDoRigListShowsSuspended(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cityToml := "[workspace]\n\n[[rigs]]\nname = \"my-frontend\"\nsuspended = true\n"
+	cityToml := "[workspace]\n\n[[rigs]]\nname = \"my-frontend\"\nsuspended_on_start = true\n"
 	siteToml := fmt.Sprintf("workspace_name = \"test-city\"\n\n[[rig]]\nname = \"my-frontend\"\npath = %q\n", rigPath)
 	writeSchema2RigCity(t, cityPath, "test-city", cityToml, siteToml)
 
@@ -1137,6 +1324,14 @@ func TestDoRigListShowsSuspended(t *testing.T) {
 func TestDoRigAdd_WithPack(t *testing.T) {
 	cityPath := t.TempDir()
 	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\n", "")
+	// A real local pack at packs/gastown: the include token must stay a
+	// local import instead of canonicalizing to the bundled source.
+	if err := os.MkdirAll(filepath.Join(cityPath, "packs", "gastown"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "packs", "gastown", "pack.toml"), []byte("[pack]\nname = \"gastown\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	rigPath := filepath.Join(t.TempDir(), "my-project")
 	if err := os.MkdirAll(rigPath, 0o755); err != nil {
@@ -1211,7 +1406,7 @@ ref = "v1.2.3"
 		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
 	}
 
-	wantSource := "https://github.com/acme/ops-pack.git//roles#v1.2.3"
+	wantSource := "https://github.com/acme/ops-pack/tree/v1.2.3/roles"
 	if !strings.Contains(stdout.String(), "Import: ops="+wantSource) {
 		t.Fatalf("output missing resolved import: %s", stdout.String())
 	}
@@ -1301,7 +1496,7 @@ ref = "v1.2.3"
 		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
 	}
 
-	wantSource := "https://github.com/acme/ops-pack.git//roles#v1.2.3"
+	wantSource := "https://github.com/acme/ops-pack/tree/v1.2.3/roles"
 	if !strings.Contains(stdout.String(), "Import: ops="+wantSource+" (default)") {
 		t.Fatalf("output missing resolved default import: %s", stdout.String())
 	}
@@ -1627,7 +1822,10 @@ func TestDoRigAdd_RealGastownExampleRootPackDefaultRigImport(t *testing.T) {
 		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
 	}
 
-	if !strings.Contains(stdout.String(), "Import: gastown=packs/gastown (default)") {
+	// The example city composes gastown via the pinned public import, not a
+	// checked-in packs/gastown copy, so the default rig import carries the
+	// public source.
+	if !strings.Contains(stdout.String(), "Import: gastown="+config.PublicGastownPackSource+" (default)") {
 		t.Fatalf("output missing gastown default import: %s", stdout.String())
 	}
 	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
@@ -1637,8 +1835,11 @@ func TestDoRigAdd_RealGastownExampleRootPackDefaultRigImport(t *testing.T) {
 	if len(cfg.Rigs) != 1 {
 		t.Fatalf("len(Rigs) = %d, want 1", len(cfg.Rigs))
 	}
-	if got := cfg.Rigs[0].Imports["gastown"].Source; got != "packs/gastown" {
-		t.Fatalf("rig gastown import source = %q, want %q", got, "packs/gastown")
+	if got := cfg.Rigs[0].Imports["gastown"].Source; got != config.PublicGastownPackSource {
+		t.Fatalf("rig gastown import source = %q, want %q", got, config.PublicGastownPackSource)
+	}
+	if got := cfg.Rigs[0].Imports["gastown"].Version; got != config.PublicGastownPackVersion {
+		t.Fatalf("rig gastown import version = %q, want %q", got, config.PublicGastownPackVersion)
 	}
 }
 
@@ -2651,6 +2852,105 @@ func TestDoRigAdd_AdoptWithoutPrefixMismatch(t *testing.T) {
 	}
 }
 
+// TestDoRigAdd_AdoptWithBdContractInvokesInitAndHook verifies that --adopt on
+// a managed-Dolt (bd-contract) city invokes the init/hook machinery to
+// register types.custom and other config into the adopted store's DB.
+// Regression for ga-fg1ht3: the adopt branch previously skipped the init
+// path entirely, leaving the DB config table out of sync with config.yaml.
+func TestDoRigAdd_AdoptWithBdContractInvokesInitAndHook(t *testing.T) {
+	cityPath := t.TempDir()
+	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\n", "")
+	t.Setenv("GC_BEADS", "exec:"+filepath.Join(cityPath, "gc-beads-bd"))
+	t.Setenv("GC_DOLT", "")
+
+	// Stub lifecycle hooks — no real Dolt in unit tests. Record that the
+	// init path was invoked with the adopted rig dir.
+	origEnsure := initDirIfReadyEnsureBeadsProvider
+	origInit := initDirIfReadyInitAndHookDir
+	t.Cleanup(func() {
+		initDirIfReadyEnsureBeadsProvider = origEnsure
+		initDirIfReadyInitAndHookDir = origInit
+	})
+	initDirIfReadyEnsureBeadsProvider = func(_ string) error { return nil }
+
+	var initCalls []string
+	initDirIfReadyInitAndHookDir = func(_, dir, _ string) error {
+		initCalls = append(initCalls, dir)
+		return nil
+	}
+
+	rigPath := filepath.Join(t.TempDir(), "adopted-rig")
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"name":"adopted-rig","issue_prefix":"ar"}`
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "metadata.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configYaml := "issue_prefix: ar\n" +
+		"types.custom: molecule,convoy,session,merge-request,agent,role,rig,spec,convergence,step\n"
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "config.yaml"), []byte(configYaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "ar", "", false, true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigAdd --adopt returned %d, stderr: %s", code, stderr.String())
+	}
+	if len(initCalls) == 0 {
+		t.Fatalf("ga-fg1ht3: --adopt on bd-contract city must invoke initAndHookDir to register types.custom; initCalls=%v", initCalls)
+	}
+	found := false
+	for _, dir := range initCalls {
+		if samePath(dir, rigPath) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("initAndHookDir called but not for adopted rig path %q; calls=%v", rigPath, initCalls)
+	}
+	if !strings.Contains(stdout.String(), "Adopted existing beads database") {
+		t.Errorf("stdout should mention adoption: %s", stdout.String())
+	}
+}
+
+// TestDoRigAdd_AdoptWithBdContractProvider_NonAdoptControlInvokesInit is a
+// control: the same stubbed harness wired through a NON-adopt add also calls
+// initAndHookDir, proving that the empty-initCalls failure above (pre-fix) was
+// real (adopt invoked init 0 times), not a harness artifact.
+func TestDoRigAdd_AdoptWithBdContractProvider_NonAdoptControlInvokesInit(t *testing.T) {
+	cityPath := t.TempDir()
+	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\n", "")
+	t.Setenv("GC_BEADS", "exec:"+filepath.Join(cityPath, "gc-beads-bd"))
+	t.Setenv("GC_DOLT", "")
+
+	origEnsure := initDirIfReadyEnsureBeadsProvider
+	origInit := initDirIfReadyInitAndHookDir
+	t.Cleanup(func() {
+		initDirIfReadyEnsureBeadsProvider = origEnsure
+		initDirIfReadyInitAndHookDir = origInit
+	})
+	initDirIfReadyEnsureBeadsProvider = func(_ string) error { return nil }
+
+	var initCalls []string
+	initDirIfReadyInitAndHookDir = func(_, dir, _ string) error {
+		initCalls = append(initCalls, dir)
+		return nil
+	}
+
+	rigPath := filepath.Join(t.TempDir(), "fresh-rig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "fr", "", false, false, &stdout, &stderr)
+	if len(initCalls) == 0 {
+		t.Fatalf("control: non-adopt rig add invoked initAndHookDir 0 times; stub not wired in? stderr=%s", stderr.String())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Six-row read-path routing matrix for `gc rig list` (ADR 0001, ga-h6w).
 // ---------------------------------------------------------------------------
@@ -3051,4 +3351,24 @@ func TestRouteRigList_StaleBannerOver30s(t *testing.T) {
 	if !strings.Contains(stdout.String(), "cache age: 45s") {
 		t.Errorf("stale banner missing from human output:\n%s", stdout.String())
 	}
+}
+
+// Regression test for the ga-lurp5d follow-up: a failed rig add must roll
+// back a symlinked city.toml by restoring the link target, not by replacing
+// the link with a regular file.
+func TestRigAddRollbackRestoresThroughCityTomlSymlink(t *testing.T) {
+	fs := fsys.OSFS{}
+	cityDir, link, target := setupSymlinkedCityToml(t)
+
+	snapshots, err := snapshotRigAddTopologyFiles(fs, cityDir, &config.City{})
+	if err != nil {
+		t.Fatalf("snapshotRigAddTopologyFiles: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("[workspace]\nname = \"mutated\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreSnapshots(fs, snapshots); err != nil {
+		t.Fatalf("restoreSnapshots: %v", err)
+	}
+	assertCityTomlSymlinkRestored(t, link, target, symlinkedCityTomlOriginal)
 }

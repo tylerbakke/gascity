@@ -22,21 +22,28 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/configedit"
+	"github.com/gastownhall/gascity/internal/fsys"
 	helpers "github.com/gastownhall/gascity/test/acceptance/helpers"
+	"github.com/gastownhall/gascity/test/tmuxtest"
 )
 
-var testEnvC *helpers.Env
+var (
+	testEnvC                *helpers.Env
+	attachedWorkflowPattern = regexp.MustCompile(`(?m)^Attached workflow (\S+)\b`)
+)
 
-const tierCAcceptanceConfig = `
-[session]
-startup_timeout = "3m"
-`
+const tierCStartupTimeout = "3m"
+
+var tierCClaudeArgsAppend = []string{"--allowedTools", "Bash,Edit,MultiEdit,Write"}
 
 func TestMain(m *testing.M) {
 	// Tier C needs real inference. Accept either:
@@ -75,6 +82,9 @@ func TestMain(m *testing.M) {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			panic("acceptance-c: " + err.Error())
 		}
+	}
+	if err := tmuxtest.ConfigureProcessEnv(filepath.Join(runtimeDir, "tmux")); err != nil {
+		panic("acceptance-c: configuring tmux test env: " + err.Error())
 	}
 	if err := helpers.WriteSupervisorConfig(gcHome); err != nil {
 		panic("acceptance-c: " + err.Error())
@@ -179,7 +189,7 @@ func TestSwarm_SlingWorkCoderCommits(t *testing.T) {
 	// Init a swarm city.
 	c := helpers.NewCity(t, testEnvC)
 	c.InitFrom(filepath.Join(helpers.ExamplesDir(), "swarm"))
-	applyTierCAcceptanceConfig(c)
+	applyTierCAcceptanceConfig(t, c)
 
 	// Add the rig via gc rig add (initializes beads, hooks, routes).
 	c.RigAdd(rigDir, "packs/swarm")
@@ -255,14 +265,15 @@ func TestGastown_PolecatImplementsRefineryMerges(t *testing.T) {
 		t.Fatalf("gc sling: %v\n%s", err, out)
 	}
 	t.Logf("Slung work to polecat: %s", strings.TrimSpace(out))
+	attachedWorkflowID := parseAttachedWorkflowID(out)
 
 	routeKey := gastownRigAgent(rigName, "polecat")
 	readyOut, err := bdCmd(testEnvC, rigDir, "ready", "--metadata-field", "gc.routed_to="+routeKey, "--unassigned", "--json", "--limit=20")
 	require.NoError(t, err, "bd ready")
 	var ready []beadJSON
 	require.NoError(t, json.Unmarshal([]byte(readyOut), &ready), "unmarshal ready queue")
-	require.Len(t, ready, 1, "expected only the outer bead in the routed ready queue")
-	require.NotContains(t, ready[0].ID, ".", "expected outer bead id, not a step id")
+	require.Len(t, ready, 1, "expected only the routed source/workflow root in the ready queue")
+	require.NotContains(t, ready[0].ID, ".", "expected source/workflow root id, not a step id")
 
 	outerID := ready[0].ID
 	outerOut, err := bdCmd(testEnvC, rigDir, "show", outerID, "--json")
@@ -270,8 +281,11 @@ func TestGastown_PolecatImplementsRefineryMerges(t *testing.T) {
 	var outer []beadJSON
 	require.NoError(t, json.Unmarshal([]byte(outerOut), &outer), "unmarshal outer bead")
 	require.Len(t, outer, 1, "expected one outer bead")
-	moleculeID := metaString(outer[0].Metadata, "molecule_id")
-	require.NotEmpty(t, moleculeID, "outer bead should carry molecule_id metadata")
+	moleculeID := attachedRootID(outer[0])
+	if moleculeID == "" {
+		moleculeID = attachedWorkflowID
+	}
+	require.NotEmpty(t, moleculeID, "routed bead should carry or be the attached workflow/molecule root")
 
 	rootOut, err := bdCmd(testEnvC, rigDir, "show", moleculeID, "--json")
 	require.NoError(t, err, "bd show molecule root")
@@ -396,14 +410,22 @@ func TestGastown_MayorDispatchPipeline(t *testing.T) {
 	c.RigAdd(rigDir, "packs/gastown")
 	seedGastownClaudeProjects(t, c, rigName)
 
-	// Limit pool sizes.
-	c.AppendToConfig("\n[[rigs.overrides]]\nagent = \"polecat\"\n[rigs.overrides.pool]\nmin = 1\nmax = 1\n")
+	// Keep polecat idle until the mayor creates routed work. A warm min=1
+	// polecat can see the fixture TODO and directly mutate the repo before the
+	// mayor dispatch path has anything to prove.
+	c.AppendToConfig("\n[[rigs.overrides]]\nagent = \"polecat\"\n[rigs.overrides.pool]\nmin = 0\nmax = 1\n")
 
 	c.StartWithSupervisor()
 	time.Sleep(15 * time.Second)
 
-	// Send mail to mayor asking to implement a feature.
-	out, err := c.GC("mail", "send", "mayor", "Please add a greet() function to app.py that prints 'hello'")
+	// Send durable mail, then notify the mayor so an idle session processes it.
+	dispatchTarget := gastownRigAgent(rigName, "polecat")
+	body := fmt.Sprintf(
+		"Create a rig work bead in rig %q for this task, then dispatch it with `gc sling %s <bead-id>`: add a greet() function to app.py that prints 'hello'. Do not edit the file directly as mayor.",
+		rigName,
+		dispatchTarget,
+	)
+	out, err := c.GC("mail", "send", "--notify", "mayor", "-s", "Dispatch app.py greet work to polecat", "-m", body)
 	if err != nil {
 		t.Fatalf("gc mail send: %v\n%s", err, out)
 	}
@@ -440,7 +462,11 @@ func setupThrowawayRepo(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	originDir := filepath.Join(root, "origin.git")
-	repoDir := filepath.Join(root, "repo")
+	// Derive a unique name from the test name so each test gets a distinct
+	// Dolt DB prefix. All tests share the same DOLT_ROOT_PATH; a hardcoded
+	// "repo" name would give every test the "re" prefix, causing bd init to
+	// fail on pre-existing dirty tables when a prior test's supervisor crashed.
+	repoDir := filepath.Join(root, uniqueRigName(t.Name()))
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -458,19 +484,70 @@ func setupThrowawayRepo(t *testing.T) string {
 	return repoDir
 }
 
+// uniqueRigName returns a short rig directory name derived from the test name.
+// It produces a name of ≤3 chars (CamelCase initials of the last _-component),
+// which DeriveBeadsPrefix returns unchanged as the Dolt DB prefix. This ensures
+// tests sharing the same DOLT_ROOT_PATH get distinct databases and bd init cannot
+// encounter pre-existing dirty tables left by a previous test's crashed supervisor.
+func uniqueRigName(testName string) string {
+	// Use the last _-separated component, e.g. "TestGastown_PolecatLifecycle" → "PolecatLifecycle".
+	if i := strings.LastIndex(testName, "_"); i >= 0 {
+		testName = testName[i+1:]
+	} else if strings.HasPrefix(testName, "Test") {
+		testName = testName[4:]
+	}
+	// Extract CamelCase initials as lowercase.
+	var initials strings.Builder
+	for i, r := range testName {
+		if i == 0 || (r >= 'A' && r <= 'Z') {
+			if r >= 'A' && r <= 'Z' {
+				initials.WriteByte(byte(r - 'A' + 'a'))
+			} else {
+				initials.WriteRune(r)
+			}
+		}
+	}
+	abbrev := initials.String()
+	if abbrev == "" {
+		return "rig"
+	}
+	// ≤3 chars: DeriveBeadsPrefix returns it as-is → unique DB prefix.
+	// >3 chars: truncate to 3 (still unique among the small set of tests here).
+	if len(abbrev) > 3 {
+		abbrev = abbrev[:3]
+	}
+	return abbrev
+}
+
 func newGastownAcceptanceCity(t *testing.T) *helpers.City {
 	t.Helper()
 	c := helpers.NewCity(t, testEnvC)
 	c.InitFrom(filepath.Join(helpers.ExamplesDir(), "gastown"))
-	applyTierCAcceptanceConfig(c)
+	applyTierCAcceptanceConfig(t, c)
 	seedClaudeProjectState(t, c, filepath.Join(c.Dir, ".gc", "agents", "mayor"))
 	seedClaudeProjectState(t, c, filepath.Join(c.Dir, ".gc", "agents", "deacon"))
 	seedClaudeProjectState(t, c, filepath.Join(c.Dir, ".gc", "agents", "boot"))
 	return c
 }
 
-func applyTierCAcceptanceConfig(c *helpers.City) {
-	c.AppendToConfig(tierCAcceptanceConfig)
+func applyTierCAcceptanceConfig(t *testing.T, c *helpers.City) {
+	t.Helper()
+
+	err := configedit.NewEditor(fsys.OSFS{}, filepath.Join(c.Dir, "city.toml")).Edit(func(cfg *config.City) error {
+		cfg.Session.StartupTimeout = tierCStartupTimeout
+		if cfg.Providers == nil {
+			cfg.Providers = make(map[string]config.ProviderSpec, 1)
+		}
+		spec, ok := cfg.Providers["claude"]
+		if !ok {
+			base := config.BasePrefixBuiltin + "claude"
+			spec.Base = &base
+		}
+		spec.ArgsAppend = append([]string(nil), tierCClaudeArgsAppend...)
+		cfg.Providers["claude"] = spec
+		return nil
+	})
+	require.NoError(t, err, "applying Tier C acceptance config")
 }
 
 func swarmRigAgent(rigName, agent string) string {
@@ -527,6 +604,27 @@ func metaString(meta map[string]any, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(fmt.Sprint(v))
+}
+
+func attachedRootID(bead beadJSON) string {
+	if id := metaString(bead.Metadata, "molecule_id"); id != "" {
+		return id
+	}
+	if id := metaString(bead.Metadata, "workflow_id"); id != "" {
+		return id
+	}
+	if metaString(bead.Metadata, "gc.kind") == "workflow" || metaString(bead.Metadata, "gc.formula_contract") == "graph.v2" {
+		return bead.ID
+	}
+	return ""
+}
+
+func parseAttachedWorkflowID(output string) string {
+	match := attachedWorkflowPattern.FindStringSubmatch(output)
+	if len(match) != 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
 }
 
 func bdCmd(env *helpers.Env, dir string, args ...string) (string, error) {
@@ -871,6 +969,37 @@ func TestTierCEnvAuthDoesNotMirrorAuthTokenIntoAPIKey(t *testing.T) {
 	require.Empty(t, apiKey)
 	require.Equal(t, "synthetic-token", authToken)
 	require.True(t, hasEnvAuth)
+}
+
+func TestUniqueRigName(t *testing.T) {
+	cases := []struct {
+		testName string
+		want     string
+	}{
+		{"TestSwarm_SlingWorkCoderCommits", "swc"},
+		{"TestGastown_PolecatImplementsRefineryMerges", "pir"},
+		{"TestGastown_PolecatLifecycle", "pl"},
+		{"TestGastown_MayorDispatchPipeline", "mdp"},
+		{"TestStandalone", "s"}, // no underscore: strips "Test", single initial
+		{"", "rig"},             // empty input falls back to "rig"
+	}
+	for _, tc := range cases {
+		if got := uniqueRigName(tc.testName); got != tc.want {
+			t.Errorf("uniqueRigName(%q) = %q, want %q", tc.testName, got, tc.want)
+		}
+	}
+}
+
+func TestParseAttachedWorkflowID(t *testing.T) {
+	output := `Created pir-pgi — "Create a file called feature.txt containing 'new feature'"
+Attached workflow pir-swc (formula "mol-polecat-work") to pir-swc
+`
+	if got := parseAttachedWorkflowID(output); got != "pir-swc" {
+		t.Fatalf("parseAttachedWorkflowID() = %q, want pir-swc", got)
+	}
+	if got := parseAttachedWorkflowID("Created pir-pgi\n"); got != "" {
+		t.Fatalf("parseAttachedWorkflowID() = %q, want empty", got)
+	}
 }
 
 func stageClaudeOAuth(realHome, gcHome string) error {

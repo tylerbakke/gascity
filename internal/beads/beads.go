@@ -5,15 +5,45 @@ package beads
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
 // ErrNotFound is returned when a bead ID does not exist in the store.
 var ErrNotFound = errors.New("bead not found")
 
+// ErrIDCollision is returned when bd's fuzzy/substring resolver returns a bead
+// whose ID differs from the requested ID (e.g. "gcy-dv7" resolves to
+// "gcy-wisp-dv78"). This is a distinct sub-case of not-found: the requested
+// bead is absent AND bd silently matched a different one. errors.Is(err,
+// ErrNotFound) remains true so existing not-found callers are unaffected;
+// mutation guards that need to distinguish a genuine collision from a plain
+// absent bead should check errors.Is(err, ErrIDCollision).
+var ErrIDCollision = fmt.Errorf("bd resolved a different bead ID (substring collision): %w", ErrNotFound)
+
+// ErrCacheUnavailable is returned by cache-only read handles when the cache
+// cannot answer without consulting the backing store.
+var ErrCacheUnavailable = errors.New("bead cache unavailable")
+
+// ErrStoreClosed is returned when a caller uses a bead store after its backing
+// handle has been closed.
+var ErrStoreClosed = errors.New("bead store closed")
+
 // ErrParentProjectionSuperseded reports that a parent update was overtaken by a
 // concurrent reparent before the caller's projection wait could converge.
 var ErrParentProjectionSuperseded = errors.New("parent projection superseded by concurrent update")
+
+// ErrConditionalReleaseUnsupported reports that a store cannot atomically
+// release an assignment based on the current status and assignee.
+var ErrConditionalReleaseUnsupported = errors.New("conditional assignment release unsupported")
+
+// ErrBDSilentFallback reports that a bd-backed store operation saw bd exit
+// successfully after falling back to on-disk JSONL auto-import mode. BdStore
+// surfaces this as an error for reads and writes because the command may have
+// observed or mutated an empty fallback database instead of the configured
+// backend. Detection requires bd's paired fallback markers: "auto-importing"
+// and "into empty database".
+var ErrBDSilentFallback = errors.New("bd silent fallback to on-disk auto-import")
 
 // Bead is a single unit of work in Gas City. Everything is a bead: tasks,
 // mail, molecules, convoys.
@@ -40,6 +70,18 @@ type Bead struct {
 	// garbage collection. Reads must opt in via ListQuery.TierMode (or the
 	// WithEphemeral/WithBothTiers QueryOpts on the legacy label helpers).
 	Ephemeral bool `json:"ephemeral,omitempty"`
+	// NoHistory routes the bead to durable no-history storage on Create. These
+	// rows are visible in normal durable reads but do not add Dolt history.
+	NoHistory bool `json:"no_history,omitempty"`
+	// DeferUntil hides the bead from ready/claimable views until this time,
+	// mirroring bd's defer_until column (a future value means "not yet ready";
+	// nil or past means ready). Create paths preserve it; UpdateOpts does not
+	// mutate it.
+	DeferUntil *time.Time `json:"defer_until,omitempty"`
+	// IsBlocked carries bd's denormalized ready-work projection. Nil means the
+	// store did not provide the projection and cached ready falls back to
+	// dependency-derived readiness for backward compatibility.
+	IsBlocked *bool `json:"is_blocked,omitempty"`
 }
 
 // UpdateOpts specifies which fields to change. Nil pointers are skipped.
@@ -54,6 +96,13 @@ type UpdateOpts struct {
 	Labels       []string // append these labels (nil = no change)
 	RemoveLabels []string // remove these labels (nil = no change)
 	Metadata     map[string]string
+}
+
+// ConditionalAssignmentReleaser is implemented by stores that can release an
+// in-progress assignment only when the current status and assignee still match
+// the expected snapshot.
+type ConditionalAssignmentReleaser interface {
+	ReleaseIfCurrent(id, expectedAssignee string) (bool, error)
 }
 
 // Tx is the write surface available inside a Store.Tx callback.
@@ -73,6 +122,22 @@ func runSequentialTx(tx Tx, fn func(Tx) error) error {
 }
 
 func cloneIntPtr(v *int) *int {
+	if v == nil {
+		return nil
+	}
+	cloned := *v
+	return &cloned
+}
+
+func cloneTimePtr(v *time.Time) *time.Time {
+	if v == nil {
+		return nil
+	}
+	cloned := *v
+	return &cloned
+}
+
+func cloneBoolPtr(v *bool) *bool {
 	if v == nil {
 		return nil
 	}
@@ -121,10 +186,76 @@ var readyExcludeTypes = map[string]bool{
 	"rig":           true, // rig identity beads
 }
 
+var readyBlockingDependencyTypes = map[string]bool{
+	"blocks":             true,
+	"waits-for":          true,
+	"conditional-blocks": true,
+}
+
+// IsReadyBlockingDependencyType reports whether a dependency type blocks a
+// bead from Ready() until the dependency target closes.
+func IsReadyBlockingDependencyType(t string) bool {
+	return readyBlockingDependencyTypes[t]
+}
+
 // IsReadyExcludedType reports whether the bead type is excluded from
 // Ready() results by default.
 func IsReadyExcludedType(t string) bool {
 	return readyExcludeTypes[t]
+}
+
+// IsReadyCandidate reports whether a bead passes the store-independent default
+// Ready filters: open status, main tier, actionable type, and no future
+// defer_until. Dependency and assignee checks are store-specific and happen
+// separately.
+func IsReadyCandidate(b Bead, now time.Time) bool {
+	return IsReadyCandidateForTier(b, now, TierIssues)
+}
+
+// IsReadyCandidateForTier reports whether a bead passes the store-independent
+// Ready filters for the requested storage tier.
+func IsReadyCandidateForTier(b Bead, now time.Time, tier TierMode) bool {
+	switch tier {
+	case TierWisps:
+		if !b.Ephemeral && !b.NoHistory {
+			return false
+		}
+	case TierBoth:
+		// no tier filter
+	default: // TierIssues
+		if b.Ephemeral {
+			return false
+		}
+	}
+	return b.Status == "open" &&
+		!IsReadyExcludedBead(b) &&
+		!IsDeferred(b, now)
+}
+
+// IsReadyExcludedBead reports whether a bead is infrastructure rather than
+// actionable Ready work.
+func IsReadyExcludedBead(b Bead) bool {
+	if IsReadyExcludedType(b.Type) {
+		return true
+	}
+	for _, label := range b.Labels {
+		switch label {
+		case "gc:session", "gc:order-tracking", "order-tracking":
+			return true
+		}
+	}
+	return false
+}
+
+// IsDeferred reports whether a bead is hidden by a future defer_until,
+// mirroring bd ready's server-side filter (defer_until IS NULL OR <= now is
+// ready) and cmd_hook.isFutureDeferredHookCandidate.
+func IsDeferred(b Bead, now time.Time) bool {
+	return b.DeferUntil != nil && b.DeferUntil.After(now)
+}
+
+func isReadyBlockingDependencyType(t string) bool {
+	return IsReadyBlockingDependencyType(t)
 }
 
 // Dep represents a dependency relationship between two beads. The IssueID
@@ -272,6 +403,35 @@ type Store interface {
 	// query: "down" returns what this bead depends on (default),
 	// "up" returns what depends on this bead.
 	DepList(id, direction string) ([]Dep, error)
+}
+
+// StorageClass selects the physical bead storage tier for adapters that
+// support table-specific creates. It is adapter plumbing, not a domain-level
+// behavior knob; normal callers should use Store.Create and let the policy
+// wrapper classify semantic beads from config.
+type StorageClass string
+
+const (
+	// StorageDefault lets the concrete store use its normal create behavior.
+	StorageDefault StorageClass = ""
+	// StorageHistory stores a bead in the normal history-tracked issues table.
+	StorageHistory StorageClass = "history"
+	// StorageNoHistory stores a bead in durable no-history storage.
+	StorageNoHistory StorageClass = "no_history"
+	// StorageEphemeral stores a bead in ephemeral wisp storage.
+	StorageEphemeral StorageClass = "ephemeral"
+)
+
+// StorageCreateStore is an optional adapter capability for create calls whose
+// physical storage tier has already been selected by policy middleware.
+type StorageCreateStore interface {
+	CreateWithStorage(b Bead, storage StorageClass) (Bead, error)
+}
+
+// StorageGraphApplyStore is an optional adapter capability for graph creates
+// whose physical storage tier has already been selected by policy middleware.
+type StorageGraphApplyStore interface {
+	ApplyGraphPlanWithStorage(ctx context.Context, plan *GraphApplyPlan, storage StorageClass) (*GraphApplyResult, error)
 }
 
 // ParentProjectionWaiter is an optional capability for stores whose

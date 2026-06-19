@@ -2,16 +2,50 @@ package main
 
 import (
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	gascitypacks "github.com/gastownhall/gascity-packs"
+
+	"github.com/gastownhall/gascity/internal/builtinpacks"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 const formulaFilesystemSearchGuidance = "**Never use wide filesystem searches when a CLI command exists.**"
+
+// materializeEmbeddedGastownPack writes the module-embedded gastown pack
+// (the exact bytes the gc binary bundles) to a t.TempDir()-rooted directory
+// and returns the pack root (pack.toml at top level). The checked-in
+// example no longer carries a pack copy — the pack arrives via the pinned
+// public import — so pack-content tests run against the embedded bytes,
+// with the same file modes the runtime materializer applies.
+func materializeEmbeddedGastownPack(t *testing.T) string {
+	t.Helper()
+	src := gascitypacks.Gastown()
+	root := filepath.Join(t.TempDir(), "gastown")
+	err := fs.WalkDir(src, ".", func(rel string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		dst := filepath.Join(root, filepath.FromSlash(rel))
+		if d.IsDir() {
+			return os.MkdirAll(dst, 0o755)
+		}
+		data, err := fs.ReadFile(src, rel)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dst, data, builtinpacks.MaterializedFileMode(rel))
+	})
+	if err != nil {
+		t.Fatalf("materializing embedded gastown pack: %v", err)
+	}
+	return root
+}
 
 func TestRenderPromptEmptyPath(t *testing.T) {
 	f := fsys.NewFake()
@@ -475,19 +509,46 @@ func TestRenderPromptWorkQuery(t *testing.T) {
 	}
 }
 
+func TestRenderPromptAssignedReadyQuery(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/test.md.tmpl"] = []byte("Assigned: {{ .AssignedReadyQuery }}")
+	ctx := PromptContext{AssignedReadyQuery: "bd ready --assignee=worker"}
+	got := renderPrompt(f, "/city", "", "prompts/test.md.tmpl", ctx, "", io.Discard, nil, nil, nil)
+	if got != "Assigned: bd ready --assignee=worker" {
+		t.Errorf("renderPrompt(AssignedReadyQuery) = %q", got)
+	}
+}
+
+func TestRenderPromptSplitWorkQueries(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/test.md.tmpl"] = []byte("Recovery: {{ .AssignedInProgressQuery }}\nPool: {{ .RoutedPoolQuery }}")
+	ctx := PromptContext{
+		AssignedInProgressQuery: "bd list --status=in_progress --assignee=worker",
+		RoutedPoolQuery:         "bd ready --metadata-field gc.routed_to=worker --unassigned",
+	}
+	got := renderPrompt(f, "/city", "", "prompts/test.md.tmpl", ctx, "", io.Discard, nil, nil, nil)
+	want := "Recovery: bd list --status=in_progress --assignee=worker\nPool: bd ready --metadata-field gc.routed_to=worker --unassigned"
+	if got != want {
+		t.Errorf("renderPrompt(split queries) = %q, want %q", got, want)
+	}
+}
+
 func TestBuildTemplateData(t *testing.T) {
 	ctx := PromptContext{
-		CityRoot:      "/city",
-		AgentName:     "a/b",
-		TemplateName:  "b",
-		BindingName:   "dep",
-		BindingPrefix: "dep.",
-		RigName:       "a",
-		WorkDir:       "/city/a",
-		IssuePrefix:   "te-",
-		Branch:        "main",
-		DefaultBranch: "main",
-		Env:           map[string]string{"Custom": "val", "CityRoot": "override"},
+		CityRoot:                "/city",
+		AgentName:               "a/b",
+		TemplateName:            "b",
+		BindingName:             "dep",
+		BindingPrefix:           "dep.",
+		RigName:                 "a",
+		WorkDir:                 "/city/a",
+		IssuePrefix:             "te-",
+		Branch:                  "main",
+		DefaultBranch:           "main",
+		AssignedInProgressQuery: "bd list --assignee=a/b --status=in_progress",
+		AssignedReadyQuery:      "bd ready --assignee=a/b",
+		RoutedPoolQuery:         "bd ready --metadata-field gc.routed_to=a/b --unassigned",
+		Env:                     map[string]string{"Custom": "val", "CityRoot": "override"},
 	}
 	data := buildTemplateData(ctx)
 	// SDK vars override Env.
@@ -508,6 +569,15 @@ func TestBuildTemplateData(t *testing.T) {
 	}
 	if data["DefaultBranch"] != "main" {
 		t.Errorf("DefaultBranch = %q, want %q", data["DefaultBranch"], "main")
+	}
+	if data["AssignedReadyQuery"] != "bd ready --assignee=a/b" {
+		t.Errorf("AssignedReadyQuery = %q, want %q", data["AssignedReadyQuery"], "bd ready --assignee=a/b")
+	}
+	if data["AssignedInProgressQuery"] != "bd list --assignee=a/b --status=in_progress" {
+		t.Errorf("AssignedInProgressQuery = %q, want %q", data["AssignedInProgressQuery"], "bd list --assignee=a/b --status=in_progress")
+	}
+	if data["RoutedPoolQuery"] != "bd ready --metadata-field gc.routed_to=a/b --unassigned" {
+		t.Errorf("RoutedPoolQuery = %q, want %q", data["RoutedPoolQuery"], "bd ready --metadata-field gc.routed_to=a/b --unassigned")
 	}
 }
 
@@ -732,17 +802,13 @@ func TestRenderPromptGlobalAndPerAgent(t *testing.T) {
 	}
 }
 
-func TestRenderPromptMaintenanceDogPromptHasRequiredSharedTemplates(t *testing.T) {
-	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatalf("filepath.Abs(repo root): %v", err)
-	}
-	maintenanceDir := filepath.Join(repoRoot, "examples", "gastown", "packs", "maintenance")
-	promptPath := filepath.Join(maintenanceDir, "agents", "dog", "prompt.template.md")
+func TestRenderPromptGastownDogPromptHasRequiredSharedTemplates(t *testing.T) {
+	gastownDir := materializeEmbeddedGastownPack(t)
+	promptPath := filepath.Join(gastownDir, "agents", "dog", "prompt.template.md")
 
 	raw, err := os.ReadFile(promptPath)
 	if err != nil {
-		t.Fatalf("os.ReadFile(maintenance dog prompt): %v", err)
+		t.Fatalf("os.ReadFile(gastown dog prompt): %v", err)
 	}
 
 	var stderr strings.Builder
@@ -750,16 +816,16 @@ func TestRenderPromptMaintenanceDogPromptHasRequiredSharedTemplates(t *testing.T
 		CityRoot:  "/tmp/city",
 		AgentName: "dog",
 		WorkQuery: "bd ready",
-	}, "", &stderr, []string{maintenanceDir}, nil, nil)
+	}, "", &stderr, []string{gastownDir}, nil, nil)
 
 	if strings.Contains(stderr.String(), "template not defined") {
 		t.Fatalf("renderPrompt emitted missing-template warning: %s", stderr.String())
 	}
 	if got == string(raw) {
-		t.Fatalf("renderPrompt fell back to raw prompt; expected rendered maintenance prompt")
+		t.Fatalf("renderPrompt fell back to raw prompt; expected rendered gastown dog prompt")
 	}
-	if !strings.Contains(got, "Gas City Maintenance Context") {
-		t.Fatalf("rendered prompt missing maintenance architecture context:\n%s", got)
+	if !strings.Contains(got, "Gas Town Architecture") {
+		t.Fatalf("rendered prompt missing architecture context:\n%s", got)
 	}
 	if !strings.Contains(got, "Following Your Formula") {
 		t.Fatalf("rendered prompt missing following-mol fragment:\n%s", got)
@@ -774,16 +840,18 @@ func TestFormulaFilesystemSearchGuidanceCoversPromptSources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("filepath.Abs(repo root): %v", err)
 	}
+	gastownDir := materializeEmbeddedGastownPack(t)
 
-	paths := []string{
-		"examples/gastown/packs/gastown/template-fragments/following-mol.template.md",
-		"examples/gastown/packs/maintenance/template-fragments/following-mol.template.md",
-		"internal/bootstrap/packs/core/assets/prompts/pool-worker.md",
-		"internal/bootstrap/packs/core/assets/prompts/graph-worker.md",
+	paths := map[string]string{
+		"embedded gastown pack/template-fragments/following-mol.template.md": filepath.Join(
+			gastownDir, "template-fragments", "following-mol.template.md"),
+		"internal/bootstrap/packs/core/assets/prompts/pool-worker.md": filepath.Join(
+			repoRoot, "internal", "bootstrap", "packs", "core", "assets", "prompts", "pool-worker.md"),
+		"internal/bootstrap/packs/core/assets/prompts/graph-worker.md": filepath.Join(
+			repoRoot, "internal", "bootstrap", "packs", "core", "assets", "prompts", "graph-worker.md"),
 	}
-	for _, rel := range paths {
+	for rel, path := range paths {
 		t.Run(rel, func(t *testing.T) {
-			path := filepath.Join(repoRoot, rel)
 			data, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatalf("os.ReadFile(%s): %v", path, err)
@@ -800,6 +868,66 @@ func TestFormulaFilesystemSearchGuidanceCoversPromptSources(t *testing.T) {
 				if !strings.Contains(text, want) {
 					t.Fatalf("%s missing %q", rel, want)
 				}
+			}
+		})
+	}
+}
+
+func TestCoreWorkerPromptsUseHookClaimProtocol(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("filepath.Abs(repo root): %v", err)
+	}
+
+	for _, rel := range []string{
+		"internal/bootstrap/packs/core/assets/prompts/pool-worker.md",
+		"internal/bootstrap/packs/core/assets/prompts/graph-worker.md",
+	} {
+		t.Run(rel, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(repoRoot, rel))
+			if err != nil {
+				t.Fatalf("ReadFile(%s): %v", rel, err)
+			}
+			text := string(data)
+			if !strings.Contains(text, "gc hook --claim --drain-ack --json") {
+				t.Fatalf("%s missing drain-aware hook claim startup protocol", rel)
+			}
+			if !strings.Contains(text, "gc hook --claim --json") {
+				t.Fatalf("%s missing hook claim polling protocol", rel)
+			}
+			if strings.Contains(text, "{{ .AssignedReadyQuery }}") {
+				t.Fatalf("%s still uses AssignedReadyQuery instead of hook claim protocol", rel)
+			}
+			if strings.Contains(text, "bd ready") {
+				t.Fatalf("%s hardcodes bd ready instead of hook claim protocol", rel)
+			}
+			if strings.Contains(text, "bd ready --include-ephemeral --assignee") {
+				t.Fatalf("%s hardcodes bd ready --include-ephemeral instead of hook claim protocol", rel)
+			}
+		})
+	}
+
+	gastownDir := materializeEmbeddedGastownPack(t)
+	staticPrompts := map[string]string{
+		"internal/bootstrap/packs/core/overlay/per-provider/kiro/AGENTS.md": filepath.Join(
+			repoRoot, "internal", "bootstrap", "packs", "core", "overlay", "per-provider", "kiro", "AGENTS.md"),
+		"internal/bootstrap/packs/core/skills/gc-work/SKILL.md": filepath.Join(
+			repoRoot, "internal", "bootstrap", "packs", "core", "skills", "gc-work", "SKILL.md"),
+		"embedded gastown pack/agents/mayor/prompt.template.md": filepath.Join(
+			gastownDir, "agents", "mayor", "prompt.template.md"),
+		"examples/hyperscale/packs/hyperscale/agents/worker/prompt.template.md": filepath.Join(
+			repoRoot, "examples", "hyperscale", "packs", "hyperscale", "agents", "worker", "prompt.template.md"),
+		"examples/swarm/packs/swarm/agents/coder/prompt.template.md": filepath.Join(
+			repoRoot, "examples", "swarm", "packs", "swarm", "agents", "coder", "prompt.template.md"),
+	}
+	for rel, path := range staticPrompts {
+		t.Run(rel, func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("ReadFile(%s): %v", rel, err)
+			}
+			if strings.Contains(string(data), "bd ready --include-ephemeral") {
+				t.Fatalf("%s hardcodes bd ready --include-ephemeral in static prompt guidance", rel)
 			}
 		})
 	}
@@ -1223,6 +1351,82 @@ func TestRenderPromptCityRootFragmentsPerAgentWins(t *testing.T) {
 	if got != "per-agent" {
 		t.Errorf("renderPrompt(per-agent overrides city-root) = %q, want %q",
 			got, "per-agent")
+	}
+}
+
+// TestRenderPromptResolvesRigPackFragment is the renderer-level regression
+// test for gascity#2676: a template fragment shipped in a rig-imported pack
+// (i.e. in cfg.RigPackDirs[<rig>], not cfg.PackDirs) must resolve when the
+// renderer is given that rig's scoped pack directories. Before the fix the
+// two callers in agent_build_params.go / cmd_prime.go passed only cfg.PackDirs,
+// so rig-pack fragments silently fell through and the renderer emitted the raw
+// `{{ template ... }}` directive in error fallback.
+func TestRenderPromptResolvesRigPackFragment(t *testing.T) {
+	f := fsys.NewFake()
+	// Rig-imported pack ships a template fragment.
+	rigPackDir := "/city/.gc/cache/repos/abc123/packs/gastown"
+	f.Files[rigPackDir+"/template-fragments/work-query.template.md"] = []byte(
+		`{{ define "work-query" }}rig-pack-work-query{{ end }}`)
+	// An imported agent's prompt references that fragment.
+	f.Files["/city/agents/polecat/prompt.template.md"] = []byte(
+		`{{ template "work-query" . }}`)
+
+	cfg := &config.City{
+		// PackDirs is intentionally empty: this city imports its pack
+		// at the rig level, not the city level. Pre-fix callers passed
+		// cfg.PackDirs here and the fragment was never registered.
+		PackDirs: nil,
+		RigPackDirs: map[string][]string{
+			"gastown": {rigPackDir},
+		},
+	}
+
+	// Post-fix call: cfg.PackDirsForRig includes the current rig dir without
+	// exposing other rigs' pack fragments.
+	got := renderPrompt(f, "/city", "", "agents/polecat/prompt.template.md",
+		PromptContext{AgentName: "polecat"}, "", io.Discard, cfg.PackDirsForRig("gastown"), nil, nil)
+	if got != "rig-pack-work-query" {
+		t.Errorf("renderPrompt(cfg.PackDirsForRig()) = %q, want %q",
+			got, "rig-pack-work-query")
+	}
+
+	// Sanity-check the pre-fix behavior: passing cfg.PackDirs alone (what
+	// the two call sites used before gascity#2676) must NOT resolve the
+	// fragment — otherwise this test wouldn't be guarding the fix. The
+	// renderer's error path emits the raw body and logs to stderr; either
+	// way the rendered output must not be the resolved fragment text.
+	gotBuggy := renderPrompt(f, "/city", "", "agents/polecat/prompt.template.md",
+		PromptContext{AgentName: "polecat"}, "", io.Discard, cfg.PackDirs, nil, nil)
+	if gotBuggy == "rig-pack-work-query" {
+		t.Errorf("pre-fix call with cfg.PackDirs unexpectedly resolved the rig-pack fragment; the regression guard is not actually guarding anything")
+	}
+}
+
+// TestRenderPromptResolvesMultiRigPackFragments verifies that fragments from
+// multiple rig-imported packs all reach the renderer when cfg.AllPackDirs()
+// is passed. Guards against an off-by-one or single-rig assumption in the
+// AllPackDirs union.
+func TestRenderPromptResolvesMultiRigPackFragments(t *testing.T) {
+	f := fsys.NewFake()
+	alphaDir := "/city/.gc/cache/repos/aaa/packs/alpha"
+	bravoDir := "/city/.gc/cache/repos/bbb/packs/bravo"
+	f.Files[alphaDir+"/template-fragments/a.template.md"] = []byte(
+		`{{ define "a" }}A{{ end }}`)
+	f.Files[bravoDir+"/template-fragments/b.template.md"] = []byte(
+		`{{ define "b" }}B{{ end }}`)
+	f.Files["/city/agents/x/prompt.template.md"] = []byte(
+		`{{ template "a" . }}-{{ template "b" . }}`)
+
+	cfg := &config.City{
+		RigPackDirs: map[string][]string{
+			"alpha": {alphaDir},
+			"bravo": {bravoDir},
+		},
+	}
+	got := renderPrompt(f, "/city", "", "agents/x/prompt.template.md",
+		PromptContext{}, "", io.Discard, cfg.AllPackDirs(), nil, nil)
+	if got != "A-B" {
+		t.Errorf("renderPrompt(multi-rig AllPackDirs) = %q, want %q", got, "A-B")
 	}
 }
 

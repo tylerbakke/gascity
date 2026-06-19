@@ -65,7 +65,9 @@ BEADS_POSTGRES_PORT=%%s
 BEADS_POSTGRES_USER=%%s
 BEADS_POSTGRES_DATABASE=%%s
 BEADS_POSTGRES_PASSWORD=%%s
-'       "${GC_STORE_ROOT:-}" "${GC_STORE_SCOPE:-}" "${GC_BEADS_PREFIX:-}" "${GC_CITY:-}" "${GC_CITY_PATH:-}" "${GC_RIG:-}" "${GC_RIG_ROOT:-}" "${GC_PROVIDER:-}" "${BEADS_DIR:-}" "${GC_DOLT_HOST:-}" "${GC_DOLT_PORT:-}" "${BEADS_POSTGRES_HOST:-}" "${BEADS_POSTGRES_PORT:-}" "${BEADS_POSTGRES_USER:-}" "${BEADS_POSTGRES_DATABASE:-}" "${BEADS_POSTGRES_PASSWORD:-}" > "$out"
+BD_DOLT_SYNC_CLI_REMOTES=%%s
+BEADS_DOLT_SYNC_CLI_REMOTES=%%s
+'       "${GC_STORE_ROOT:-}" "${GC_STORE_SCOPE:-}" "${GC_BEADS_PREFIX:-}" "${GC_CITY:-}" "${GC_CITY_PATH:-}" "${GC_RIG:-}" "${GC_RIG_ROOT:-}" "${GC_PROVIDER:-}" "${BEADS_DIR:-}" "${GC_DOLT_HOST:-}" "${GC_DOLT_PORT:-}" "${BEADS_POSTGRES_HOST:-}" "${BEADS_POSTGRES_PORT:-}" "${BEADS_POSTGRES_USER:-}" "${BEADS_POSTGRES_DATABASE:-}" "${BEADS_POSTGRES_PASSWORD:-}" "${BD_DOLT_SYNC_CLI_REMOTES:-}" "${BEADS_DOLT_SYNC_CLI_REMOTES:-}" > "$out"
     cat >/dev/null
     echo '{"id":"EX-1","title":"captured","status":"open","type":"task","created_at":"2026-02-27T10:00:00Z"}'
     ;;
@@ -113,6 +115,41 @@ func envSliceValue(env []string, key string) string {
 		}
 	}
 	return ""
+}
+
+func TestSetExecProjectedBackendEnvEmptyDisablesAutoBackup(t *testing.T) {
+	// The exec-store projection is the 5th bd env-projection site (alongside
+	// bdRuntimeEnv, cityRuntimeProcessEnv, sessionBackendEnv, and recovery).
+	// It must force bd's PersistentPostRun auto-backup off (ga-0eq), even when
+	// the ambient env tries to enable it.
+	env := map[string]string{
+		"BD_BACKUP_ENABLED":    "true",
+		"BEADS_BACKUP_ENABLED": "true",
+	}
+	setExecProjectedBackendEnvEmpty(env)
+	if got := env["BD_BACKUP_ENABLED"]; got != "false" {
+		t.Fatalf("BD_BACKUP_ENABLED = %q, want false", got)
+	}
+	if got := env["BEADS_BACKUP_ENABLED"]; got != "false" {
+		t.Fatalf("BEADS_BACKUP_ENABLED = %q, want false", got)
+	}
+}
+
+func TestSetExecProjectedBackendEnvEmptyDisablesContributorRouting(t *testing.T) {
+	// The exec-store projection must also force bd's fork/contributor
+	// auto-routing off, mirroring the other bd env-projection sites, so a
+	// gcy-style store cannot siphon create/list/update to ~/.beads-planning.
+	env := map[string]string{
+		"BD_ROUTING_MODE":    "auto",
+		"BEADS_ROUTING_MODE": "auto",
+	}
+	setExecProjectedBackendEnvEmpty(env)
+	if got := env["BD_ROUTING_MODE"]; got != "off" {
+		t.Fatalf("BD_ROUTING_MODE = %q, want off", got)
+	}
+	if got := env["BEADS_ROUTING_MODE"]; got != "off" {
+		t.Fatalf("BEADS_ROUTING_MODE = %q, want off", got)
+	}
 }
 
 func TestProviderUsesBdStoreContract(t *testing.T) {
@@ -480,11 +517,17 @@ func TestOpenStoreAtForCityExecBeadsBdProjectsScopedExternalDoltEnv(t *testing.T
 	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
 	t.Setenv("GC_DOLT_HOST", "ambient-dolt")
 	t.Setenv("GC_DOLT_PORT", "9999")
+	t.Setenv("BD_DOLT_SYNC_CLI_REMOTES", "true")
+	t.Setenv("BEADS_DOLT_SYNC_CLI_REMOTES", "true")
 
-	store, err := openStoreAtForCity(rigDir, cityDir)
+	result, err := openStoreResultAtForCity(rigDir, cityDir)
 	if err != nil {
 		t.Fatalf("openStoreAtForCity: %v", err)
 	}
+	if result.Diagnostic.Store != "ExecStore" {
+		t.Fatalf("beads_store = %q, want ExecStore", result.Diagnostic.Store)
+	}
+	store := result.Store
 	if _, err := store.Create(beads.Bead{Title: "rig"}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -501,6 +544,12 @@ func TestOpenStoreAtForCityExecBeadsBdProjectsScopedExternalDoltEnv(t *testing.T
 	}
 	if got := rigEnv["BEADS_DIR"]; got != "" {
 		t.Fatalf("BEADS_DIR leaked as %q", got)
+	}
+	if got := rigEnv["BD_DOLT_SYNC_CLI_REMOTES"]; got != "false" {
+		t.Fatalf("BD_DOLT_SYNC_CLI_REMOTES = %q, want false", got)
+	}
+	if got := rigEnv["BEADS_DOLT_SYNC_CLI_REMOTES"]; got != "false" {
+		t.Fatalf("BEADS_DOLT_SYNC_CLI_REMOTES = %q, want false", got)
 	}
 }
 

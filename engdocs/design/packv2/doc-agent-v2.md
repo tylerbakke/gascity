@@ -1,5 +1,11 @@
 # Agent Definition v.next
 
+> **Historical PackV2 design note.** This page preserves design history and
+> rollout rationale. For current pack authoring guidance, use
+> `docs/reference/specs/pack-spec.md`, `docs/guides/understanding-packs.md`,
+> and `docs/guides/shareable-packs.md`. When this note disagrees with shipped
+> behavior, prefer the current docs, generated reference, code, and tests.
+
 **GitHub Issue:** [gastownhall/gascity#356](https://github.com/gastownhall/gascity/issues/356)
 
 Title: `feat: Agent Definition v.next — agents as directories`
@@ -113,11 +119,13 @@ default_sling_formula = "mol-do-work"
 append_fragments = ["operational-awareness"]
 ```
 
-As of release v0.15.0, the actively-applied defaults are still narrow:
-`default_sling_formula` plus `[agent_defaults].append_fragments` during
-prompt rendering. Other `AgentDefaults` fields are parsed and composed,
-but are not yet auto-inherited at runtime. Per-agent fields such as
-`provider` and `scope` still live in `agents/<name>/agent.toml`.
+As of the current implementation, the actively-applied defaults are still
+narrow: `provider`, `default_sling_formula`, and
+`[agent_defaults].append_fragments` during prompt rendering. `provider`
+fills agents that do not set their own provider and also seeds implicit
+provider-agent injection. Other `AgentDefaults` fields are parsed and
+composed, but are not yet auto-inherited at runtime. Per-agent fields such as
+`scope` still live in `agents/<name>/agent.toml`.
 
 Individual agents override in their own `agent.toml`:
 

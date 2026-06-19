@@ -50,10 +50,13 @@ func TestProviderProcessPassthroughEnvIncludesProviderAndRuntimeBaseline(t *test
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "test-anthropic-token")
 	t.Setenv("OLLAMA_API_KEY", "test-ollama-token")
+	t.Setenv("XIAOMI_API_KEY", "test-xiaomi-key")
 	t.Setenv("AWS_ACCESS_KEY_ID", "test-aws-key")
 	t.Setenv("AWS_PAGER", "less")
 	t.Setenv("CLAUDECODE", "1")
 	t.Setenv("CLAUDE_CODE_ENTRYPOINT", "nested")
+	t.Setenv("CODEX_THREAD_ID", "thread-123")
+	t.Setenv("CODEX_CI", "true")
 
 	got := ProviderProcessPassthroughEnv()
 
@@ -67,9 +70,12 @@ func TestProviderProcessPassthroughEnvIncludesProviderAndRuntimeBaseline(t *test
 		"XDG_STATE_HOME":         filepath.Join(homeDir, ".local", "state"),
 		"ANTHROPIC_AUTH_TOKEN":   "test-anthropic-token",
 		"OLLAMA_API_KEY":         "test-ollama-token",
+		"XIAOMI_API_KEY":         "test-xiaomi-key",
 		"AWS_ACCESS_KEY_ID":      "test-aws-key",
 		"CLAUDECODE":             "",
 		"CLAUDE_CODE_ENTRYPOINT": "",
+		"CODEX_THREAD_ID":        "",
+		"CODEX_CI":               "",
 	} {
 		if got[key] != want {
 			t.Errorf("ProviderProcessPassthroughEnv()[%s] = %q, want %q", key, got[key], want)

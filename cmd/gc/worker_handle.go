@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/materialize"
@@ -98,14 +99,27 @@ func workerSessionCreateHints(resolved *config.ResolvedProvider) runtime.Config 
 	if resolved == nil {
 		return runtime.Config{}
 	}
-	return runtime.Config{
+	hints := agent.StartupHints{
 		Lifecycle:              runtime.Lifecycle(resolved.Lifecycle),
 		ReadyPromptPrefix:      resolved.ReadyPromptPrefix,
 		ReadyDelayMs:           resolved.ReadyDelayMs,
 		ProcessNames:           resolved.ProcessNames,
 		EmitsPermissionWarning: resolved.EmitsPermissionWarning,
 		AcceptStartupDialogs:   resolved.AcceptStartupDialogs,
+		// ga-c4w: the unmanaged `gc session new` direct-start path (controller
+		// down) builds its runtime hints here. Default interactive CLI creates to
+		// mouse-on so the tmux wheel drives copy-mode scrollback. Pool/headless
+		// agents never reach this function — they resolve MouseOn via the
+		// reconciler's templateParamsToConfig (cfgAgent.MouseModeOn()=false), so
+		// this does not weaken controller-poll safety.
+		MouseOn: true,
 	}
+	// Project through the single StartupHints → runtime.Config mapping so this
+	// CLI create path can never silently drop a hint field the reconciler
+	// threads (gc-0tna7). It still populates only the provider-resolvable subset
+	// above; closing the remaining create-vs-resume population gap is the
+	// internal/worker.Factory follow-up.
+	return hints.ToRuntimeConfig()
 }
 
 func resolvedRuntimeMCPServersWithConfig(
@@ -541,23 +555,29 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 		}
 		sessionLive = expandSessionSetup(agentCfg.SessionLive, setupCtx)
 	}
+	// Project the resolved hint subset through the single StartupHints →
+	// runtime.Config mapping (gc-0tna7), then layer the caller-owned
+	// WorkDir/Env/MCPServers. SessionLive is resolved above (ga-vtkhi) so
+	// resumed sessions re-theme; closing the remaining create-time field gap
+	// is the internal/worker.Factory population follow-up.
+	runtimeHints := agent.StartupHints{
+		Lifecycle:              runtime.Lifecycle(resolved.Lifecycle),
+		ReadyPromptPrefix:      resolved.ReadyPromptPrefix,
+		ReadyDelayMs:           resolved.ReadyDelayMs,
+		ProcessNames:           resolved.ProcessNames,
+		EmitsPermissionWarning: resolved.EmitsPermissionWarning,
+		AcceptStartupDialogs:   resolved.AcceptStartupDialogs,
+		SessionLive:            sessionLive,
+	}.ToRuntimeConfig()
+	runtimeHints.WorkDir = workDir
+	runtimeHints.Env = sessionEnv
+	runtimeHints.MCPServers = mcpServers
 	return &worker.ResolvedRuntime{
 		Command:    command,
 		WorkDir:    workDir,
-		Provider:   firstNonEmptyGCString(info.Provider, resolved.Name),
+		Provider:   resolvedWorkerRuntimeProviderLabel(resolved, transport, info),
 		SessionEnv: sessionEnv,
-		Hints: runtime.Config{
-			WorkDir:                workDir,
-			Env:                    sessionEnv,
-			Lifecycle:              runtime.Lifecycle(resolved.Lifecycle),
-			ReadyPromptPrefix:      resolved.ReadyPromptPrefix,
-			ReadyDelayMs:           resolved.ReadyDelayMs,
-			ProcessNames:           resolved.ProcessNames,
-			EmitsPermissionWarning: resolved.EmitsPermissionWarning,
-			AcceptStartupDialogs:   resolved.AcceptStartupDialogs,
-			MCPServers:             mcpServers,
-			SessionLive:            sessionLive,
-		},
+		Hints:      runtimeHints,
 		Resume: session.ProviderResume{
 			ResumeFlag:    firstNonEmptyGCString(resolved.ResumeFlag, info.ResumeFlag),
 			ResumeStyle:   firstNonEmptyGCString(resolved.ResumeStyle, info.ResumeStyle),
@@ -565,6 +585,13 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 			SessionIDFlag: resolved.SessionIDFlag,
 		},
 	}, nil
+}
+
+func resolvedWorkerRuntimeProviderLabel(resolved *config.ResolvedProvider, transport string, info session.Info) string {
+	if strings.TrimSpace(configuredWorkerRuntimeCommand(resolved, transport)) != "" {
+		return firstNonEmptyGCString(resolved.Name, info.Provider)
+	}
+	return firstNonEmptyGCString(info.Provider, resolved.Name)
 }
 
 func resolvedWorkerRuntimeCommandForTransport(cityPath string, resolved *config.ResolvedProvider, transport, storedCommand, fallbackProvider string, metadata map[string]string) string {
@@ -748,6 +775,9 @@ func resolvedWorkerRuntimeTransport(info session.Info, resolved *config.Resolved
 	}
 	if storedWorkerSessionProvesACPTransport(resolved, configuredTransport, info.Command, metadata) {
 		return "acp"
+	}
+	if strings.TrimSpace(configuredTransport) == config.SessionTransportTmux {
+		return config.SessionTransportTmux
 	}
 	if strings.TrimSpace(info.Command) == "" {
 		return strings.TrimSpace(configuredTransport)

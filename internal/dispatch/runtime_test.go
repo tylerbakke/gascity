@@ -446,6 +446,362 @@ func TestProcessScopeCheckAbortsScopeOnFailure(t *testing.T) {
 	}
 }
 
+// scopeCheckAbortScopeFixture builds the canonical scope topology used by the
+// gc.on_fail=abort_scope contract tests: a scope body, a closed subject member
+// (metadata supplied by the caller), the subject's scope-check control, and a
+// downstream member + control wired the way graph compile rewires them
+// (downstream blocks on the subject's scope-check, not on the subject).
+func scopeCheckAbortScopeFixture(t *testing.T, store beads.Store, subjectMeta map[string]string) (control, futureMember, futureControl, body beads.Bead) {
+	t.Helper()
+	body = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": "wf-1",
+			"gc.step_ref":     "demo.body",
+		},
+	})
+	meta := map[string]string{
+		"gc.root_bead_id": "wf-1",
+		"gc.scope_ref":    "body",
+		"gc.scope_role":   "member",
+	}
+	for k, v := range subjectMeta {
+		meta[k] = v
+	}
+	subject := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "preflight",
+		Type:     "task",
+		Status:   "closed",
+		Metadata: meta,
+	})
+	control = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for preflight",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": "wf-1",
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+		},
+	})
+	futureMember = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "implement",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": "wf-1",
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+			"gc.on_fail":      "abort_scope",
+		},
+	})
+	futureControl = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for implement",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": "wf-1",
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+		},
+	})
+	mustDepAdd(t, store, control.ID, subject.ID, "blocks")
+	mustDepAdd(t, store, body.ID, control.ID, "blocks")
+	mustDepAdd(t, store, futureMember.ID, control.ID, "blocks")
+	mustDepAdd(t, store, futureControl.ID, futureMember.ID, "blocks")
+	return control, futureMember, futureControl, body
+}
+
+// Regression test for gastownhall/gascity#1657: a scoped step that opted into
+// gc.on_fail=abort_scope and closes without an affirmative gc.outcome (the
+// worker-result contract violation — e.g. `bd close --reason "FAIL: ..."`)
+// must abort the scope. Downstream steps must be closed as skipped and must
+// NOT appear in ready-work queries, so no pool worker can claim and run them.
+func TestProcessScopeCheckAbortScopeNormalizesFailureContract(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		subjectMeta map[string]string
+	}{
+		{
+			name: "bare close without outcome",
+			subjectMeta: map[string]string{
+				"gc.on_fail":   "abort_scope",
+				"close_reason": "FAIL: subagent returned non-zero",
+			},
+		},
+		{
+			name: "unknown outcome value",
+			subjectMeta: map[string]string{
+				"gc.on_fail": "abort_scope",
+				"gc.outcome": "banana",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := beads.NewMemStore()
+			control, futureMember, futureControl, body := scopeCheckAbortScopeFixture(t, store, tc.subjectMeta)
+
+			result, err := ProcessControl(store, mustGetBead(t, store, control.ID), ProcessOptions{})
+			if err != nil {
+				t.Fatalf("ProcessControl(scope-check): %v", err)
+			}
+			if !result.Processed || result.Action != "scope-fail" {
+				t.Fatalf("result = %+v, want processed scope-fail", result)
+			}
+			if result.Skipped != 2 {
+				t.Fatalf("skipped = %d, want 2", result.Skipped)
+			}
+
+			bodyAfter := mustGetBead(t, store, body.ID)
+			if bodyAfter.Status != "closed" || bodyAfter.Metadata["gc.outcome"] != "fail" {
+				t.Fatalf("body = status %q outcome %q, want closed/fail", bodyAfter.Status, bodyAfter.Metadata["gc.outcome"])
+			}
+			for _, beadID := range []string{futureMember.ID, futureControl.ID} {
+				member := mustGetBead(t, store, beadID)
+				if member.Status != "closed" || member.Metadata["gc.outcome"] != "skipped" {
+					t.Fatalf("%s = status %q outcome %q, want closed/skipped", beadID, member.Status, member.Metadata["gc.outcome"])
+				}
+			}
+			// The issue's repro assertion: with the subject's scope-check
+			// closed, the downstream member's dependencies are satisfied —
+			// only its skipped close keeps it out of ready-work queries.
+			if mustReadyContains(t, store, futureMember.ID) {
+				t.Fatalf("downstream member %s is claimable after abort_scope failure", futureMember.ID)
+			}
+		})
+	}
+}
+
+// Scoped members that did NOT opt into gc.on_fail=abort_scope keep the
+// legacy lenient contract: a bare close advances the scope, and an
+// affirmative pass never aborts even with the opt-in present.
+func TestProcessScopeCheckAbortScopeAffirmativeAndLegacyOutcomes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		subjectMeta map[string]string
+	}{
+		{
+			name:        "bare close without on_fail keeps legacy pass behavior",
+			subjectMeta: map[string]string{"close_reason": "FAIL: subagent returned non-zero"},
+		},
+		{
+			name: "pass outcome with abort_scope does not abort",
+			subjectMeta: map[string]string{
+				"gc.on_fail": "abort_scope",
+				"gc.outcome": "pass",
+			},
+		},
+		{
+			name: "skipped outcome with abort_scope does not abort",
+			subjectMeta: map[string]string{
+				"gc.on_fail": "abort_scope",
+				"gc.outcome": "skipped",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := beads.NewMemStore()
+			control, futureMember, _, body := scopeCheckAbortScopeFixture(t, store, tc.subjectMeta)
+
+			result, err := ProcessControl(store, mustGetBead(t, store, control.ID), ProcessOptions{})
+			if err != nil {
+				t.Fatalf("ProcessControl(scope-check): %v", err)
+			}
+			if !result.Processed || result.Action != "continue" {
+				t.Fatalf("result = %+v, want processed continue", result)
+			}
+			memberAfter := mustGetBead(t, store, futureMember.ID)
+			if memberAfter.Status != "open" {
+				t.Fatalf("downstream member status = %q, want open", memberAfter.Status)
+			}
+			bodyAfter := mustGetBead(t, store, body.ID)
+			if bodyAfter.Status != "open" {
+				t.Fatalf("body status = %q, want open while members remain", bodyAfter.Status)
+			}
+			if !mustReadyContains(t, store, futureMember.ID) {
+				t.Fatalf("downstream member %s should be claimable after scope continues", futureMember.ID)
+			}
+		})
+	}
+}
+
+// Retry-managed attempt subjects are exempt from the fail-closed abort_scope
+// contract: a bare-closed nested-retry attempt (gc.logical_bead_id +
+// gc.attempt, with the opt-in hardcoded at dispatch) must keep routing
+// through retry-eval as a transient contract violation, not abort its
+// iteration scope. An explicit gc.outcome=fail still counts as failed. The
+// opt-in match itself is whitespace-tolerant so formula-authored variants
+// cannot silently keep the legacy lenient contract.
+func TestBeadOutcomeFailedRetryAttemptExemptionAndOptInTrim(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		meta map[string]string
+		want bool
+	}{
+		{
+			name: "bare-closed retry attempt is exempt from fail-closed",
+			meta: map[string]string{
+				"gc.on_fail":         "abort_scope",
+				"gc.logical_bead_id": "ga-logical-1",
+				"gc.attempt":         "1",
+			},
+			want: false,
+		},
+		{
+			name: "explicit fail on retry attempt still counts as failed",
+			meta: map[string]string{
+				"gc.on_fail":         "abort_scope",
+				"gc.logical_bead_id": "ga-logical-1",
+				"gc.attempt":         "1",
+				"gc.outcome":         "fail",
+			},
+			want: true,
+		},
+		{
+			name: "whitespace-padded opt-in still fail-closes a bare close",
+			meta: map[string]string{
+				"gc.on_fail": " abort_scope ",
+			},
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			subject := beads.Bead{
+				ID:       "ga-subject-1",
+				Status:   "closed",
+				Metadata: tc.meta,
+			}
+			if got := beadOutcomeFailed(subject); got != tc.want {
+				t.Fatalf("beadOutcomeFailed = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSkipOpenScopeMembersBatchesDependencyChecksAndUpdates(t *testing.T) {
+	t.Parallel()
+
+	store := &scopeSkipBatchStore{MemStore: beads.NewMemStore()}
+	body := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": "wf-1",
+			"gc.step_ref":     "demo.body",
+		},
+	})
+	failed := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "preflight",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": "wf-1",
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+			"gc.outcome":      "fail",
+		},
+	})
+	control := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for preflight",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": "wf-1",
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+		},
+	})
+	futureMember := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "implement",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": "wf-1",
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+		},
+	})
+	futureControl := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for implement",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": "wf-1",
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+		},
+	})
+	independent := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "independent cleanup marker",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": "wf-1",
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+		},
+	})
+
+	mustDepAdd(t, store, futureMember.ID, control.ID, "blocks")
+	mustDepAdd(t, store, futureControl.ID, futureMember.ID, "blocks")
+
+	snapshot := scopeSnapshot{
+		rootID:      "wf-1",
+		scopeRef:    "body",
+		allComplete: true,
+		members:     []beads.Bead{body, failed, control, futureMember, futureControl, independent},
+		body:        body,
+	}
+	skipped, err := snapshot.skipOpenScopeMembers(store, control.ID)
+	if err != nil {
+		t.Fatalf("skipOpenScopeMembers: %v", err)
+	}
+	if skipped != 3 {
+		t.Fatalf("skipped = %d, want 3", skipped)
+	}
+	if store.depListCalls != 0 {
+		t.Fatalf("DepList calls = %d, want 0 when batch dep listing is available", store.depListCalls)
+	}
+	if store.depListBatchCalls != 2 {
+		t.Fatalf("DepListBatch calls = %d, want 2 dependency waves", store.depListBatchCalls)
+	}
+	if store.updateCalls != 0 {
+		t.Fatalf("Update calls = %d, want 0 when batch update is available", store.updateCalls)
+	}
+	if store.updateAllCalls != 2 {
+		t.Fatalf("UpdateAll calls = %d, want 2 dependency waves", store.updateAllCalls)
+	}
+	if got := []int{len(store.updateAllIDs[0]), len(store.updateAllIDs[1])}; !slices.Equal(got, []int{2, 1}) {
+		t.Fatalf("UpdateAll wave sizes = %v, want [2 1]", got)
+	}
+	for _, beadID := range []string{futureMember.ID, futureControl.ID, independent.ID} {
+		member := mustGetBead(t, store, beadID)
+		if member.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed", beadID, member.Status)
+		}
+		if got := member.Metadata["gc.outcome"]; got != "skipped" {
+			t.Fatalf("%s outcome = %q, want skipped", beadID, got)
+		}
+	}
+}
+
 func TestProcessScopeCheckTreatsRetryAttemptFailureAsNonTerminalForScope(t *testing.T) {
 	t.Parallel()
 
@@ -592,6 +948,244 @@ func TestProcessScopeCheckReturnsPendingWhenSubjectStillOpen(t *testing.T) {
 	bodyAfter := mustGetBead(t, store, body.ID)
 	if bodyAfter.Status != "open" {
 		t.Fatalf("body should stay open, got %q", bodyAfter.Status)
+	}
+}
+
+func TestProcessScopeCheckReturnsPendingWhenRetryAttemptSubjectStillOpen(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	body := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "demo.body",
+		},
+	})
+	logical := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "apply fixes",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "retry",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+			"gc.step_ref":     "demo.apply-fixes",
+		},
+	})
+	attempt := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "apply fixes attempt 1",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id":    workflow.ID,
+			"gc.scope_ref":       "body",
+			"gc.scope_role":      "member",
+			"gc.step_ref":        "demo.apply-fixes.attempt.1",
+			"gc.logical_bead_id": logical.ID,
+			"gc.attempt":         "1",
+		},
+	})
+	control := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for apply fixes attempt 1",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+		},
+	})
+
+	mustDepAdd(t, store, control.ID, attempt.ID, "blocks")
+	mustDepAdd(t, store, body.ID, control.ID, "blocks")
+	mustDepAdd(t, store, logical.ID, control.ID, "blocks")
+
+	_, err := ProcessControl(store, mustGetBead(t, store, control.ID), ProcessOptions{})
+	if !errors.Is(err, ErrControlPending) {
+		t.Fatalf("ProcessControl(scope-check with open retry attempt) = %v, want ErrControlPending", err)
+	}
+
+	controlAfter := mustGetBead(t, store, control.ID)
+	if controlAfter.Status != "open" {
+		t.Fatalf("control status = %q, want open", controlAfter.Status)
+	}
+	bodyAfter := mustGetBead(t, store, body.ID)
+	if bodyAfter.Status != "open" {
+		t.Fatalf("body status = %q, want open", bodyAfter.Status)
+	}
+}
+
+func TestProcessScopeCheckReturnsPendingWhenRetryAttemptSubjectOutsideScopeStillOpen(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	body := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "demo.body",
+		},
+	})
+	logical := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "apply fixes",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.kind":         "retry",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+			"gc.step_ref":     "demo.apply-fixes",
+			"gc.outcome":      "pass",
+		},
+	})
+	attempt := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "apply fixes attempt 1",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id":    workflow.ID,
+			"gc.scope_ref":       "attempt-body",
+			"gc.scope_role":      "member",
+			"gc.step_ref":        "demo.apply-fixes.attempt.1",
+			"gc.logical_bead_id": logical.ID,
+			"gc.attempt":         "1",
+			"gc.output_json":     `{"verdict":"unfinished"}`,
+		},
+	})
+	control := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for apply fixes attempt 1",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+		},
+	})
+
+	mustDepAdd(t, store, control.ID, attempt.ID, "blocks")
+	mustDepAdd(t, store, body.ID, control.ID, "blocks")
+	mustDepAdd(t, store, logical.ID, control.ID, "blocks")
+
+	_, err := ProcessControl(store, mustGetBead(t, store, control.ID), ProcessOptions{})
+	if !errors.Is(err, ErrControlPending) {
+		t.Fatalf("ProcessControl(scope-check with open out-of-scope retry attempt) = %v, want ErrControlPending", err)
+	}
+
+	controlAfter := mustGetBead(t, store, control.ID)
+	if controlAfter.Status != "open" {
+		t.Fatalf("control status = %q, want open", controlAfter.Status)
+	}
+	bodyAfter := mustGetBead(t, store, body.ID)
+	if bodyAfter.Status != "open" {
+		t.Fatalf("body status = %q, want open", bodyAfter.Status)
+	}
+	if got := bodyAfter.Metadata["gc.output_json"]; got != "" {
+		t.Fatalf("body gc.output_json = %q, want empty", got)
+	}
+}
+
+func TestProcessScopeCheckRetryAttemptPassPropagatesMemberMetadata(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	body := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "demo.body",
+		},
+	})
+	logical := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "apply fixes",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.kind":         "retry",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+			"gc.step_ref":     "demo.apply-fixes",
+			"gc.outcome":      "pass",
+		},
+	})
+	attempt := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "apply fixes attempt 1",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id":    workflow.ID,
+			"gc.scope_ref":       "body",
+			"gc.scope_role":      "member",
+			"gc.step_ref":        "demo.apply-fixes.attempt.1",
+			"gc.logical_bead_id": logical.ID,
+			"gc.attempt":         "1",
+			"gc.outcome":         "pass",
+			"review.verdict":     "done",
+		},
+	})
+	control := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for apply fixes attempt 1",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+		},
+	})
+
+	mustDepAdd(t, store, control.ID, attempt.ID, "blocks")
+	mustDepAdd(t, store, body.ID, control.ID, "blocks")
+	mustDepAdd(t, store, logical.ID, control.ID, "blocks")
+
+	result, err := ProcessControl(store, mustGetBead(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(scope-check retry attempt): %v", err)
+	}
+	if result.Action != "scope-pass" {
+		t.Fatalf("action = %q, want scope-pass", result.Action)
+	}
+
+	bodyAfter := mustGetBead(t, store, body.ID)
+	if bodyAfter.Status != "closed" {
+		t.Fatalf("body status = %q, want closed", bodyAfter.Status)
+	}
+	if got := bodyAfter.Metadata["review.verdict"]; got != "done" {
+		t.Fatalf("body review.verdict = %q, want done", got)
 	}
 }
 
@@ -1027,6 +1621,73 @@ func TestReconcileTerminalScopedMemberReusesResolvedBodyForFailingScope(t *testi
 	}
 }
 
+// Regression test for gastownhall/gascity#1657, reconcile-path symmetry: a
+// scoped member with gc.on_fail=abort_scope reconciled after a bare close
+// (no gc.outcome) must abort the scope instead of treating the close as pass.
+func TestReconcileTerminalScopedMemberAbortScopeBareCloseAbortsScope(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	body := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "demo.body",
+		},
+	})
+	failed := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "failed step",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+			"gc.on_fail":      "abort_scope",
+			"close_reason":    "FAIL: subagent returned non-zero",
+		},
+	})
+	openStep := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "later step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+		},
+	})
+
+	result, err := reconcileTerminalScopedMember(store, failed)
+	if err != nil {
+		t.Fatalf("reconcileTerminalScopedMember(bare close): %v", err)
+	}
+	if result.Action != "scope-fail" {
+		t.Fatalf("action = %q, want scope-fail", result.Action)
+	}
+	if result.Skipped != 1 {
+		t.Fatalf("skipped = %d, want 1", result.Skipped)
+	}
+	bodyAfter := mustGetBead(t, store, body.ID)
+	if bodyAfter.Status != "closed" || bodyAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("body = status %q outcome %q, want closed/fail", bodyAfter.Status, bodyAfter.Metadata["gc.outcome"])
+	}
+	openAfter := mustGetBead(t, store, openStep.ID)
+	if openAfter.Status != "closed" || openAfter.Metadata["gc.outcome"] != "skipped" {
+		t.Fatalf("open step = status %q outcome %q, want closed/skipped", openAfter.Status, openAfter.Metadata["gc.outcome"])
+	}
+}
+
 func TestReconcileTerminalScopedMemberReusesResolvedBodyForPassingScope(t *testing.T) {
 	t.Parallel()
 
@@ -1209,6 +1870,15 @@ type countingListStore struct {
 	queries   []beads.ListQuery
 }
 
+type scopeSkipBatchStore struct {
+	*beads.MemStore
+	depListCalls      int
+	depListBatchCalls int
+	updateCalls       int
+	updateAllCalls    int
+	updateAllIDs      [][]string
+}
+
 type scopeBodyVanishAfterFirstResolveStore struct {
 	*beads.MemStore
 	mu       sync.Mutex
@@ -1230,10 +1900,55 @@ type workflowFinalizeCloseFailStore struct {
 	finalizerID string
 }
 
+type closeErrorStore struct {
+	beads.Store
+	failID string
+	err    error
+}
+
+type statusUpdateNoopCloseStore struct {
+	beads.Store
+}
+
 func (s *countingListStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	s.listCalls++
 	s.queries = append(s.queries, query)
 	return s.MemStore.List(query)
+}
+
+func (s statusUpdateNoopCloseStore) Update(id string, opts beads.UpdateOpts) error {
+	if opts.Status != nil && *opts.Status == "closed" {
+		opts.Status = nil
+	}
+	return s.Store.Update(id, opts)
+}
+
+func (s *scopeSkipBatchStore) DepList(id, direction string) ([]beads.Dep, error) {
+	s.depListCalls++
+	return s.MemStore.DepList(id, direction)
+}
+
+func (s *scopeSkipBatchStore) DepListBatch(ids []string) (map[string][]beads.Dep, error) {
+	s.depListBatchCalls++
+	return s.MemStore.DepListBatch(ids)
+}
+
+func (s *scopeSkipBatchStore) Update(id string, opts beads.UpdateOpts) error {
+	s.updateCalls++
+	return s.MemStore.Update(id, opts)
+}
+
+func (s *scopeSkipBatchStore) UpdateAll(ids []string, opts beads.UpdateOpts) (int, error) {
+	s.updateAllCalls++
+	s.updateAllIDs = append(s.updateAllIDs, slices.Clone(ids))
+	updated := 0
+	for _, id := range ids {
+		if err := s.MemStore.Update(id, opts); err != nil {
+			return updated, err
+		}
+		updated++
+	}
+	return updated, nil
 }
 
 func (s *scopeBodyVanishAfterFirstResolveStore) List(query beads.ListQuery) ([]beads.Bead, error) {
@@ -1302,9 +2017,30 @@ func filterBeadID(items []beads.Bead, id string) []beads.Bead {
 	return filtered
 }
 
+func (s *workflowFinalizeCloseFailStore) Close(id string) error {
+	if id == s.finalizerID {
+		return errors.New("finalizer close failed")
+	}
+	return s.Store.Close(id)
+}
+
 func (s *workflowFinalizeCloseFailStore) Update(id string, opts beads.UpdateOpts) error {
 	if id == s.finalizerID && opts.Status != nil && *opts.Status == "closed" {
-		return errors.New("finalizer close failed")
+		opts.Status = nil
+	}
+	return s.Store.Update(id, opts)
+}
+
+func (s closeErrorStore) Close(id string) error {
+	if id == s.failID {
+		return s.err
+	}
+	return s.Store.Close(id)
+}
+
+func (s closeErrorStore) Update(id string, opts beads.UpdateOpts) error {
+	if id == s.failID && opts.Status != nil && *opts.Status == "closed" {
+		opts.Status = nil
 	}
 	return s.Store.Update(id, opts)
 }
@@ -1427,6 +2163,148 @@ func TestProcessWorkflowFinalizeClosesWorkflow(t *testing.T) {
 	}
 	if got := rootAfter.Metadata["gc.outcome"]; got != "fail" {
 		t.Fatalf("workflow outcome = %q, want fail", got)
+	}
+}
+
+// Regression test for gastownhall/gascity#1657, finalize sibling site: a
+// workflow-finalize blocker with gc.on_fail=abort_scope that closed bare (no
+// gc.outcome) must fail the workflow instead of finalizing it green.
+func TestProcessWorkflowFinalizeAbortScopeBareCloseFailsWorkflow(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	sink := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "sink step",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": workflow.ID,
+			"gc.on_fail":      "abort_scope",
+			"close_reason":    "FAIL: subagent returned non-zero",
+		},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+
+	mustDepAdd(t, store, finalizer.ID, sink.ID, "blocks")
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-fail" {
+		t.Fatalf("workflow result = %+v, want processed workflow-fail", result)
+	}
+	rootAfter := mustGetBead(t, store, workflow.ID)
+	if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("workflow = status %q outcome %q, want closed/fail", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
+	}
+}
+
+func TestProcessWorkflowFinalizeUsesCloseOperationForTerminalBeads(t *testing.T) {
+	t.Parallel()
+
+	store := statusUpdateNoopCloseStore{Store: beads.NewMemStore()}
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+	}
+	for _, beadID := range []string{workflow.ID, finalizer.ID} {
+		after := mustGetBead(t, store, beadID)
+		if after.Status != "closed" {
+			t.Fatalf("%s status = %q, want closed", beadID, after.Status)
+		}
+		if got := after.Metadata["gc.outcome"]; got != "pass" {
+			t.Fatalf("%s gc.outcome = %q, want pass", beadID, got)
+		}
+	}
+}
+
+func TestProcessWorkflowFinalizeClosesOpenSpecSidecars(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	spec := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "generated step spec",
+		Type:  "spec",
+		Metadata: map[string]string{
+			"gc.kind":         "spec",
+			"gc.root_bead_id": workflow.ID,
+			"gc.spec_for":     "implement",
+			"gc.spec_for_ref": "implement",
+		},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+	}
+
+	specAfter := mustGetBead(t, store, spec.ID)
+	if specAfter.Status != "closed" {
+		t.Fatalf("spec status = %q, want closed", specAfter.Status)
+	}
+	if got := specAfter.Metadata["gc.outcome"]; got != "pass" {
+		t.Fatalf("spec gc.outcome = %q, want pass", got)
+	}
+	if got := specAfter.Metadata["close_reason"]; got != sourceworkflow.WorkflowSpecSidecarClosedReason {
+		t.Fatalf("spec close_reason = %q, want %q", got, sourceworkflow.WorkflowSpecSidecarClosedReason)
 	}
 }
 
@@ -1818,19 +2696,6 @@ func (s getErrorStore) Get(id string) (beads.Bead, error) {
 	return s.Store.Get(id)
 }
 
-type updateErrorStore struct {
-	beads.Store
-	failID string
-	err    error
-}
-
-func (s updateErrorStore) Update(id string, opts beads.UpdateOpts) error {
-	if id == s.failID {
-		return s.err
-	}
-	return s.Store.Update(id, opts)
-}
-
 func TestProcessWorkflowFinalizeRetriesWhenSourceBeadLookupFails(t *testing.T) {
 	t.Parallel()
 
@@ -2039,7 +2904,7 @@ func TestProcessWorkflowFinalizeDoesNotCloseSourcesWhenRootCloseFails(t *testing
 
 	f := newSourceChainFinalizeFixture(t)
 	rootCloseErr := errors.New("root close failed")
-	rigStore := updateErrorStore{Store: f.rigStore, failID: f.workflow.ID, err: rootCloseErr}
+	rigStore := closeErrorStore{Store: f.rigStore, failID: f.workflow.ID, err: rootCloseErr}
 	resolver := func(ref string) (beads.Store, error) {
 		switch ref {
 		case "city:test":
@@ -3150,6 +4015,9 @@ func TestAppendRalphRetryClearsPoolAssignee(t *testing.T) {
 name = "test-city"
 provider = "claude"
 
+[providers.claude]
+base = "builtin:claude"
+
 [[agent]]
 name = "polecat"
 
@@ -3164,7 +4032,11 @@ max = -1
 	poolSlot := "polecat-2"
 	if err := store.Update(run1.ID, beads.UpdateOpts{
 		Assignee: &poolSlot,
-		Metadata: map[string]string{"gc.routed_to": "polecat"},
+		Metadata: map[string]string{
+			"gc.continuation_group": "main",
+			"gc.routed_to":          "polecat",
+			"gc.session_affinity":   "require",
+		},
 	}); err != nil {
 		t.Fatalf("assign pooled run1: %v", err)
 	}
@@ -3179,6 +4051,12 @@ max = -1
 	run2 := mustGetBead(t, store, mapping[run1.ID])
 	if run2.Assignee != "" {
 		t.Fatalf("run2 assignee = %q, want empty for pooled retry task", run2.Assignee)
+	}
+	if run2.Metadata["gc.session_affinity"] != "" {
+		t.Fatalf("run2 gc.session_affinity = %q, want cleared with pooled retry assignee", run2.Metadata["gc.session_affinity"])
+	}
+	if run2.Metadata["gc.continuation_group"] != "" {
+		t.Fatalf("run2 gc.continuation_group = %q, want cleared with pooled retry assignee", run2.Metadata["gc.continuation_group"])
 	}
 }
 
@@ -6715,6 +7593,59 @@ func TestProcessFanoutFailsWhenSourceFailed(t *testing.T) {
 	}
 }
 
+// Regression test for gastownhall/gascity#1657, fanout sibling site: a fanout
+// whose abort_scope source closed bare (no gc.outcome) must fail instead of
+// attempting expansion against the missing required output.
+func TestProcessFanoutFailsWhenAbortScopeSourceClosedBare(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	source := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "survey",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "demo.survey",
+			"gc.on_fail":      "abort_scope",
+			"close_reason":    "FAIL: subagent returned non-zero",
+		},
+	})
+	fanout := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Expand fanout for survey",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "fanout",
+			"gc.root_bead_id": workflow.ID,
+			"gc.control_for":  "demo.survey",
+			"gc.for_each":     "output.items",
+			"gc.bond":         "expansion-review",
+		},
+	})
+	mustDepAdd(t, store, fanout.ID, source.ID, "blocks")
+
+	result, err := ProcessControl(store, fanout, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(fanout bare-failed source): %v", err)
+	}
+	if !result.Processed || result.Action != "fanout-fail" {
+		t.Fatalf("result = %+v, want processed fanout-fail", result)
+	}
+
+	fanoutAfter := mustGetBead(t, store, fanout.ID)
+	if fanoutAfter.Status != "closed" || fanoutAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("fanout = status %q outcome %q, want closed/fail", fanoutAfter.Status, fanoutAfter.Metadata["gc.outcome"])
+	}
+}
+
 func TestClearRetryEphemeraPreservesRoutingAndClearsFanoutState(t *testing.T) {
 	t.Parallel()
 
@@ -7124,18 +8055,14 @@ func TestRunRalphCheckRejectsPathTraversalAboveCityPath(t *testing.T) {
 	}
 }
 
-// TestRunRalphCheckRejectsAbsoluteCheckPath pins the contract that
-// gc.check_path must be relative. Sling API vars
-// (internal/api/handler_sling.go → internal/molecule → bead metadata)
-// can flow through formula variable substitution
-// (internal/formula/expand.go) and synthesize an absolute string into
-// gc.check_path. convergence.ResolveConditionPath intentionally skips
-// containment for absolute conditionPath values (callers vouch), so
-// ralph.go must reject the absolute form at the metadata boundary or
-// the OR-containment relaxation in gastownhall/gascity#2354 becomes a
-// full bypass for callers who can influence vars.
-func TestRunRalphCheckRejectsAbsoluteCheckPath(t *testing.T) {
+// TestRunRalphCheckAllowsAbsoluteCheckPath pins the registry/import-pack
+// behavior: packs can be installed outside the city/store roots, so formula
+// expansion may produce an absolute gc.check_path.
+func TestRunRalphCheckAllowsAbsoluteCheckPath(t *testing.T) {
 	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
 	cityPath := filepath.Join(parent, "city")
 	storePath := filepath.Join(parent, "rig")
 	if err := os.MkdirAll(cityPath, 0o755); err != nil {
@@ -7144,9 +8071,13 @@ func TestRunRalphCheckRejectsAbsoluteCheckPath(t *testing.T) {
 	if err := os.MkdirAll(storePath, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	outside := filepath.Join(parent, "outside.sh")
-	if err := os.WriteFile(outside, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write outside: %v", err)
+	packDir := filepath.Join(home, ".gc", "cache", "repos", "pack-key", "packs", "workflows")
+	if err := os.MkdirAll(filepath.Join(packDir, "formulas"), 0o755); err != nil {
+		t.Fatalf("mkdir pack formulas: %v", err)
+	}
+	checkScript := filepath.Join(packDir, "check.sh")
+	if err := os.WriteFile(checkScript, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write check script: %v", err)
 	}
 
 	store := beads.NewMemStore()
@@ -7154,50 +8085,226 @@ func TestRunRalphCheckRejectsAbsoluteCheckPath(t *testing.T) {
 		ID:   "check-abs",
 		Type: "task",
 		Metadata: map[string]string{
-			"gc.check_path":    outside,
+			"gc.check_path":    checkScript,
 			"gc.check_timeout": "30s",
 		},
 	}
 	subject := beads.Bead{ID: "run-abs", Type: "task"}
 
-	_, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+	result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath:           cityPath,
+		StorePath:          storePath,
+		FormulaSearchPaths: []string{filepath.Join(packDir, "formulas")},
+	})
+	if err != nil {
+		t.Fatalf("absolute check path should be accepted: %v", err)
+	}
+	if result.Outcome != convergence.GatePass {
+		t.Fatalf("outcome = %q, want %q; stdout=%q stderr=%q", result.Outcome, convergence.GatePass, result.Stdout, result.Stderr)
+	}
+}
+
+func TestRunRalphCheckAllowsAbsoluteCheckPathUnderFormulaPackRoot(t *testing.T) {
+	parent := t.TempDir()
+	t.Setenv("HOME", filepath.Join(parent, "home"))
+	cityPath := filepath.Join(parent, "city")
+	storePath := filepath.Join(parent, "rig")
+	localPackRoot := filepath.Join(parent, "local-workflows-pack")
+	for _, dir := range []string{cityPath, storePath, filepath.Join(localPackRoot, "formulas"), filepath.Join(localPackRoot, "assets", "scripts", "checks")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	checkScript := filepath.Join(localPackRoot, "assets", "scripts", "checks", "review-approved.sh")
+	if err := os.WriteFile(checkScript, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write check script: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	check := beads.Bead{
+		ID:   "check-local-pack",
+		Type: "task",
+		Metadata: map[string]string{
+			"gc.check_path":    checkScript,
+			"gc.check_timeout": "30s",
+		},
+	}
+	subject := beads.Bead{ID: "run-local-pack", Type: "task"}
+
+	result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath:           cityPath,
+		StorePath:          storePath,
+		FormulaSearchPaths: []string{filepath.Join(localPackRoot, "formulas")},
+	})
+	if err != nil {
+		t.Fatalf("absolute check path under formula pack root should be accepted: %v", err)
+	}
+	if result.Outcome != convergence.GatePass {
+		t.Fatalf("outcome = %q, want %q; stdout=%q stderr=%q", result.Outcome, convergence.GatePass, result.Stdout, result.Stderr)
+	}
+}
+
+func TestRunRalphCheckRejectsAbsoluteCheckPathUnderUnrelatedCachedPack(t *testing.T) {
+	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
+	cityPath := filepath.Join(parent, "city")
+	storePath := filepath.Join(parent, "rig")
+	activePackRoot := filepath.Join(home, ".gc", "cache", "repos", "active-key", "packs", "workflows")
+	otherPackRoot := filepath.Join(home, ".gc", "cache", "repos", "other-key", "packs", "workflows")
+	for _, dir := range []string{cityPath, storePath, filepath.Join(activePackRoot, "formulas"), filepath.Join(otherPackRoot, "assets", "scripts")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	checkScript := filepath.Join(otherPackRoot, "assets", "scripts", "check.sh")
+	if err := os.WriteFile(checkScript, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write check script: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	check := beads.Bead{
+		ID:   "check-other-pack",
+		Type: "task",
+		Metadata: map[string]string{
+			"gc.check_path":    checkScript,
+			"gc.check_timeout": "30s",
+		},
+	}
+	subject := beads.Bead{ID: "run-other-pack", Type: "task"}
+
+	result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath:           cityPath,
+		StorePath:          storePath,
+		FormulaSearchPaths: []string{filepath.Join(activePackRoot, "formulas")},
+	})
+	if err == nil {
+		t.Fatalf("expected unrelated cached pack rejection, got outcome=%q stdout=%q", result.Outcome, result.Stdout)
+	}
+	if !strings.Contains(err.Error(), "trusted roots") {
+		t.Errorf("expected trusted roots error, got: %v", err)
+	}
+}
+
+func TestRunRalphCheckRejectsAbsoluteCheckPathOutsideTrustedRoots(t *testing.T) {
+	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
+	cityPath := filepath.Join(parent, "city")
+	storePath := filepath.Join(parent, "rig")
+	outsideDir := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(cityPath, 0o755); err != nil {
+		t.Fatalf("mkdir city: %v", err)
+	}
+	if err := os.MkdirAll(storePath, 0o755); err != nil {
+		t.Fatalf("mkdir store: %v", err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	checkScript := filepath.Join(outsideDir, "check.sh")
+	if err := os.WriteFile(checkScript, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write check script: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	check := beads.Bead{
+		ID:   "check-abs-outside",
+		Type: "task",
+		Metadata: map[string]string{
+			"gc.check_path":    checkScript,
+			"gc.check_timeout": "30s",
+		},
+	}
+	subject := beads.Bead{ID: "run-abs-outside", Type: "task"}
+
+	result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
 		CityPath:  cityPath,
 		StorePath: storePath,
 	})
 	if err == nil {
-		t.Fatal("expected absolute-path rejection, got nil")
+		t.Fatalf("expected absolute check path rejection, got outcome=%q stdout=%q", result.Outcome, result.Stdout)
 	}
-	if !strings.Contains(err.Error(), "must be relative") {
-		t.Errorf("expected absolute-path error, got: %v", err)
+	if !strings.Contains(err.Error(), "trusted roots") {
+		t.Errorf("expected trusted roots error, got: %v", err)
 	}
 }
 
-// TestRunRalphCheckRejectsAbsoluteWorkDirOutsideRoots pins the
-// gastownhall/gascity#2354 review fix: work_dir is the only path on
-// runRalphCheck's hot path that comes from caller-influenceable
-// metadata (sling API vars → bead metadata). If work_dir resolves
-// outside both cityPath and storePath, it must be rejected before it
-// becomes the `base` argument to convergence.ResolveConditionPath —
-// otherwise the OR-containment relaxation lets a relative gc.check_path
-// land anywhere the caller controls.
-func TestRunRalphCheckRejectsAbsoluteWorkDirOutsideRoots(t *testing.T) {
+func TestRunRalphCheckRejectsAbsoluteCheckPathSymlinkOutsideTrustedRoots(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("GC_HOME", filepath.Join(home, ".gc"))
+	cityPath := filepath.Join(parent, "city")
+	storePath := filepath.Join(parent, "rig")
+	packDir := filepath.Join(home, ".gc", "cache", "repos", "pack-key")
+	outsideDir := filepath.Join(parent, "outside")
+	for _, dir := range []string{cityPath, storePath, packDir, outsideDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	outsideScript := filepath.Join(outsideDir, "check.sh")
+	if err := os.WriteFile(outsideScript, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write outside check script: %v", err)
+	}
+	checkLink := filepath.Join(packDir, "check.sh")
+	if err := os.Symlink(outsideScript, checkLink); err != nil {
+		t.Fatalf("symlink check script: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	check := beads.Bead{
+		ID:   "check-abs-symlink-outside",
+		Type: "task",
+		Metadata: map[string]string{
+			"gc.check_path":    checkLink,
+			"gc.check_timeout": "30s",
+		},
+	}
+	subject := beads.Bead{ID: "run-abs-symlink-outside", Type: "task"}
+
+	result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath:  cityPath,
+		StorePath: storePath,
+	})
+	if err == nil {
+		t.Fatalf("expected symlinked absolute check path rejection, got outcome=%q stdout=%q", result.Outcome, result.Stdout)
+	}
+	if !strings.Contains(err.Error(), "trusted roots") {
+		t.Errorf("expected trusted roots error, got: %v", err)
+	}
+}
+
+// TestRunRalphCheckAllowsAbsoluteCheckPathWithExternalWorkDir pins the
+// PR-review worktree contract: adopted PR worktrees are sibling directories
+// outside both the city and store roots, while review checks are absolute
+// pack-local scripts whose source is independently trusted.
+func TestRunRalphCheckAllowsAbsoluteCheckPathWithExternalWorkDir(t *testing.T) {
 	parent := t.TempDir()
 	cityPath := filepath.Join(parent, "city")
 	storePath := filepath.Join(parent, "rig")
-	attackerDir := filepath.Join(parent, "attacker")
-	if err := os.MkdirAll(cityPath, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	worktreeDir := filepath.Join(parent, "worktree")
+	packRoot := filepath.Join(parent, "workflows-pack")
+	for _, dir := range []string{
+		cityPath,
+		storePath,
+		worktreeDir,
+		filepath.Join(packRoot, "formulas"),
+		filepath.Join(packRoot, "assets", "scripts", "checks"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
 	}
-	if err := os.MkdirAll(storePath, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.MkdirAll(attackerDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	// Plant a real script in attackerDir so the rejection cannot be
-	// blamed on a missing file — the failure must be the work_dir guard.
-	if err := os.WriteFile(filepath.Join(attackerDir, "check.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write attacker script: %v", err)
+	checkScript := filepath.Join(packRoot, "assets", "scripts", "checks", "review-approved.sh")
+	if err := os.WriteFile(checkScript, []byte("#!/bin/sh\nprintf '%s\\n%s\\n' \"$GC_WORK_DIR\" \"$(pwd)\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write pack check script: %v", err)
 	}
 
 	store := beads.NewMemStore()
@@ -7205,70 +8312,81 @@ func TestRunRalphCheckRejectsAbsoluteWorkDirOutsideRoots(t *testing.T) {
 		ID:   "check-abs-workdir",
 		Type: "task",
 		Metadata: map[string]string{
-			"gc.check_path":    "check.sh",
-			"gc.work_dir":      attackerDir, // absolute, outside both roots
+			"gc.check_path":    checkScript,
+			"gc.work_dir":      worktreeDir, // absolute, outside both roots
 			"gc.check_timeout": "30s",
 		},
 	}
 	subject := beads.Bead{ID: "run-abs-workdir", Type: "task"}
 
-	_, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
-		CityPath:  cityPath,
-		StorePath: storePath,
+	result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath:           cityPath,
+		StorePath:          storePath,
+		FormulaSearchPaths: []string{filepath.Join(packRoot, "formulas")},
 	})
-	if err == nil {
-		t.Fatal("expected work_dir escape rejection, got nil")
+	if err != nil {
+		t.Fatalf("runRalphCheck: %v", err)
 	}
-	if !strings.Contains(err.Error(), "work_dir") || !strings.Contains(err.Error(), "escapes") {
-		t.Errorf("expected work_dir escape error, got: %v", err)
+	if result.Outcome != "pass" {
+		t.Fatalf("Outcome = %q, want pass (stderr=%q)", result.Outcome, result.Stderr)
+	}
+	if !strings.Contains(result.Stdout, worktreeDir) {
+		t.Fatalf("stdout = %q, want GC_WORK_DIR %q", result.Stdout, worktreeDir)
 	}
 }
 
-// TestRunRalphCheckRejectsRelativeWorkDirOutsideRoots pins the
-// companion case for relative work_dir values that traverse upward
-// out of storePath. The pre-2354 envelope-only check would still
-// reject because the resolved path escaped envelope; with the
-// OR-containment relaxation, the new ralph.go guard is what closes
-// this vector.
-func TestRunRalphCheckRejectsRelativeWorkDirOutsideRoots(t *testing.T) {
+// TestRunRalphCheckRejectsRelativeCheckPathWithExternalWorkDir keeps
+// metadata-derived external work_dir values from becoming the trusted base for
+// relative gc.check_path scripts.
+func TestRunRalphCheckRejectsRelativeCheckPathWithExternalWorkDir(t *testing.T) {
 	parent := t.TempDir()
 	cityPath := filepath.Join(parent, "city")
 	storePath := filepath.Join(parent, "rig")
-	attackerDir := filepath.Join(parent, "attacker")
-	if err := os.MkdirAll(cityPath, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	absoluteWorktreeDir := filepath.Join(parent, "abs-worktree")
+	relativeWorktreeDir := filepath.Join(parent, "rel-worktree")
+	for _, dir := range []string{cityPath, storePath, absoluteWorktreeDir, relativeWorktreeDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
 	}
-	if err := os.MkdirAll(storePath, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.MkdirAll(attackerDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(attackerDir, "check.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write attacker script: %v", err)
+	for _, dir := range []string{absoluteWorktreeDir, relativeWorktreeDir} {
+		if err := os.WriteFile(filepath.Join(dir, "check.sh"), []byte("#!/bin/sh\necho \"$GC_WORK_DIR\"\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write worktree script in %s: %v", dir, err)
+		}
 	}
 
-	store := beads.NewMemStore()
-	check := beads.Bead{
-		ID:   "check-rel-workdir",
-		Type: "task",
-		Metadata: map[string]string{
-			"gc.check_path":    "check.sh",
-			"gc.work_dir":      "../attacker", // joins under storePath, escapes both roots
-			"gc.check_timeout": "30s",
-		},
+	cases := []struct {
+		name    string
+		workDir string
+	}{
+		{name: "absolute_external", workDir: absoluteWorktreeDir},
+		{name: "relative_external", workDir: "../rel-worktree"},
 	}
-	subject := beads.Bead{ID: "run-rel-workdir", Type: "task"}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			check := beads.Bead{
+				ID:   "check-rel-workdir",
+				Type: "task",
+				Metadata: map[string]string{
+					"gc.check_path":    "check.sh",
+					"gc.work_dir":      tc.workDir,
+					"gc.check_timeout": "30s",
+				},
+			}
+			subject := beads.Bead{ID: "run-rel-workdir", Type: "task"}
 
-	_, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
-		CityPath:  cityPath,
-		StorePath: storePath,
-	})
-	if err == nil {
-		t.Fatal("expected work_dir traversal rejection, got nil")
-	}
-	if !strings.Contains(err.Error(), "work_dir") || !strings.Contains(err.Error(), "escapes") {
-		t.Errorf("expected work_dir escape error, got: %v", err)
+			result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+				CityPath:  cityPath,
+				StorePath: storePath,
+			})
+			if err == nil {
+				t.Fatalf("expected external work_dir rejection, got outcome=%q stdout=%q", result.Outcome, result.Stdout)
+			}
+			if !strings.Contains(err.Error(), "escapes both city and store roots") {
+				t.Errorf("expected work_dir containment error, got: %v", err)
+			}
+		})
 	}
 }
 

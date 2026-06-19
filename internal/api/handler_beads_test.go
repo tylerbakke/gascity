@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -539,6 +540,88 @@ func (s *projectionConflictStore) WaitForParentProjection(_ context.Context, _, 
 	return beads.ErrParentProjectionSuperseded
 }
 
+// TestBeadListBoundedReadIsStableOrderedPrefixAcrossRigs pins the #3208
+// contract: a limit-bounded GET /beads returns a deterministic prefix of one
+// global (created_at DESC, id DESC) total order across rig stores — not a
+// per-rig concatenation — and a truncated response carries next_cursor so
+// the remainder is fetchable.
+func TestBeadListBoundedReadIsStableOrderedPrefixAcrossRigs(t *testing.T) {
+	state := newFakeState(t)
+	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	mk := func(id string, minutes int) beads.Bead {
+		return beads.Bead{
+			ID:        id,
+			Title:     id,
+			Status:    "open",
+			Type:      "task",
+			CreatedAt: base.Add(time.Duration(minutes) * time.Minute),
+		}
+	}
+	// Creation times interleave across the two rigs so per-rig concatenation
+	// and the global total order disagree.
+	state.stores["arig"] = beads.NewMemStoreFrom(0, []beads.Bead{
+		mk("aa-1", 1), mk("aa-3", 3), mk("aa-5", 5),
+	}, nil)
+	state.stores["zrig"] = beads.NewMemStoreFrom(0, []beads.Bead{
+		mk("zz-2", 2), mk("zz-4", 4), mk("zz-6", 6),
+	}, nil)
+	h := newTestCityHandler(t, state)
+
+	type listResp struct {
+		Items      []beads.Bead `json:"items"`
+		Total      int          `json:"total"`
+		NextCursor string       `json:"next_cursor"`
+	}
+	get := func(url string) listResp {
+		t.Helper()
+		req := httptest.NewRequest("GET", cityURL(state, url), nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200: %s", url, rec.Code, rec.Body.String())
+		}
+		var resp listResp
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode %s: %v", url, err)
+		}
+		return resp
+	}
+	ids := func(items []beads.Bead) []string {
+		out := make([]string, 0, len(items))
+		for _, b := range items {
+			out = append(out, b.ID)
+		}
+		return out
+	}
+
+	first := get("/beads?limit=4")
+	wantFirst := []string{"zz-6", "aa-5", "zz-4", "aa-3"}
+	if got := ids(first.Items); !slices.Equal(got, wantFirst) {
+		t.Fatalf("bounded page ids = %v, want global order %v", got, wantFirst)
+	}
+	if first.Total != 6 {
+		t.Fatalf("total = %d, want 6", first.Total)
+	}
+	if first.NextCursor == "" {
+		t.Fatalf("truncated bounded read returned no next_cursor; remainder is unfetchable")
+	}
+
+	// The same bounded read must return the same page — the #3208 symptom
+	// was per-call-different subsets.
+	if again := get("/beads?limit=4"); !slices.Equal(ids(again.Items), wantFirst) {
+		t.Fatalf("repeat bounded page ids = %v, want %v (non-deterministic page)", ids(again.Items), wantFirst)
+	}
+
+	rest := get("/beads?limit=4&cursor=" + first.NextCursor)
+	wantRest := []string{"zz-2", "aa-1"}
+	if got := ids(rest.Items); !slices.Equal(got, wantRest) {
+		t.Fatalf("continuation ids = %v, want %v", got, wantRest)
+	}
+	if rest.NextCursor != "" {
+		t.Fatalf("final page next_cursor = %q, want empty", rest.NextCursor)
+	}
+}
+
 func TestBeadListFiltering(t *testing.T) {
 	state := newFakeState(t)
 	store := state.stores["myrig"]
@@ -895,6 +978,43 @@ func TestBeadCreatePersistsMetadataAndParent(t *testing.T) {
 	}
 	if got.Metadata["real_world_app.contract.role"] != "child" || got.Metadata["real_world_app.contract.run_id"] != "run-1" {
 		t.Fatalf("stored metadata = %#v, want real-world app metadata", got.Metadata)
+	}
+}
+
+func TestBeadCreatePersistsDeferUntil(t *testing.T) {
+	state := newFakeState(t)
+	store := state.stores["myrig"]
+	h := newTestCityHandler(t, state)
+
+	deferUntil := time.Date(2026, 6, 1, 12, 30, 0, 0, time.UTC)
+	body := `{
+		"rig":"myrig",
+		"title":"Deferred task",
+		"type":"task",
+		"defer_until":"` + deferUntil.Format(time.RFC3339) + `"
+	}`
+	req := newPostRequest(cityURL(state, "/beads"), bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d, body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var created beads.Bead
+	if err := json.NewDecoder(rec.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created bead: %v", err)
+	}
+	if created.DeferUntil == nil || !created.DeferUntil.Equal(deferUntil) {
+		t.Fatalf("response defer_until = %v, want %s", created.DeferUntil, deferUntil.Format(time.RFC3339))
+	}
+
+	got, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get(created): %v", err)
+	}
+	if got.DeferUntil == nil || !got.DeferUntil.Equal(deferUntil) {
+		t.Fatalf("stored defer_until = %v, want %s", got.DeferUntil, deferUntil.Format(time.RFC3339))
 	}
 }
 

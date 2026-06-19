@@ -6,12 +6,14 @@ type ProfileID string
 // revive:disable:exported
 const ( //nolint:revive // exported profile IDs are documented by the enclosing type.
 	// Profile* identify the canonical worker profiles used by conformance tests.
-	ProfileClaudeTmuxCLI   ProfileID = "claude/tmux-cli"
-	ProfileCodexTmuxCLI    ProfileID = "codex/tmux-cli"
-	ProfileGeminiTmuxCLI   ProfileID = "gemini/tmux-cli"
-	ProfileKimiTmuxCLI     ProfileID = "kimi/tmux-cli"
-	ProfileOpenCodeTmuxCLI ProfileID = "opencode/tmux-cli"
-	ProfilePiTmuxCLI       ProfileID = "pi/tmux-cli"
+	ProfileClaudeTmuxCLI      ProfileID = "claude/tmux-cli"
+	ProfileCodexTmuxCLI       ProfileID = "codex/tmux-cli"
+	ProfileGeminiTmuxCLI      ProfileID = "gemini/tmux-cli"
+	ProfileKimiTmuxCLI        ProfileID = "kimi/tmux-cli"
+	ProfileOpenCodeTmuxCLI    ProfileID = "opencode/tmux-cli"
+	ProfileMimoCodeTmuxCLI    ProfileID = "mimocode/tmux-cli"
+	ProfilePiTmuxCLI          ProfileID = "pi/tmux-cli"
+	ProfileAntigravityTmuxCLI ProfileID = "antigravity/tmux-cli"
 )
 
 // revive:enable:exported
@@ -124,6 +126,22 @@ func Phase1Profiles() []Profile {
 			},
 		},
 		{
+			ID:       ProfileMimoCodeTmuxCLI,
+			Provider: "mimocode/tmux-cli",
+			WorkDir:  "/tmp/gascity/phase1/mimocode",
+			Fixtures: ProfileFixtureSet{
+				FreshRoot:        "testdata/fixtures/mimocode/fresh",
+				ContinuationRoot: "testdata/fixtures/mimocode/continuation",
+				ResetRoot:        "testdata/fixtures/mimocode/reset",
+			},
+			Continuation: ContinuationOracle{
+				AnchorText:             "MiMo Code phase 1 validates the tmux CLI transcript contract.",
+				RecallPromptContains:   "Repeat the exact MiMo Code phase-1 summary from earlier before answering.",
+				RecallResponseContains: "MiMo Code phase 1 validates the tmux CLI transcript contract.",
+				ResetResponseContains:  "I cannot repeat the earlier MiMo Code summary because this session started fresh.",
+			},
+		},
+		{
 			ID:       ProfilePiTmuxCLI,
 			Provider: "pi/tmux-cli",
 			WorkDir:  "/tmp/gascity/phase1/pi",
@@ -137,6 +155,22 @@ func Phase1Profiles() []Profile {
 				RecallPromptContains:   "Repeat the exact Pi phase-1 summary from earlier before answering.",
 				RecallResponseContains: "Pi phase 1 validates the tmux CLI transcript contract.",
 				ResetResponseContains:  "I cannot repeat the earlier Pi summary because this session started fresh.",
+			},
+		},
+		{
+			ID:       ProfileAntigravityTmuxCLI,
+			Provider: "antigravity/tmux-cli",
+			WorkDir:  "/tmp/gascity/phase1/antigravity",
+			Fixtures: ProfileFixtureSet{
+				FreshRoot:        "testdata/fixtures/antigravity/fresh/brain",
+				ContinuationRoot: "testdata/fixtures/antigravity/continuation/brain",
+				ResetRoot:        "testdata/fixtures/antigravity/reset/brain",
+			},
+			Continuation: ContinuationOracle{
+				AnchorText:             "Antigravity phase 1 validates the agy trajectory transcript contract.",
+				RecallPromptContains:   "Repeat the exact Antigravity phase-1 summary from earlier before answering.",
+				RecallResponseContains: "Antigravity phase 1 validates the agy trajectory transcript contract.",
+				ResetResponseContains:  "I cannot repeat the earlier Antigravity summary because this session started fresh.",
 			},
 		},
 	}

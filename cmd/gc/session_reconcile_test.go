@@ -15,8 +15,10 @@ import (
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
 // testStore wraps a bead slice for SetMetadata tracking in tests.
@@ -738,7 +740,7 @@ func TestComputeWorkSet_RunsWorkQuery(t *testing.T) {
 	}
 
 	runner := func(command, _ string, _ map[string]string) (string, error) {
-		if strings.Contains(command, "gc.routed_to=worker") {
+		if strings.Contains(command, `bd ready --metadata-field "gc.routed_to=$target"`) && strings.Contains(command, "-- worker") {
 			return `[{"id":"BL-42"}]`, nil
 		}
 		return "", nil // empty = no work for idle's custom query
@@ -801,6 +803,51 @@ func TestComputeWorkSet_UsesConfiguredRigRoot(t *testing.T) {
 	work := computeWorkSet(cfg, runner, "test-city", cityDir, nil, nil, nil)
 	if !work["myrig/polecat"] {
 		t.Error("expected myrig/polecat to have work when rig root is configured externally")
+	}
+}
+
+// TestComputeWorkSet_RuntimeOnlySuspendUnderForeignCwd guards the
+// regression behind threading the in-scope city path into the
+// reconciler's suspension check: a rig suspended *only* in the runtime
+// state file (no suspended_on_start in city.toml) must keep its agents
+// out of the work set even when the controller process runs from a
+// foreign working directory. The pre-fix check resolved suspension via
+// the process cwd, so a runtime-only suspend in cityDir was invisible
+// here and the agent wrongly stayed eligible.
+func TestComputeWorkSet_RuntimeOnlySuspendUnderForeignCwd(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "myrig")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Runtime-only suspend: the rig declares no suspended_on_start; the
+	// suspension lives solely in .gc/runtime/suspension-state.json.
+	suspend := true
+	if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cityDir, "myrig", &suspend); err != nil {
+		t.Fatalf("SetRigSuspended: %v", err)
+	}
+
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "myrig", Path: rigDir}},
+		Agents: []config.Agent{
+			{Name: "polecat", Dir: "myrig", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3)},
+		},
+	}
+
+	// The probe runner reports work for any dir; if the suspended agent
+	// were not filtered, it would land in the work set.
+	runner := func(_ string, _ string, _ map[string]string) (string, error) {
+		return "real-world app-1\n", nil
+	}
+
+	// Run from a foreign cwd with no city.toml, defeating any cwd-based
+	// suspension resolution.
+	t.Chdir(t.TempDir())
+
+	work := computeWorkSet(cfg, runner, "test-city", cityDir, nil, nil, nil)
+	if work["myrig/polecat"] {
+		t.Error("runtime-only suspended rig's agent must stay out of the work set even under a foreign cwd")
 	}
 }
 
@@ -2346,6 +2393,23 @@ func TestFindAgentByTemplate(t *testing.T) {
 	if a := findAgentByTemplate(cfg, "worker"); a == nil || a.Name != "worker" {
 		t.Error("expected to find worker")
 	}
+	legacyCfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "implementation-worker", Dir: "gascity-packs"},
+		},
+	}
+	if a := findAgentByTemplate(legacyCfg, "gascity-packs/gc.implementation-worker"); a == nil || a.QualifiedName() != "gascity-packs/implementation-worker" {
+		t.Fatalf("expected persisted bound template to resolve to current unbound agent, got %#v", a)
+	}
+	boundCfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "rig"},
+			{Name: "worker", Dir: "rig", BindingName: "gc"},
+		},
+	}
+	if a := findAgentByTemplate(boundCfg, "rig/gc.worker"); a == nil || a.BindingName != "gc" {
+		t.Fatalf("expected exact bound agent to win over unbound legacy fallback, got %#v", a)
+	}
 	if a := findAgentByTemplate(cfg, "missing"); a != nil {
 		t.Error("expected nil for missing template")
 	}
@@ -2354,6 +2418,44 @@ func TestFindAgentByTemplate(t *testing.T) {
 	}
 	if a := findAgentByTemplate(cfg, ""); a != nil {
 		t.Error("expected nil for empty template")
+	}
+}
+
+// TestAgentTemplateIdentitiesEquivalent pins the load-bearing asymmetry of
+// the identity-equivalence helper: a legacy bound identity is equivalent to
+// the unbound agent only after the bound agent is gone. While both a bound
+// "rig/gc.worker" and an unbound "rig/worker" exist, each identity normalizes
+// to itself and the two must stay distinct — otherwise wake demand and
+// session accounting for two different roles would merge.
+func TestAgentTemplateIdentitiesEquivalent(t *testing.T) {
+	unboundOnly := &config.City{
+		Agents: []config.Agent{{Name: "worker", Dir: "rig"}},
+	}
+	if !agentTemplateIdentitiesEquivalent(unboundOnly, "rig/gc.worker", "rig/worker") {
+		t.Error("legacy bound identity should be equivalent to the remaining unbound agent")
+	}
+	if !agentTemplateIdentitiesEquivalent(unboundOnly, "rig/worker", "rig/gc.worker") {
+		t.Error("equivalence should be symmetric")
+	}
+
+	bothPresent := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "rig"},
+			{Name: "worker", Dir: "rig", BindingName: "gc"},
+		},
+	}
+	if agentTemplateIdentitiesEquivalent(bothPresent, "rig/gc.worker", "rig/worker") {
+		t.Error("bound and unbound identities must stay distinct while both agents exist")
+	}
+
+	if agentTemplateIdentitiesEquivalent(unboundOnly, "otherrig/gc.worker", "rig/worker") {
+		t.Error("legacy fallback must not cross rig/dir boundaries")
+	}
+	if agentTemplateIdentitiesEquivalent(unboundOnly, "", "rig/worker") {
+		t.Error("empty identity is never equivalent")
+	}
+	if !agentTemplateIdentitiesEquivalent(nil, "rig/worker", "rig/worker") {
+		t.Error("identical strings are equivalent even without config")
 	}
 }
 

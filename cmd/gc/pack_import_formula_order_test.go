@@ -128,14 +128,14 @@ func TestTransitiveGastownPackDigestOrderResolvesAndRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gastownRoot, err := filepath.Abs(filepath.Join("..", "..", "examples", "gastown"))
-	if err != nil {
-		t.Fatalf("Abs(examples/gastown): %v", err)
-	}
-	gastownPackDir := filepath.Join(gastownRoot, "packs", "gastown")
-	maintenancePackDir := filepath.Join(gastownRoot, "packs", "maintenance")
+	// The example city no longer carries a checked-in gastown pack copy;
+	// materialize the module-embedded pack so the wrapper import below
+	// exercises transitive local-path composition against the real bytes.
+	gastownPackDir := materializeEmbeddedGastownPack(t)
+	retiredMaintenanceFormulaLayer := filepath.Join(filepath.Dir(gastownPackDir), "maintenance", "formulas")
 	digestFormulaLayer := filepath.Join(gastownPackDir, "formulas")
 	digestFormulaFile := filepath.Join(digestFormulaLayer, "mol-digest-generate.toml")
+	shutdownFormulaFile := filepath.Join(digestFormulaLayer, "mol-shutdown-dance.toml")
 
 	writeFile(t, filepath.Join(cityDir, "city.toml"), `
 [daemon]
@@ -165,7 +165,7 @@ source = "`+gastownPackDir+`"
 	if err != nil {
 		t.Fatalf("loadCityConfig: %v", err)
 	}
-	assertContainsString(t, cfg.FormulaLayers.City, filepath.Join(maintenancePackDir, "formulas"))
+	assertNotContainsString(t, cfg.FormulaLayers.City, retiredMaintenanceFormulaLayer)
 	assertContainsString(t, cfg.FormulaLayers.City, digestFormulaLayer)
 	assertAgentQualifiedName(t, cfg.Agents, "wrapper.dog")
 
@@ -205,6 +205,7 @@ source = "`+gastownPackDir+`"
 		t.Fatalf("ResolveFormulas(city): %v", err)
 	}
 	assertSymlinkTarget(t, filepath.Join(cityDir, ".beads", "formulas", "mol-digest-generate.toml"), digestFormulaFile)
+	assertSymlinkTarget(t, filepath.Join(cityDir, ".beads", "formulas", "mol-shutdown-dance.toml"), shutdownFormulaFile)
 
 	store := beads.NewMemStore()
 	var stdout bytes.Buffer
@@ -213,7 +214,7 @@ source = "`+gastownPackDir+`"
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stdout: %s stderr: %s", code, stdout.String(), stderr.String())
 	}
-	runs, err := store.ListByLabel("order-run:digest-generate", 0)
+	runs, err := store.ListByLabel("order-run:digest-generate", 0, beads.WithBothTiers)
 	if err != nil {
 		t.Fatalf("store.ListByLabel(order-run:digest-generate): %v", err)
 	}

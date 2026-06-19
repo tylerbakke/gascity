@@ -1,6 +1,7 @@
 package beads_test
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -504,7 +505,7 @@ func TestFileStoreRefreshesSameSizeExternalRewrite(t *testing.T) {
 	}
 
 	beforeLen := len(f.Files[path])
-	updatedTitle := updateTitleKeepingFileSize(t, s1, f, path, created.ID, beforeLen)
+	updatedTitle := rewriteTitleKeepingFileSize(t, f, path, created.ID, beforeLen)
 	afterLen := len(f.Files[path])
 	if beforeLen != afterLen {
 		t.Fatalf("expected same-size rewrite, got %d -> %d bytes", beforeLen, afterLen)
@@ -538,11 +539,6 @@ func TestFileStoreMutatorReloadsSameSizeExternalRewriteWithUnchangedFreshness(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer, err := beads.OpenFileStore(f, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	created, err := stale.Create(beads.Bead{Title: strings.Repeat("a", 32)})
 	if err != nil {
 		t.Fatal(err)
@@ -550,7 +546,7 @@ func TestFileStoreMutatorReloadsSameSizeExternalRewriteWithUnchangedFreshness(t 
 	originalModTime := f.ModTimes[path]
 	originalLen := len(f.Files[path])
 
-	updatedTitle := updateTitleKeepingFileSize(t, writer, f, path, created.ID, originalLen)
+	updatedTitle := rewriteTitleKeepingFileSize(t, f, path, created.ID, originalLen)
 	if gotLen := len(f.Files[path]); gotLen != originalLen {
 		t.Fatalf("expected same-size external rewrite, got %d -> %d bytes", originalLen, gotLen)
 	}
@@ -576,14 +572,50 @@ func TestFileStoreMutatorReloadsSameSizeExternalRewriteWithUnchangedFreshness(t 
 	}
 }
 
-func updateTitleKeepingFileSize(t *testing.T, store beads.Store, f *fsys.Fake, path, id string, targetLen int) string {
+func rewriteTitleKeepingFileSize(t *testing.T, f *fsys.Fake, path, id string, targetLen int) string {
 	t.Helper()
-	for pad := 0; pad <= 64; pad++ {
-		title := "bravo" + strings.Repeat("x", pad)
-		if err := store.Update(id, beads.UpdateOpts{Title: &title}); err != nil {
-			t.Fatalf("Update(%q) to same-size title: %v", id, err)
-		}
-		if len(f.Files[path]) == targetLen {
+
+	var fd struct {
+		Seq   int          `json:"seq"`
+		Beads []beads.Bead `json:"beads"`
+		Deps  []beads.Dep  `json:"deps,omitempty"`
+	}
+	if err := json.Unmarshal(f.Files[path], &fd); err != nil {
+		t.Fatalf("unmarshal file store data: %v", err)
+	}
+
+	for titleLen := 1; titleLen <= targetLen; titleLen++ {
+		title := "b" + strings.Repeat("x", titleLen-1)
+		for descLen := 0; descLen <= targetLen; descLen++ {
+			candidate := fd
+			candidate.Beads = append([]beads.Bead(nil), fd.Beads...)
+			found := false
+			for i := range candidate.Beads {
+				if candidate.Beads[i].ID != id {
+					continue
+				}
+				found = true
+				candidate.Beads[i].Title = title
+				if descLen == 0 {
+					candidate.Beads[i].Description = ""
+				} else {
+					candidate.Beads[i].Description = strings.Repeat("d", descLen)
+				}
+				break
+			}
+			if !found {
+				t.Fatalf("bead %q missing from file store data", id)
+			}
+			data, err := json.MarshalIndent(candidate, "", "  ")
+			if err != nil {
+				t.Fatalf("marshal same-size file store data: %v", err)
+			}
+			if len(data) != targetLen {
+				continue
+			}
+			if err := f.WriteFile(path, data, 0o644); err != nil {
+				t.Fatalf("write same-size file store data: %v", err)
+			}
 			return title
 		}
 	}

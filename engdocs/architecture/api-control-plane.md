@@ -188,7 +188,7 @@ quirks that inform these helpers are documented in
 
 ### 3.2 Spec is generated, never hand-written
 
-`internal/api/openapi.json` and `docs/schema/openapi.json` are
+`internal/api/openapi.json` and `docs/reference/schema/openapi.json` are
 outputs of `cmd/genspec`, which reads the live Huma registration
 from a `SupervisorMux`. The pre-commit hook regenerates both on
 every Go-file commit. `TestOpenAPISpecInSync` fails CI if the
@@ -514,6 +514,20 @@ payload variant is still fully typed on the wire; consumers narrow
 explicitly rather than getting automatic discriminator narrowing.
 See §6 for the full tooling note.
 
+### Sibling discipline: the bead-metadata vocabulary
+
+The same declared-vocabulary discipline applies to the `gc.*`
+bead-metadata keys the API reads off beads (e.g.
+`gc.workflow_id`, `gc.root_bead_id` in the convoy stream): every
+engine-owned key is a constant in `internal/beadmeta`, and
+`TestNoUndeclaredMetadataKeys` fails CI on any raw `gc.*` key
+literal in non-test Go. Unlike the events registry this is a
+const block plus a static source guard, not a runtime
+registration — bead metadata is `map[string]string` with no
+decode or OpenAPI-projection consumer, so there is no payload
+type to register. See `engdocs/architecture/beads.md` ("Metadata
+vocabulary") for the scope boundary and open-world policy.
+
 ## 5. Developer workflow
 
 The invariants above exist so the developer's contribution to the
@@ -528,7 +542,7 @@ else.
    the `cityGet` / `cityPost` / `cityPatch` / etc. helpers in
    `internal/api/city_scope.go` for per-city scoped operations).
 3. Commit. Pre-commit regenerates `internal/api/openapi.json`,
-   `docs/schema/openapi.json`, `internal/api/genclient/`, and the
+   `docs/reference/schema/openapi.json`, `internal/api/genclient/`, and the
    TS types under `cmd/gc/dashboard/web/src/generated/`. Mintlify
    publishes the spec on the next docs build.
 

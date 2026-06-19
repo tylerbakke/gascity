@@ -23,7 +23,6 @@ func TestAgentFieldSync(t *testing.T) {
 		// Provider-level fields: set during ResolveProvider, not typically
 		// overridden per-rig. Agent-level overrides happen in the Agent
 		// struct itself (which feeds into ResolveProvider).
-		"Args":                         "provider field, set via ResolveProvider",
 		"PromptMode":                   "provider field, set via ResolveProvider",
 		"PromptFlag":                   "provider field, set via ResolveProvider",
 		"ReadyDelayMs":                 "provider field, set via ResolveProvider",
@@ -36,6 +35,7 @@ func TestAgentFieldSync(t *testing.T) {
 		"MinActiveSessions":            "cap field, inherits from rig/workspace — not a patch concern",
 		"ScaleCheck":                   "agent-specific scaling, derived from pool config — not a patch concern",
 		"SourceDir":                    "runtime-only, set during pack/fragment loading",
+		"InheritedProvider":            "runtime-only, derived from imported pack [agent_defaults]",
 		"InheritedDefaultSlingFormula": "runtime-only, derived from imported pack [agent_defaults]",
 		"InheritedAppendFragments":     "runtime-only, derived from imported pack [agent_defaults]",
 		"SharedSkills":                 "runtime-only legacy tombstone field retained for backwards compatibility",
@@ -179,6 +179,7 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		PromptTemplate:          strVal("prompts/test.md"),
 		Session:                 strVal("acp"),
 		Provider:                strVal("claude"),
+		Args:                    Fragments("--custom-arg"),
 		StartCommand:            strVal("claude --dangerously"),
 		Lifecycle:               strVal(AgentLifecycleOneShot),
 		Nudge:                   strVal("wake up"),
@@ -199,6 +200,7 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		DependsOn:               []string{"other-agent"},
 		ResumeCommand:           strVal("claude --resume {{.SessionKey}}"),
 		WakeMode:                strVal("fresh"),
+		MouseMode:               strVal("on"),
 		PreStartAppend:          []string{"pre-append"},
 		SessionSetupAppend:      []string{"setup-append"},
 		SessionLiveAppend:       []string{"live-append"},
@@ -331,6 +333,7 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		PromptTemplate:          strVal("prompts/test.md"),
 		Session:                 strVal("acp"),
 		Provider:                strVal("claude"),
+		Args:                    Fragments("--custom-arg"),
 		StartCommand:            strVal("claude --dangerously"),
 		Lifecycle:               strVal(AgentLifecycleOneShot),
 		Nudge:                   strVal("wake up"),
@@ -351,6 +354,7 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		DependsOn:               []string{"other-agent"},
 		ResumeCommand:           strVal("claude --resume {{.SessionKey}}"),
 		WakeMode:                strVal("fresh"),
+		MouseMode:               strVal("on"),
 		PreStartAppend:          []string{"pre-append"},
 		SessionSetupAppend:      []string{"setup-append"},
 		SessionLiveAppend:       []string{"live-append"},

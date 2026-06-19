@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -21,6 +22,15 @@ func TestDirectJSONWriterPayloadsValidateDeclaredSchemas(t *testing.T) {
 
 	cityPath := t.TempDir()
 	writeManagementJSONTestCity(t, cityPath, "[workspace]\nname = \"test-city\"\n")
+	// The sling dry-run case targets a dog pool instance; the city defines
+	// its own dog pool (builtin packs no longer supply a fallback dog).
+	dogDir := filepath.Join(cityPath, "agents", "dog")
+	if err := os.MkdirAll(dogDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(agents/dog): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dogDir, "agent.toml"), []byte("start_command = \"true\"\nmin_active_sessions = 0\nmax_active_sessions = 3\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(agents/dog/agent.toml): %v", err)
+	}
 	store, err := openCityStoreAt(cityPath)
 	if err != nil {
 		t.Fatalf("open city store: %v", err)
@@ -131,10 +141,12 @@ func TestJSONResultStructsExposeExplicitOKField(t *testing.T) {
 		{name: "handoff", value: handoffJSONResult{}},
 		{name: "build-image", value: buildImageJSONResult{}},
 		{name: "mcp list", value: projectedMCPJSON{}},
+		{name: "formula catalog", value: formulaCatalogJSON{}},
 		{name: "formula list", value: formulaListJSON{}},
 		{name: "formula show", value: formulaShowJSON{}},
 		{name: "event emit", value: eventEmitJSONResult{}},
 		{name: "init", value: initJSONResult{}},
+		{name: "import status", value: ImportStatusJSON{}},
 	}
 
 	for _, tc := range tests {
@@ -157,6 +169,7 @@ func TestFixedResultSchemasPinSchemaVersion(t *testing.T) {
 	for _, command := range [][]string{
 		{"handoff"},
 		{"build-image"},
+		{"formula", "catalog"},
 		{"formula", "list"},
 		{"formula", "show"},
 		{"event", "emit"},
@@ -184,6 +197,38 @@ func TestFixedResultSchemasPinSchemaVersion(t *testing.T) {
 	}
 }
 
+func TestFormulaWarningSchemasRequireCodeAndMessage(t *testing.T) {
+	tests := []struct {
+		name    string
+		command []string
+		payload string
+	}{
+		{
+			name:    "catalog",
+			command: []string{"formula", "catalog"},
+			payload: `{"schema_version":"1","ok":true,"formulas":[],"summary":{"count":0},"warnings":[{"message":"missing code"}]}`,
+		},
+		{
+			name:    "list",
+			command: []string{"formula", "list"},
+			payload: `{"schema_version":"1","ok":true,"search_paths":[],"formulas":[],"summary":{"count":0},"warnings":[{"message":"missing code"}]}`,
+		},
+		{
+			name:    "show",
+			command: []string{"formula", "show"},
+			payload: `{"schema_version":"1","ok":true,"name":"build","search_paths":[],"steps":[],"warnings":[{"message":"missing code"}]}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateJSONAgainstResultSchemaE(tc.command, []byte(tc.payload)); err == nil {
+				t.Fatalf("schema for %v accepted a warning without code", tc.command)
+			}
+		})
+	}
+}
+
 func assertTopLevelOKTrue(t *testing.T, data []byte) {
 	t.Helper()
 	var payload map[string]any
@@ -197,28 +242,35 @@ func assertTopLevelOKTrue(t *testing.T, data []byte) {
 
 func validateJSONAgainstResultSchema(t *testing.T, command []string, data []byte) {
 	t.Helper()
+	if err := validateJSONAgainstResultSchemaE(command, data); err != nil {
+		t.Fatalf("payload for %v does not validate: %v\n%s", command, err, string(data))
+	}
+}
+
+func validateJSONAgainstResultSchemaE(command []string, data []byte) error {
 	rawSchema, err := readBuiltinSchema(command, jsonSchemaResultRole)
 	if err != nil {
-		t.Fatalf("read schema for %v: %v", command, err)
+		return fmt.Errorf("read schema for %v: %w", command, err)
 	}
 	schemaDoc, err := jsonschema.UnmarshalJSON(bytes.NewReader(rawSchema))
 	if err != nil {
-		t.Fatalf("parse schema for %v: %v", command, err)
+		return fmt.Errorf("parse schema for %v: %w", command, err)
 	}
 	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(data))
 	if err != nil {
-		t.Fatalf("parse payload for %v: %v\n%s", command, err, string(data))
+		return fmt.Errorf("parse payload for %v: %w", command, err)
 	}
 	compiler := jsonschema.NewCompiler()
 	schemaURL := strings.Join(command, "/") + "/result.schema.json"
 	if err := compiler.AddResource(schemaURL, schemaDoc); err != nil {
-		t.Fatalf("add schema resource for %v: %v", command, err)
+		return fmt.Errorf("add schema resource for %v: %w", command, err)
 	}
 	compiled, err := compiler.Compile(schemaURL)
 	if err != nil {
-		t.Fatalf("compile schema for %v: %v", command, err)
+		return fmt.Errorf("compile schema for %v: %w", command, err)
 	}
 	if err := compiled.Validate(instance); err != nil {
-		t.Fatalf("payload for %v does not validate: %v\n%s", command, err, string(data))
+		return err
 	}
+	return nil
 }

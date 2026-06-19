@@ -24,19 +24,22 @@ const (
 // TierMode selects which storage tier(s) a List query reads from.
 // The zero value is TierIssues.
 //
-// For BdStore, where issues and wisps live in physically separate Dolt
-// tables, TierIssues is naturally tier-restricted by the underlying
-// `bd list` call. For in-memory stores (MemStore, ApplyListQuery) where
-// both tiers may share a single backing slice, Matches now filters out
-// any bead with Ephemeral=true under TierIssues. Pre-PR, such a query
-// would have returned ephemeral rows mixed in; callers that relied on
-// that behavior must opt into TierBoth explicitly.
+// TierIssues is the permanent logical tier and filters out Ephemeral rows when
+// a store returns them to the caller. NoHistory rows remain visible to list
+// filters in TierIssues because they are durable work without Dolt history.
+// Raw bd ready defaults are narrower than the logical union surface. In bd
+// 1.0.4, ready queries cannot expose no-history rows with the full ready
+// filter semantics, so compatibility policy keeps claimable work history-backed
+// in that mode. TierBoth is a logical union; implementations may satisfy it
+// through a single backend query when the backing store exposes a supported
+// union surface for the requested bead type.
 type TierMode int
 
 const (
 	// TierIssues reads only the permanent (issues) tier. Default.
 	TierIssues TierMode = iota
-	// TierWisps reads only the ephemeral (wisps) tier.
+	// TierWisps reads only the wisp-backed tier, including ephemeral and
+	// no-history rows.
 	TierWisps
 	// TierBoth unions the issues and wisps tiers, deduping by ID and
 	// preserving the query's sort.
@@ -61,10 +64,13 @@ func TierModeFromOpts(opts []QueryOpt) TierMode {
 // Queries are conjunctive: every populated field must match. A zero-value query
 // is rejected unless AllowScan is true.
 type ListQuery struct {
-	Status        string
-	Type          string
-	Label         string
-	Assignee      string
+	Status   string
+	Type     string
+	Label    string
+	Assignee string
+	// Assignees matches beads assigned to any listed assignee.
+	// It is mutually exclusive with Assignee; call Validate to enforce that contract.
+	Assignees     []string
 	ParentID      string
 	Metadata      map[string]string
 	CreatedBefore time.Time
@@ -89,12 +95,26 @@ type ListQuery struct {
 	TierMode TierMode
 }
 
+// Validate returns an error when the query contains contradictory selectors.
+func (q ListQuery) Validate() error {
+	if q.Assignee != "" && len(q.Assignees) > 0 {
+		return errors.New("ListQuery: Assignee and Assignees are mutually exclusive")
+	}
+	return nil
+}
+
 // ReadyQuery describes optional filters for ready-work lookup. A zero-value
 // query preserves Ready's historical behavior: all open, unblocked actionable
 // work.
 type ReadyQuery struct {
 	Assignee string
 	Limit    int
+	// TierMode selects the storage tier(s) to read from. Zero value
+	// (TierIssues) preserves raw Ready's historical main-tier behavior.
+	// Policy-aware callers should use the policy store wrapper, which expands
+	// default Ready reads to TierBoth so no-history and ephemeral policy rows
+	// remain reachable under bd 1.0.4.
+	TierMode TierMode
 }
 
 func readyQueryFromArgs(queries []ReadyQuery) ReadyQuery {
@@ -110,6 +130,7 @@ func (q ListQuery) HasFilter() bool {
 		q.Type != "" ||
 		q.Label != "" ||
 		q.Assignee != "" ||
+		len(q.Assignees) > 0 ||
 		q.ParentID != "" ||
 		len(q.Metadata) > 0 ||
 		!q.CreatedBefore.IsZero() ||
@@ -125,7 +146,7 @@ func (q ListQuery) IncludesClosed() bool {
 func (q ListQuery) Matches(b Bead) bool {
 	switch q.TierMode {
 	case TierWisps:
-		if !b.Ephemeral {
+		if !b.Ephemeral && !b.NoHistory {
 			return false
 		}
 	case TierBoth:
@@ -150,6 +171,18 @@ func (q ListQuery) Matches(b Bead) bool {
 	}
 	if q.Assignee != "" && b.Assignee != q.Assignee {
 		return false
+	}
+	if len(q.Assignees) > 0 {
+		matched := false
+		for _, assignee := range q.Assignees {
+			if b.Assignee == assignee {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
 	}
 	if q.ParentID != "" && b.ParentID != q.ParentID {
 		return false
@@ -199,6 +232,39 @@ func ApplyListQuery(items []Bead, q ListQuery) []Bead {
 
 func applyListQuery(items []Bead, q ListQuery) []Bead {
 	return ApplyListQuery(items, q)
+}
+
+// SortBeads sorts items into the canonical (created_at, id) total order for
+// the given direction. SortDefault leaves the slice order unchanged. Callers
+// that merge results across stores use this to impose one deterministic
+// global order on the merged set (#3208).
+func SortBeads(items []Bead, order SortOrder) {
+	sortBeadsForQuery(items, order)
+}
+
+// sortBeadsReadyOrder sorts ready results into the canonical
+// (priority, created_at, id) ascending order used by the SQL-backed ready
+// readers (a nil priority sorts as 2, matching their COALESCE(i.priority, 2)),
+// so a bounded ready read cuts the same deterministic prefix regardless of
+// which store path served it (#3208).
+func sortBeadsReadyOrder(items []Bead) {
+	sort.Slice(items, func(i, j int) bool {
+		pi, pj := readySortPriority(items[i]), readySortPriority(items[j])
+		if pi != pj {
+			return pi < pj
+		}
+		if !items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].CreatedAt.Before(items[j].CreatedAt)
+		}
+		return items[i].ID < items[j].ID
+	})
+}
+
+func readySortPriority(b Bead) int {
+	if b.Priority == nil {
+		return 2
+	}
+	return *b.Priority
 }
 
 func sortBeadsForQuery(items []Bead, order SortOrder) {

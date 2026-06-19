@@ -16,10 +16,11 @@ import (
 	"time"
 )
 
-// testSocketName is the dedicated tmux socket used by all integration tests.
-// Using a separate socket ensures tests never interfere with the user's
-// running tmux server.
-const testSocketName = "gc-test"
+// testSocketName is the dedicated tmux socket used by this integration test
+// process. It uses the tmuxtest cleanup prefix and a per-process suffix so
+// reused CI runners cannot inherit a stale fixed test socket from an aborted
+// run.
+var testSocketName = fmt.Sprintf("gctest-%d-%d", os.Getpid(), time.Now().UnixNano())
 
 func hasTmux() bool {
 	_, err := exec.LookPath("tmux")
@@ -2343,6 +2344,12 @@ func TestMatchesPromptPrefix(t *testing.T) {
 
 		// Bare prompt character without any space
 		{"bare prompt no space", "❯", regularPrefix, true},
+
+		// Boxed prompt: TUIs (e.g. grok) render the input line inside a box
+		// border, so the captured line is "│ ❯ …" rather than "❯ …".
+		{"boxed prompt bare", "│ ❯ ", regularPrefix, true},
+		{"boxed prompt with content", "│ ❯ do the work", regularPrefix, true},
+		{"heavy box border", "┃ ❯ ", regularPrefix, true},
 	}
 
 	for _, tt := range tests {
@@ -2353,6 +2360,16 @@ func TestMatchesPromptPrefix(t *testing.T) {
 					tt.line, tt.prefix, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestProviderEnvSkipsEscapeGrok guards the grok engagement fix: grok's TUI
+// treats a pre-Enter Escape as "clear input", so synthesizing one between the
+// pasted prompt and the submit Enter prevents submission and the worker idles
+// at the welcome screen forever. grok must be on the skip list.
+func TestProviderEnvSkipsEscapeGrok(t *testing.T) {
+	if !providerEnvSkipsEscape("grok") {
+		t.Error("grok must skip pre-Enter Escape (TUI treats Escape as clear-input)")
 	}
 }
 
@@ -2402,6 +2419,18 @@ func TestPaneContainsBusyIndicator(t *testing.T) {
 		{"gemini auth spinner", []string{"Waiting for authentication... (Press Esc or Ctrl+C to cancel)"}, true},
 		{"gemini shell tool panel", []string{"│ ?  Shell sleep 12 [current working directory /tmp/city] (Sleep … │"}, true},
 		{"no indicator", []string{"some output", "building..."}, false},
+		// Current Claude Code (bypass mode) shows a live spinner with an elapsed
+		// timer + token stream, not "esc to interrupt", while working.
+		{"claude busy spinner token footer", []string{"· Boogieing… (2m 28s · ↓ 10.9k tokens)"}, true},
+		{"claude busy spinner long turn", []string{"✶ Investigating… (31m 40s · ↓ 108.6k tokens)"}, true},
+		{"claude busy spinner thinking", []string{"✢ Clauding… (56s · ↓ 1.7k tokens · thinking with max effort)"}, true},
+		{"codex busy spinner bullet", []string{"◦ Working (2m 48s • esc to interrupt)"}, true},
+		// Idle/done markers and status chrome must NOT read as busy — a false
+		// positive makes WaitForIdle never return, so the agent is never nudged.
+		{"claude done marker", []string{"✻ Worked for 1m 49s", "❯ "}, false},
+		{"claude status bar time", []string{"🧠 Sonnet 4.6 | 📁 witness | ⏱️  Jun 3 20:10:09"}, false},
+		{"scrollback truncation parens", []string{"  … +9 lines (ctrl+o to expand)"}, false},
+		{"git branch in status bar", []string{"  🚀 Opus 4.8 | 📁 thriva | (main) | ⏱️  Jun 4 02:57:04"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

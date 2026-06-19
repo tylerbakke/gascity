@@ -10,7 +10,7 @@ import (
 )
 
 // ApplyEvent updates the cache from a bd hook event. Call this when the
-// event bus delivers a bead.created, bead.updated, or bead.closed event
+// event bus delivers a bead.created, bead.updated, bead.closed, or bead.deleted event
 // with the full bead JSON payload. This keeps the cache fresh without
 // waiting for reconciliation.
 func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
@@ -54,10 +54,12 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 
 	verifiedConflict := false
 	var verifiedClosedBase Bead
+	var verifiedClosedFresh Bead
+	verifiedClosedFromBacking := false
 	verifiedRecentLocal := false
 	var verifiedRecentLocalBase Bead
 	if conflictsCached && eventType == "bead.closed" {
-		matchesBacking, verifyErr := c.cacheClosedEventMatchesBacking(patch.ID)
+		fresh, matchesBacking, verifyErr := c.cacheClosedEventMatchesBacking(patch.ID)
 		if verifyErr != nil {
 			c.recordProblem(fmt.Sprintf("verify %s event", eventType), verifyErr)
 			// Drop destructive close events on verification failure; reconciliation
@@ -69,6 +71,10 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 		}
 		verifiedConflict = true
 		verifiedClosedBase = conflictBase
+		if closedEventPayloadNeedsBackingRefresh(patch, fresh) {
+			verifiedClosedFresh = fresh
+			verifiedClosedFromBacking = true
+		}
 	}
 	if conflictsCached && eventType != "bead.closed" && locallyMutated && !recentlyLocal && !verifiedConflict {
 		// The bead is flagged locally mutated only because a prior applied
@@ -88,6 +94,25 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 			return
 		}
 		if !matchesBacking {
+			// A field-changing event that could not be confirmed against the
+			// backing store is either genuinely stale, or real but not yet
+			// visible to this process's backing read — a write-through race
+			// after a cross-process gc sling/kickoff stamps gc.routed_to or
+			// claims the bead. Dropping it outright leaves a stale cached row
+			// that CachedReady still serves with ok=true, so the demand path
+			// counts the bead off the stale row and strands it (no routed_to /
+			// wrong status) until the next full reconcile
+			// (gastownhall/gascity#2927). Mark the bead dirty so the cached
+			// ready model declines for it and the demand path falls back to the
+			// authoritative ReadyLive query; reconciliation clears the flag once
+			// cache and backing reconverge. A dependency-only conflict is left
+			// untouched: dependency snapshots routinely arrive ahead of the
+			// backing and are intentionally tolerated without declining.
+			if fieldConflictCached {
+				c.mu.Lock()
+				c.dirty[patch.ID] = struct{}{}
+				c.mu.Unlock()
+			}
 			return
 		}
 		verifiedRecentLocal = true
@@ -114,7 +139,10 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 
 	b := patch
 	refreshedFromBacking := false
-	if !cached {
+	if verifiedClosedFromBacking {
+		b = verifiedClosedFresh
+		refreshedFromBacking = true
+	} else if !cached {
 		if fresh, err := c.backing.Get(patch.ID); err == nil {
 			b = fresh
 			refreshedFromBacking = true
@@ -177,7 +205,9 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 				}
 			}
 		}
-		b = mergeCacheEventPatch(current, patch, fields)
+		if eventType != "bead.closed" || !verifiedClosedFromBacking {
+			b = mergeCacheEventPatch(current, patch, fields)
+		}
 	}
 
 	mutated := false
@@ -192,6 +222,9 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 		}
 		c.updateStatsLocked()
 		mutated = true
+		if c.clearDependentReadyProjectionsLocked(b.ID) {
+			mutated = true
+		}
 	case "bead.updated":
 		existing, cached := c.beads[b.ID]
 		if !cached || beadChanged(existing, b, false) {
@@ -205,6 +238,9 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 			c.noteMutationLocked(b.ID)
 			mutated = true
 		}
+		if hasCacheEventField(fields, "status") && c.clearDependentReadyProjectionsLocked(b.ID) {
+			mutated = true
+		}
 	case "bead.closed":
 		c.noteMutationLocked(b.ID)
 		if _, exists := c.beads[b.ID]; !exists {
@@ -215,6 +251,22 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 		delete(c.dirty, b.ID)
 		delete(c.deletedSeq, b.ID)
 		mutated = true
+		if c.clearDependentReadyProjectionsLocked(b.ID) {
+			mutated = true
+		}
+	case "bead.deleted":
+		c.noteMutationLocked(b.ID)
+		delete(c.beads, b.ID)
+		delete(c.deps, b.ID)
+		delete(c.dirty, b.ID)
+		delete(c.beadSeq, b.ID)
+		delete(c.localBeadAt, b.ID)
+		c.deletedSeq[b.ID] = c.mutationSeq
+		c.updateStatsLocked()
+		mutated = true
+		if c.clearDependentReadyProjectionsLocked(b.ID) {
+			mutated = true
+		}
 	default:
 		return
 	}
@@ -244,6 +296,9 @@ func (c *CachingStore) updateEventDepsLocked(eventType string, b Bead, fields ma
 			delete(c.deps, b.ID)
 			mutated = true
 		}
+		if c.clearReadyProjectionLocked(b.ID) {
+			mutated = true
+		}
 		if c.depsComplete {
 			c.depsComplete = false
 			mutated = true
@@ -271,12 +326,14 @@ func (c *CachingStore) setEventDepsLocked(id string, deps []Dep) bool {
 			return false
 		}
 		c.deps[id] = cloneDeps(deps)
+		c.clearReadyProjectionLocked(id)
 		return true
 	}
 	if c.depsComplete && len(deps) == 0 {
-		return false
+		return c.clearReadyProjectionLocked(id)
 	}
 	c.deps[id] = cloneDeps(deps)
+	c.clearReadyProjectionLocked(id)
 	return true
 }
 
@@ -291,10 +348,64 @@ func (c *CachingStore) ApplyDepEvent(beadID string, deps []Dep) {
 	}
 	c.noteMutationLocked(beadID)
 	c.deps[beadID] = cloneDeps(deps)
+	c.clearReadyProjectionLocked(beadID)
 	delete(c.dirty, beadID)
 	delete(c.deletedSeq, beadID)
 	c.markFreshLocked(time.Now())
 	c.updateStatsLocked()
+}
+
+func (c *CachingStore) clearReadyProjectionLocked(id string) bool {
+	b, ok := c.beads[id]
+	if !ok || b.IsBlocked == nil {
+		return false
+	}
+	b.IsBlocked = nil
+	c.beads[id] = b
+	return true
+}
+
+func (c *CachingStore) clearAllReadyProjectionsLocked() bool {
+	cleared := make([]string, 0)
+	for id := range c.beads {
+		if c.clearReadyProjectionLocked(id) {
+			cleared = append(cleared, id)
+		}
+	}
+	if len(cleared) == 0 {
+		return false
+	}
+	c.noteMutationLocked(cleared...)
+	return true
+}
+
+func (c *CachingStore) clearDependentReadyProjectionsLocked(dependsOnID string) bool {
+	if dependsOnID == "" {
+		return false
+	}
+	if !c.depsComplete {
+		return c.clearAllReadyProjectionsLocked()
+	}
+	cleared := make([]string, 0)
+	for id, deps := range c.deps {
+		if _, ok := c.beads[id]; !ok {
+			continue
+		}
+		for _, dep := range deps {
+			if dep.DependsOnID != dependsOnID || !isReadyBlockingDependencyType(dep.Type) {
+				continue
+			}
+			if c.clearReadyProjectionLocked(id) {
+				cleared = append(cleared, id)
+			}
+			break
+		}
+	}
+	if len(cleared) == 0 {
+		return false
+	}
+	c.noteMutationLocked(cleared...)
+	return true
 }
 
 func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) Bead {
@@ -341,6 +452,15 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 	if hasCacheEventField(fields, "dependencies") {
 		merged.Dependencies = slices.Clone(patch.Dependencies)
 	}
+	if hasCacheEventField(fields, "ephemeral") {
+		merged.Ephemeral = patch.Ephemeral
+	}
+	if hasCacheEventField(fields, "defer_until") {
+		merged.DeferUntil = cloneTimePtr(patch.DeferUntil)
+	}
+	if hasCacheEventField(fields, "is_blocked") {
+		merged.IsBlocked = cloneBoolPtr(patch.IsBlocked)
+	}
 	return merged
 }
 
@@ -380,6 +500,15 @@ func cacheEventConflictsCurrent(current, patch Bead, fields map[string]json.RawM
 	if hasCacheEventField(fields, "labels") && !slices.Equal(current.Labels, patch.Labels) {
 		return true
 	}
+	if hasCacheEventField(fields, "ephemeral") && current.Ephemeral != patch.Ephemeral {
+		return true
+	}
+	if hasCacheEventField(fields, "defer_until") && !timePtrEqual(current.DeferUntil, patch.DeferUntil) {
+		return true
+	}
+	if hasCacheEventField(fields, "is_blocked") && !boolPtrEqual(current.IsBlocked, patch.IsBlocked) {
+		return true
+	}
 	return false
 }
 
@@ -402,12 +531,38 @@ func (c *CachingStore) cacheEventMatchesBacking(id string, patch Bead, fields ma
 	return cacheEventPatchMatchesBead(fresh, patch, fields), nil
 }
 
-func (c *CachingStore) cacheClosedEventMatchesBacking(id string) (bool, error) {
+func (c *CachingStore) cacheClosedEventMatchesBacking(id string) (Bead, bool, error) {
 	fresh, err := c.backing.Get(id)
 	if err != nil {
-		return false, err
+		return Bead{}, false, err
 	}
-	return fresh.Status == "closed", nil
+	return fresh, fresh.Status == "closed", nil
+}
+
+func closedEventPayloadNeedsBackingRefresh(patch Bead, fresh Bead) bool {
+	// Verified close events only need the backing row when the hook payload is
+	// partial and the timestamp is unusable or not newer. Rich close snapshots
+	// should still flow through the normal merge path so they can replace stale
+	// cached fields that the backing row still carries.
+	if patch.UpdatedAt.IsZero() || fresh.UpdatedAt.IsZero() || !patch.UpdatedAt.After(fresh.UpdatedAt) {
+		return !closedEventCarriesRichCloseSnapshot(patch)
+	}
+	return false
+}
+
+func closedEventCarriesRichCloseSnapshot(patch Bead) bool {
+	return patch.Title != "" ||
+		len(patch.Labels) > 0 ||
+		patch.Description != "" ||
+		patch.Assignee != "" ||
+		patch.ParentID != "" ||
+		patch.Ref != "" ||
+		len(patch.Needs) > 0 ||
+		patch.Type != "" ||
+		patch.Priority != nil ||
+		patch.Ephemeral ||
+		patch.NoHistory ||
+		patch.DeferUntil != nil
 }
 
 func cacheEventPatchMatchesBead(current, patch Bead, fields map[string]json.RawMessage) bool {
@@ -530,7 +685,10 @@ func beadChanged(old, fresh Bead, skipLabels bool) bool {
 		old.From != fresh.From ||
 		old.ParentID != fresh.ParentID ||
 		old.Ref != fresh.Ref ||
-		old.Description != fresh.Description {
+		old.Description != fresh.Description ||
+		old.Ephemeral != fresh.Ephemeral ||
+		!timePtrEqual(old.DeferUntil, fresh.DeferUntil) ||
+		!boolPtrEqual(old.IsBlocked, fresh.IsBlocked) {
 		return true
 	}
 	if !maps.Equal(old.Metadata, fresh.Metadata) {
@@ -557,5 +715,27 @@ func intPtrEqual(left, right *int) bool {
 		return false
 	default:
 		return *left == *right
+	}
+}
+
+func boolPtrEqual(left, right *bool) bool {
+	switch {
+	case left == nil && right == nil:
+		return true
+	case left == nil || right == nil:
+		return false
+	default:
+		return *left == *right
+	}
+}
+
+func timePtrEqual(left, right *time.Time) bool {
+	switch {
+	case left == nil && right == nil:
+		return true
+	case left == nil || right == nil:
+		return false
+	default:
+		return left.Equal(*right)
 	}
 }

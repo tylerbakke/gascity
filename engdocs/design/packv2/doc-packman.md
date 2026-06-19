@@ -1,5 +1,11 @@
 # City/Pack Import Management
 
+> **Historical PackV2 design note.** This page preserves design history and
+> rollout rationale. For current pack authoring guidance, use
+> `docs/reference/specs/pack-spec.md`, `docs/guides/understanding-packs.md`,
+> and `docs/guides/shareable-packs.md`. When this note disagrees with shipped
+> behavior, prefer the current docs, generated reference, code, and tests.
+
 **GitHub Issue:** TBD
 
 Title: `feat: gc import — import management for schema-2 Gas City packs`
@@ -277,7 +283,7 @@ This launch does not define:
 This document describes the schema-2 surface. Older V1-style
 `[packs.*]` and `workspace.includes` layouts remain migration input, not
 the public authoring contract for new PackV2 cities. Use
-[migrating-to-pack-vnext.md](../../../docs/guides/migrating-to-pack-vnext.md) for
+[shareable-packs.md](../../../docs/guides/shareable-packs.md) for
 the conversion map.
 
 ---END ISSUE---

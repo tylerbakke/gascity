@@ -6,6 +6,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -16,6 +17,7 @@ import (
 // capability probes.
 func buildAwakeInputFromReconciler(
 	cfg *config.City,
+	cityPath string,
 	sessionBeads []beads.Bead,
 	poolDesired map[string]int,
 	namedSessionDemand map[string]bool,
@@ -35,16 +37,21 @@ func buildAwakeInputFromReconciler(
 		AttachedSessions:   make(map[string]bool),
 		PendingSessions:    make(map[string]bool),
 		ChatIdleTimeout:    cfg.ChatSessions.IdleTimeoutDuration(),
+		ManualGracePeriod:  cfg.ChatSessions.GracePeriodDuration(),
 		Now:                clk,
 	}
 
-	// Agents
+	// Agents. Load runtime suspension state once against the in-scope
+	// city path so suspension resolves against the controlled city
+	// rather than the process cwd.
+	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
 	for i := range cfg.Agents {
 		a := &cfg.Agents[i]
 		agent := AwakeAgent{
-			QualifiedName:  a.QualifiedName(),
-			Suspended:      isAgentEffectivelySuspended(cfg, a),
-			SleepAfterIdle: parseSleepDuration(a.SleepAfterIdle),
+			QualifiedName:     a.QualifiedName(),
+			Suspended:         isAgentEffectivelySuspendedWith(cfg, a, suspState),
+			SleepAfterIdle:    parseSleepDuration(a.SleepAfterIdle),
+			MinActiveSessions: a.EffectiveMinActiveSessions(),
 		}
 		if len(a.DependsOn) > 0 {
 			agent.DependsOn = a.DependsOn
@@ -94,9 +101,12 @@ func buildAwakeInputFromReconciler(
 			Now:      clk,
 		})
 		bead := AwakeSessionBead{
-			ID:                     b.ID,
-			SessionName:            name,
-			Template:               b.Metadata["template"],
+			ID:          b.ID,
+			SessionName: name,
+			// Canonicalize so adopted beads persisted under a legacy identity
+			// (e.g. a removed binding) key the awake engine by the current
+			// agent template. Unresolvable templates pass through unchanged.
+			Template:               normalizeAgentTemplateIdentity(cfg, b.Metadata["template"]),
 			State:                  string(lifecycle.CompatState),
 			SleepReason:            b.Metadata["sleep_reason"],
 			ManualSession:          isManualSessionBead(*b),
@@ -108,9 +118,13 @@ func buildAwakeInputFromReconciler(
 			Pinned:                 lifecycle.HasWakeCause(session.WakeCausePinned),
 			Drained:                lifecycle.BaseState == session.BaseStateDrained,
 			WaitHold:               b.Metadata["wait_hold"] == "true",
+			RestartRequested:       strings.TrimSpace(b.Metadata["restart_requested"]) == "true",
+			ContinuationResetPending: strings.TrimSpace(b.Metadata["continuation_reset_pending"]) == "true" &&
+				strings.TrimSpace(b.Metadata[session.ResetCommittedAtKey]) != "",
 		}
 		bead.HeldUntil = lifecycle.HeldUntil
 		bead.QuarantinedUntil = lifecycle.QuarantinedUntil
+		bead.CreatedAt = b.CreatedAt
 		if t, err := time.Parse(time.RFC3339, b.Metadata["detached_at"]); err == nil && !t.IsZero() {
 			bead.IdleSince = t
 		}
@@ -208,6 +222,8 @@ func awakeSetToWakeEvals(decisions map[string]AwakeDecision, sessionBeads []Awak
 				reasons = []WakeReason{WakeWait}
 			case "assigned-work", "named-demand", "work-query":
 				reasons = []WakeReason{WakeWork}
+			case "min-active":
+				reasons = []WakeReason{WakeConfig}
 			default:
 				reasons = []WakeReason{WakeConfig}
 			}

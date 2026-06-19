@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,23 +15,35 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 func newHookCmd(stdout, stderr io.Writer) *cobra.Command {
 	var inject bool
 	var hookFormat string
+	var claim bool
+	var drainAck bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "hook [agent]",
-		Short: "Check for available work",
-		Long: `Checks for available work using the agent's work_query config.
+		Short: "Find routed work for an agent",
+		Long: `Finds routed work using the agent's work_query config.
 
 Without --inject: prints normalized ready-only output, exits 0 if work exists, 1 if empty.
 With --inject: silent legacy Stop-hook compatibility; skips the work query and always exits 0.
+With --claim: runs the standard startup claim protocol for one work item.
 
 		The agent is determined from $GC_AGENT or a positional argument.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdHookWithFormat(args, inject, hookFormat, stdout, stderr) != 0 {
+			opts := hookCommandOptions{
+				Inject:     inject,
+				HookFormat: hookFormat,
+				Claim:      claim,
+				DrainAck:   drainAck,
+				JSON:       jsonOut,
+			}
+			if cmdHookWithOptions(args, opts, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -37,10 +51,116 @@ With --inject: silent legacy Stop-hook compatibility; skips the work query and a
 	}
 	cmd.Flags().BoolVar(&inject, "inject", false, "silent legacy Stop-hook compatibility; skip work query and exit 0")
 	cmd.Flags().StringVar(&hookFormat, "hook-format", "", "format hook output for a provider")
+	cmd.Flags().BoolVar(&claim, "claim", false, "atomically claim one routed work item for the current session")
+	cmd.Flags().BoolVar(&drainAck, "drain-ack", false, "with --claim, acknowledge runtime drain when no work is available")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "with --claim, emit a JSON protocol result")
 	if flag := cmd.Flags().Lookup("hook-format"); flag != nil {
 		flag.Hidden = true
 	}
+	cmd.AddCommand(newHookRunCmd(stdout, stderr))
 	return cmd
+}
+
+func newHookRunCmd(stdout, stderr io.Writer) *cobra.Command {
+	opts := hookRunOptions{
+		Timeout:         defaultHookRunTimeout,
+		TimeoutExitCode: 124,
+	}
+	cmd := &cobra.Command{
+		Use:   "run -- <gc args...>",
+		Short: "Run a managed hook command with a hard timeout",
+		Long: `Runs a managed gc hook command in a child process with a hard timeout.
+
+This protects provider hook callbacks from wedged data-plane commands. The
+child process is the current gc executable, and <gc args...> are passed to it
+verbatim.`,
+		Args: cobra.ArbitraryArgs,
+		RunE: func(c *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				fmt.Fprintln(stderr, "gc hook run: missing gc command arguments after --") //nolint:errcheck
+				return errExit
+			}
+			return exitForCode(cmdHookRun(args, opts, c.InOrStdin(), stdout, stderr))
+		},
+	}
+	cmd.Flags().DurationVar(&opts.Timeout, "timeout", defaultHookRunTimeout, "hard timeout for the managed hook command")
+	cmd.Flags().IntVar(&opts.TimeoutExitCode, "timeout-exit-code", 124, "exit code to return when the managed hook command times out")
+	return cmd
+}
+
+const defaultHookRunTimeout = 15 * time.Second
+
+type hookRunOptions struct {
+	Timeout         time.Duration
+	TimeoutExitCode int
+}
+
+var hookRunExecutable = os.Executable
+
+func cmdHookRun(args []string, opts hookRunOptions, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "gc hook run: missing gc command arguments") //nolint:errcheck
+		return 1
+	}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = defaultHookRunTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	exe, err := hookRunExecutable()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc hook run: resolving gc executable: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
+	// Forward the provider hook stdin so wrapped commands like
+	// `nudge drain --inject` still receive the UserPromptSubmit JSON
+	// (carrying transcript_path) they need for context-pressure injection.
+	// readHookStdin already bounds the read with an io.LimitReader and the
+	// hard timeout below bounds any block, so forwarding is safe.
+	cmd.Stdin = stdin
+	// Buffer child stdout instead of streaming it straight to the provider so
+	// a wedged command cannot leak partial injectable output before the
+	// fail-open timeout path runs. The buffer is flushed only on a clean or
+	// self-determined exit, and discarded on timeout.
+	var childOut bytes.Buffer
+	cmd.Stdout = &childOut
+	cmd.Stderr = stderr
+	cmd.WaitDelay = 2 * time.Second
+	prepareProviderOpCommand(cmd)
+
+	err = cmd.Run()
+	// A clean exit wins even if the deadline fired in the same instant: the
+	// child finished and produced complete output, so report success and flush.
+	if err == nil {
+		_, _ = stdout.Write(childOut.Bytes()) //nolint:errcheck
+		return 0
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		// Timed out: the child was killed mid-flight, so any buffered output is
+		// partial. Discard it and return the configured fail-open code.
+		fmt.Fprintf(stderr, "gc hook run: command timed out after %s\n", timeout) //nolint:errcheck
+		return opts.TimeoutExitCode
+	}
+	// The child exited on its own with a non-zero status: its output is
+	// complete, so preserve it and propagate the exit code.
+	_, _ = stdout.Write(childOut.Bytes()) //nolint:errcheck
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	fmt.Fprintf(stderr, "gc hook run: %v\n", err) //nolint:errcheck
+	return 1
+}
+
+type hookCommandOptions struct {
+	Inject     bool
+	HookFormat string
+	Claim      bool
+	DrainAck   bool
+	JSON       bool
 }
 
 // cmdHook is the CLI entry point for gc hook. Resolves the agent from
@@ -51,12 +171,20 @@ func cmdHook(args []string, stdout, stderr io.Writer) int {
 }
 
 func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, stderr io.Writer) int {
-	if inject {
+	return cmdHookWithOptions(args, hookCommandOptions{Inject: inject, HookFormat: hookFormat}, stdout, stderr)
+}
+
+func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr io.Writer) int {
+	if opts.Inject {
 		return 0
 	}
 	// Accepted for compatibility with installed hook commands; non-inject
 	// gc hook output ignores provider-specific formatting.
-	_ = hookFormat
+	_ = opts.HookFormat
+	if opts.DrainAck && !opts.Claim {
+		fmt.Fprintln(stderr, "gc hook: --drain-ack requires --claim") //nolint:errcheck
+		return 1
+	}
 
 	agentName := os.Getenv("GC_ALIAS")
 	if agentName == "" {
@@ -96,24 +224,52 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
 	// do the same immediately after loadCityConfig.
 	resolveRigPaths(cityPath, cfg.Rigs)
 
-	if citySuspended(cfg) {
+	st, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
+	if citySuspendedWithState(cfg, st) {
 		fmt.Fprintln(stderr, "gc hook: city is suspended") //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
 	a, ok := resolveAgentIdentity(cfg, agentName, currentRigContext(cfg))
 	if !ok {
+		// Pool instances run with GC_AGENT/GC_ALIAS set to their per-instance name
+		// (e.g. "rig/polecat-adhoc-<hash>") which is not a config entry — only the
+		// pool binding (GC_TEMPLATE, e.g. "rig/polecat") is. When a pack script
+		// invokes "gc hook $GC_AGENT" the positional arg bypasses the no-args
+		// sessionTemplateContext fallback. Retry with GC_TEMPLATE so pool agents
+		// resolve correctly regardless of invocation style.
+		//
+		// Gate the retry to the runtime/session identity case: only fall back
+		// when the unresolved arg is this instance's own runtime name
+		// (GC_ALIAS/GC_AGENT/GC_SESSION_NAME). Otherwise an unrelated bad
+		// explicit target in a pool session would silently reinterpret as the
+		// template agent instead of erroring.
+		isRuntimeIdentity := agentName == strings.TrimSpace(os.Getenv("GC_ALIAS")) ||
+			agentName == strings.TrimSpace(os.Getenv("GC_AGENT")) ||
+			agentName == strings.TrimSpace(os.Getenv("GC_SESSION_NAME"))
+		if tpl := strings.TrimSpace(os.Getenv("GC_TEMPLATE")); tpl != "" && tpl != agentName && isRuntimeIdentity {
+			if ta, tok := resolveAgentIdentity(cfg, tpl, currentRigContext(cfg)); tok {
+				a, ok = ta, true
+				agentName = tpl
+				if !sessionTemplateContext {
+					sessionTemplateContext = strings.TrimSpace(os.Getenv("GC_SESSION_NAME")) != "" ||
+						strings.TrimSpace(os.Getenv("GC_SESSION_ID")) != ""
+				}
+			}
+		}
+	}
+	if !ok {
 		fmt.Fprintf(stderr, "gc hook: agent %q not found in config\n", agentName) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
-	if isAgentEffectivelySuspended(cfg, &a) {
+	if isAgentEffectivelySuspendedWith(cfg, &a, st) {
 		fmt.Fprintf(stderr, "gc hook: agent %q is suspended\n", agentName) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
 	cityName := loadedCityName(cfg, cityPath)
-	workQuery := a.EffectiveWorkQuery()
+	workQuery := a.EffectiveWorkQueryForBeads(cfg.Beads)
 	// Expand {{.Rig}}/{{.AgentBase}} in user-supplied work_query so agent-side
 	// hook invocation sees the same rig substitution as the controller-side
 	// probes in build_desired_state.go / session_reconcile.go. #793.
@@ -162,8 +318,34 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
 	}
 	queryEnv := mergeRuntimeEnv(os.Environ(), overrides)
 	failureTemplate, emitFailureEvent := hookWorkQueryFailureTemplate(len(args) > 0, sessionTemplateContext, a.QualifiedName())
-	runner := func(command, dir string) (string, error) {
-		out, err := shellWorkQueryWithEnv(command, dir, queryEnv)
+
+	// A cross-store-eligible (city-scoped) agent federates its work query across
+	// all stores — its own first, then every rig store — matched on its own
+	// identity (vp-kvp stage iii). A rig-scoped agent ("<rig>/<name>") instead
+	// queries its own <rig> store FIRST: its routed work lives there, but its
+	// city-scoped work-query env does not reach it, so without this the hook
+	// returns empty and the spawned session exits with nothing to do. The rig
+	// store goes first (as the primary entry, not a best-effort federated
+	// extra) so a rig-store work-query timeout still surfaces to the reconciler
+	// via firstStoreWithWork's emit-on-timeout contract — the agent's
+	// (work-less) city-scoped env stays as a best-effort secondary. This
+	// extends the #2877 city-scoped cross-store delivery to rig-scoped agents.
+	stores := []hookStore{{dir: workDir, env: queryEnv}}
+	if agentIsCrossStoreEligible(&a) {
+		stores = appendRigHookStores(stores, cityPath, cfg, &a, overrides)
+	} else if rig := rigScopedHookRig(cfg, agentForQuery); rig != "" {
+		if rigStores := appendOneRigHookStore(nil, cityPath, cfg, &a, rig, overrides); len(rigStores) > 0 {
+			stores = append(rigStores, stores...)
+		}
+		// A rig-backed agent's own env above is ALSO rig-scoped, so without
+		// this no entry reaches the CITY store and root-only beads assigned
+		// to the agent stay invisible. Best-effort tertiary; see
+		// appendCityHookStore.
+		stores = appendCityHookStore(stores, cityPath, cfg, &a, overrides)
+	}
+
+	runner := func(command, _ string) (string, error) {
+		out, err := firstStoreWithWork(command, stores, shellWorkQueryWithEnv)
 		if err != nil && emitFailureEvent {
 			// A killed/timed-out work query strands the session with no
 			// output and no cause on the event bus; emit one so the
@@ -175,7 +357,50 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
 		}
 		return out, err
 	}
-	return doHook(workQuery, workDir, inject, runner, stdout, stderr)
+	if opts.Claim {
+		sessionID := strings.TrimSpace(overrides["GC_SESSION_ID"])
+		sessionName := strings.TrimSpace(sessionForQuery)
+		alias := strings.TrimSpace(overrides["GC_ALIAS"])
+		assignee := firstNonEmptyHookValue(sessionName, sessionID, alias, agentForQuery, resolvedAgentName)
+		routeTarget := hookClaimPrimaryRouteTarget(&a)
+		claimOpts := hookClaimOptions{
+			Assignee: assignee,
+			IdentityCandidates: hookClaimIdentityCandidates(
+				assignee,
+				sessionID,
+				sessionName,
+				alias,
+				agentForQuery,
+				resolvedAgentName,
+			),
+			RouteTargets: hookClaimRouteTargets(routeTarget, resolvedAgentName, strings.TrimSpace(overrides["GC_TEMPLATE"])),
+			Env:          queryEnv,
+			DrainAck:     opts.DrainAck,
+			JSON:         opts.JSON,
+		}
+		return doHookClaim(workQuery, workDir, claimOpts, hookClaimOps{Runner: runner}, stdout, stderr)
+	}
+	return doHook(workQuery, workDir, false, runner, stdout, stderr)
+}
+
+func hookClaimPrimaryRouteTarget(a *config.Agent) string {
+	if a == nil {
+		return ""
+	}
+	if target := strings.TrimSpace(a.PoolName); target != "" {
+		return target
+	}
+	return a.QualifiedName()
+}
+
+func firstNonEmptyHookValue(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func hookWorkQueryFailureTemplate(explicitTarget, sessionTemplateContext bool, resolvedAgentName string) (string, bool) {
@@ -234,15 +459,27 @@ func shellWorkQueryWithEnv(command, dir string, env []string) (string, error) {
 		cmd.Dir = dir
 	}
 	cmd.Env = workQueryEnvForDir(env, dir)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if ctx.Err() == context.DeadlineExceeded {
+		// Wrap context.DeadlineExceeded so callers can classify the timeout as
+		// transient (dispatch.IsTransientControllerError / errors.Is). Without
+		// this, a work-query timeout reads as an opaque fatal error and kills
+		// long-running consumers like the control-dispatcher --follow loop even
+		// though the timeout is just transient bead-store load. The human-facing
+		// "timed out after" text is preserved.
 		msg := strings.TrimSpace(string(out))
 		if msg != "" {
-			return string(out), fmt.Errorf("running work query %q: timed out after %s with partial stdout %q", command, hookWorkQueryTimeout, msg)
+			return string(out), fmt.Errorf("running work query %q: timed out after %s with partial stdout %q: %w", command, hookWorkQueryTimeout, msg, context.DeadlineExceeded)
 		}
-		return "", fmt.Errorf("running work query %q: timed out after %s", command, hookWorkQueryTimeout)
+		return "", fmt.Errorf("running work query %q: timed out after %s: %w", command, hookWorkQueryTimeout, context.DeadlineExceeded)
 	}
 	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return "", fmt.Errorf("running work query %q: %w: %s", command, err, msg)
+		}
 		return "", fmt.Errorf("running work query %q: %w", command, err)
 	}
 	return string(out), nil

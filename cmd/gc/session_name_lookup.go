@@ -16,14 +16,14 @@ import (
 
 const poolManagedMetadataKey = "pool_managed"
 
+type explicitBeadIDStore interface {
+	IDPrefix() string
+}
+
 type poolSessionCreateIdentity struct {
 	AgentName string
 	Alias     string
 	Slot      int
-}
-
-type explicitBeadIDStore interface {
-	IDPrefix() string
 }
 
 func isPoolManagedSessionBead(bead beads.Bead) bool {
@@ -55,8 +55,8 @@ func resolveLegacyPoolTemplate(cfg *config.City, storedTemplate string) string {
 	if cfg == nil || storedTemplate == "" {
 		return ""
 	}
-	if findAgentByTemplate(cfg, storedTemplate) != nil {
-		return storedTemplate
+	if agent := findAgentByTemplate(cfg, storedTemplate); agent != nil {
+		return agent.QualifiedName()
 	}
 	match := ""
 	for i := range cfg.Agents {
@@ -89,8 +89,8 @@ func resolvedTemplateForIdentity(identity string, cfg *config.City) string {
 	if cfg == nil || identity == "" {
 		return ""
 	}
-	if findAgentByTemplate(cfg, identity) != nil {
-		return identity
+	if agent := findAgentByTemplate(cfg, identity); agent != nil {
+		return agent.QualifiedName()
 	}
 	if resolved := resolveLegacyPoolTemplate(cfg, identity); resolved != "" {
 		return resolved
@@ -119,7 +119,10 @@ func resolvedTemplateForIdentity(identity string, cfg *config.City) string {
 func resolvedSessionTemplate(bead beads.Bead, cfg *config.City) string {
 	template := normalizedSessionTemplate(bead, cfg)
 	if template != "" && (cfg == nil || findAgentByTemplate(cfg, template) != nil) {
-		return template
+		// normalizedSessionTemplate already returns the canonical qualified name
+		// when an agent resolves, so this re-normalization is a defensive no-op
+		// on that value (and still canonicalizes a non-canonical input).
+		return normalizeAgentTemplateIdentity(cfg, template)
 	}
 	storedTemplate := sessionBeadStoredTemplate(bead)
 	if storedTemplate == "" {
@@ -137,7 +140,7 @@ func storedTemplateMatchesPoolTemplate(storedTemplate, template string, cfg *con
 	if storedTemplate == "" || template == "" {
 		return false
 	}
-	if storedTemplate == template {
+	if agentTemplateIdentitiesEquivalent(cfg, storedTemplate, template) {
 		return true
 	}
 	return resolveLegacyPoolTemplate(cfg, storedTemplate) == template
@@ -236,22 +239,6 @@ func createPoolSessionBeadWithAlias(
 	return bead, nil
 }
 
-func poolSessionExplicitBeadID(store beads.Store, instanceToken string) string {
-	prefixStore, ok := store.(explicitBeadIDStore)
-	if !ok {
-		return ""
-	}
-	prefix := strings.TrimSpace(prefixStore.IDPrefix())
-	if prefix == "" {
-		return ""
-	}
-	instanceToken = strings.TrimSpace(instanceToken)
-	if instanceToken == "" {
-		return ""
-	}
-	return prefix + "-session-" + instanceToken
-}
-
 // derivePoolSessionName picks the session_name for a fresh pool bead. When
 // resolvedTmuxAlias is non-empty and unreserved in the live store, config, and
 // current open snapshot, it wins; otherwise the bead ID is appended as a
@@ -316,6 +303,19 @@ func openSessionNameTaken(snapshot *sessionBeadSnapshot, name, selfID string) bo
 	return false
 }
 
+func poolSessionExplicitBeadID(store beads.Store, instanceToken string) string {
+	prefixStore, ok := store.(explicitBeadIDStore)
+	if !ok {
+		return ""
+	}
+	prefix := strings.Trim(strings.TrimSpace(prefixStore.IDPrefix()), "-")
+	instanceToken = strings.TrimSpace(instanceToken)
+	if prefix == "" || instanceToken == "" {
+		return ""
+	}
+	return prefix + "-session-" + instanceToken
+}
+
 // resolveSessionName returns the session name for a qualified agent name.
 // When a bead store is available, it looks up an existing session bead and
 // returns its session_name metadata. When no bead is found (or no store is
@@ -376,8 +376,10 @@ func normalizedSessionTemplate(bead beads.Bead, cfg *config.City) string {
 	if cfg == nil {
 		return template
 	}
-	if template != "" && findAgentByTemplate(cfg, template) != nil {
-		return template
+	if template != "" {
+		if agent := findAgentByTemplate(cfg, template); agent != nil {
+			return agent.QualifiedName()
+		}
 	}
 	agentName := sessionBeadAgentName(bead)
 	if agentName != "" {

@@ -17,11 +17,13 @@ lives in the [Architecture](../architecture/index.md) section.
 | Document | Status | Notes |
 |---|---|---|
 | `machine-wide-supervisor-v0` | Accepted | Current supervisor direction |
+| `convoy-first-formulas-and-drain-v0` | Implemented | Convoy-first graph.v2 formula inputs and drain scatter semantics |
 | `api-ops-design` | Implemented | State-mutation API surface |
 | `agent-pools` | Implemented | Feature shipped before the current template existed |
 | `dependency-aware-bounded-parallel-lifecycle` | Implemented | Bounded parallel start/stop waves for session lifecycle |
 | `beads-dolt-contract-redesign` | Accepted | Canonical bd+Dolt contract, topology commands, migration, and provider-boundary redesign |
 | `idle-session-sleep` | Accepted | Idle-sleep policy, precedence, and wake mechanics |
+| `session-store-fences` | Accepted | Cross-process write fences for session-owned metadata: store facts, flock and token-reread fences, residual convergence-through-persistence |
 | `named-configured-sessions` | Accepted | Explicit canonical named sessions backed by reusable templates; partially superseded by `session-model-unification` |
 | `session-model-unification` | Accepted | Unified post-pool session model: config factories, canonical named identities, exact session ownership, and `scale_check`-only controller demand |
 | `session-lifecycle-domain-cleanup-plan` | Implemented with hardening | Red-green-refactor plan for centralizing session lifecycle projection and transition writes behind typed abstractions |

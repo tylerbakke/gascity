@@ -162,7 +162,7 @@ func TestCityStatusSuspended(t *testing.T) {
 	sp := runtime.NewFake()
 	dops := newFakeDrainOps()
 	cfg := &config.City{
-		Workspace: config.Workspace{Name: "city", Suspended: true, MaxActiveSessions: intPtr(1)},
+		Workspace: config.Workspace{Name: "city", SuspendedOnStart: true, MaxActiveSessions: intPtr(1)},
 		Agents:    []config.Agent{{Name: "mayor", MaxActiveSessions: intPtr(1)}},
 	}
 
@@ -265,7 +265,7 @@ func TestCityStatusRigs(t *testing.T) {
 		Agents:    []config.Agent{{Name: "mayor", MaxActiveSessions: intPtr(1)}},
 		Rigs: []config.Rig{
 			{Name: "hello-world", Path: "/home/user/hello-world"},
-			{Name: "frontend", Path: "/home/user/frontend", Suspended: true},
+			{Name: "frontend", Path: "/home/user/frontend", SuspendedOnStart: true},
 		},
 	}
 
@@ -322,6 +322,83 @@ func TestCityStatusJSONEmpty(t *testing.T) {
 	}
 	if status.Summary.TotalAgents != 0 {
 		t.Errorf("total_agents = %d, want 0", status.Summary.TotalAgents)
+	}
+}
+
+func TestCityStatusFormatJSONIncludesBeadsDiagnostic(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "bright-lights"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldOpen := openCityStoreAtForStatus
+	openCityStoreAtForStatus = func(string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Store: beads.NewMemStore(),
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               "BdStore",
+				NativeStoreEligible: false,
+				PreflightGate:       "metadata_backend",
+				PreflightReason:     "metadata backend=file; native store requires dolt",
+			},
+		}, nil
+	}
+	t.Cleanup(func() { openCityStoreAtForStatus = oldOpen })
+
+	var stdout, stderr bytes.Buffer
+	cmd := newStatusCmd(&stdout, &stderr)
+	cmd.SetArgs([]string{"--format", "json", cityPath})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v; stderr: %s", err, stderr.String())
+	}
+
+	var status StatusJSON
+	if err := json.Unmarshal(stdout.Bytes(), &status); err != nil {
+		t.Fatalf("unmarshal: %v; output: %s", err, stdout.String())
+	}
+	if status.Beads == nil {
+		t.Fatalf("status.Beads = nil, want diagnostic")
+	}
+	if status.Beads.Store != "BdStore" {
+		t.Fatalf("beads_store = %q, want BdStore", status.Beads.Store)
+	}
+	if status.Beads.NativeStoreEligible {
+		t.Fatalf("native_store_eligible = true, want false")
+	}
+	if status.Beads.PreflightGate != "metadata_backend" {
+		t.Fatalf("preflight_gate = %q, want metadata_backend", status.Beads.PreflightGate)
+	}
+	if status.Beads.PreflightReason == "" {
+		t.Fatalf("preflight_reason = empty, want fallback reason")
+	}
+}
+
+func TestSnapshotFromStatusViewIncludesBeadsDiagnostic(t *testing.T) {
+	view := api.StatusView{
+		CityName: "bright-lights",
+		CityPath: "/home/user/bright-lights",
+		Beads: &beads.BeadsDiagnostic{
+			Store:               "BdStore",
+			NativeStoreEligible: false,
+			PreflightGate:       "metadata_backend",
+			PreflightReason:     "metadata backend=file; native store requires dolt",
+		},
+	}
+
+	snapshot := snapshotFromStatusView(view.CityPath, view)
+	if snapshot.Beads == nil {
+		t.Fatal("snapshot.Beads = nil, want diagnostic from API status view")
+	}
+	if snapshot.Beads.Store != "BdStore" {
+		t.Fatalf("beads_store = %q, want BdStore", snapshot.Beads.Store)
+	}
+	if snapshot.Beads.PreflightReason == "" {
+		t.Fatal("preflight_reason = empty, want API fallback reason")
 	}
 }
 
@@ -439,8 +516,8 @@ func TestCityStatusJSONReportsObservationErrors(t *testing.T) {
 func TestCityStatusJSONReportsStoreOpenError(t *testing.T) {
 	sp := runtime.NewFake()
 	oldOpen := openCityStoreAtForStatus
-	openCityStoreAtForStatus = func(string) (beads.Store, error) {
-		return nil, errors.New("bead store unavailable")
+	openCityStoreAtForStatus = func(string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{}, errors.New("bead store unavailable")
 	}
 	t.Cleanup(func() { openCityStoreAtForStatus = oldOpen })
 	cfg := &config.City{
@@ -470,8 +547,8 @@ func TestCityStatusJSONReportsStoreOpenError(t *testing.T) {
 func TestCityStatusJSONReportsCatalogListError(t *testing.T) {
 	sp := runtime.NewFake()
 	oldOpen := openCityStoreAtForStatus
-	openCityStoreAtForStatus = func(string) (beads.Store, error) {
-		return &listErrorStore{Store: beads.NewMemStore()}, nil
+	openCityStoreAtForStatus = func(string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: &listErrorStore{Store: beads.NewMemStore()}}, nil
 	}
 	t.Cleanup(func() { openCityStoreAtForStatus = oldOpen })
 	cfg := &config.City{
@@ -531,8 +608,8 @@ func TestCityStatusReportsCatalogListError(t *testing.T) {
 	sp := runtime.NewFake()
 	dops := newFakeDrainOps()
 	oldOpen := openCityStoreAtForStatus
-	openCityStoreAtForStatus = func(string) (beads.Store, error) {
-		return &listErrorStore{Store: beads.NewMemStore()}, nil
+	openCityStoreAtForStatus = func(string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: &listErrorStore{Store: beads.NewMemStore()}}, nil
 	}
 	t.Cleanup(func() { openCityStoreAtForStatus = oldOpen })
 	cfg := &config.City{
@@ -565,9 +642,9 @@ func TestCityStatusSkipsStoreOpenWhenNoPersistedStoreExists(t *testing.T) {
 	dops := newFakeDrainOps()
 	oldOpen := openCityStoreAtForStatus
 	called := false
-	openCityStoreAtForStatus = func(string) (beads.Store, error) {
+	openCityStoreAtForStatus = func(string) (beads.StoreOpenResult, error) {
 		called = true
-		return nil, errors.New("unexpected store open")
+		return beads.StoreOpenResult{}, errors.New("unexpected store open")
 	}
 	t.Cleanup(func() { openCityStoreAtForStatus = oldOpen })
 	cfg := &config.City{
@@ -593,7 +670,7 @@ func TestCityStatusAgentSuspendedByRig(t *testing.T) {
 			{Name: "polecat", Dir: "myrig", MaxActiveSessions: intPtr(1)},
 		},
 		Rigs: []config.Rig{
-			{Name: "myrig", Path: "/tmp/myrig", Suspended: true},
+			{Name: "myrig", Path: "/tmp/myrig", SuspendedOnStart: true},
 		},
 	}
 

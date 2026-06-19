@@ -181,6 +181,47 @@ func TestComputePoolDesiredStates_ResumeResolvesAssigneeByAlias(t *testing.T) {
 	}
 }
 
+func TestComputePoolDesiredStates_ResumeUsesLegacyWorkflowRunTarget(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{
+			poolAgent("claude", "rig", intPtr(2), 0),
+			poolAgent("reviewer", "rig", intPtr(2), 0),
+		},
+	}
+	work := []beads.Bead{{
+		ID:       "legacy-workflow-root",
+		Status:   "in_progress",
+		Assignee: "sess-1",
+		Priority: intPtr(5),
+		Metadata: map[string]string{
+			"gc.kind":       "workflow",
+			"gc.run_target": "rig/claude",
+		},
+	}}
+	sessions := []beads.Bead{{
+		ID:     "sess-1",
+		Status: "open",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	}}
+
+	result := ComputePoolDesiredStates(cfg, work, sessions, nil)
+
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	reqs := result[0].Requests
+	if len(reqs) != 1 {
+		t.Fatalf("len(requests) = %d, want 1 resume request", len(reqs))
+	}
+	if reqs[0].Tier != "resume" || reqs[0].SessionBeadID != "sess-1" {
+		t.Fatalf("request = %+v, want resume for sess-1", reqs[0])
+	}
+}
+
 func TestComputePoolDesiredStates_ResumeResolvesAssigneeByAliasHistory(t *testing.T) {
 	// Regression: alias rotation preserves prior aliases in alias_history.
 	// Work assigned under a prior alias must still resolve to its owning
@@ -210,6 +251,70 @@ func TestComputePoolDesiredStates_ResumeResolvesAssigneeByAliasHistory(t *testin
 	reqs := result[0].Requests
 	if len(reqs) != 1 || reqs[0].SessionBeadID != "sess-vi6hhp" {
 		t.Fatalf("requests = %+v, want 1 resume for sess-vi6hhp", reqs)
+	}
+}
+
+func TestComputePoolDesiredStates_ResumeResolvesPersistedBoundTemplate(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("implementation-worker", "gascity-packs", intPtr(8), 0)},
+	}
+	sessionName := "gc__implementation-worker-mc-xbvk5"
+	work := []beads.Bead{
+		workBead("gp-qx0o", "gascity-packs/gc.implementation-worker", sessionName, "in_progress", 5),
+	}
+	sessions := []beads.Bead{{
+		ID:     "mc-xbvk5",
+		Status: "open",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":             "gascity-packs/gc.implementation-worker",
+			"session_name":         sessionName,
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	}}
+
+	result := ComputePoolDesiredStates(cfg, work, sessions, nil)
+
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	if result[0].Template != "gascity-packs/implementation-worker" {
+		t.Fatalf("result template = %q, want current canonical template", result[0].Template)
+	}
+	reqs := result[0].Requests
+	if len(reqs) != 1 || reqs[0].Tier != "resume" || reqs[0].SessionBeadID != "mc-xbvk5" {
+		t.Fatalf("requests = %+v, want one resume for mc-xbvk5", reqs)
+	}
+}
+
+// TestComputePoolDesiredStates_WakeKnownIdentityResolvesPersistedBoundAssignee
+// covers the wake-known-identity tier one migration class over from the
+// resume tier: in-progress work assigned to the pool identity itself under
+// the legacy bound form, with no open session bead. The assignee/template
+// comparison must use identity equivalence so the work still produces a wake
+// request for the current canonical template instead of being treated as
+// orphaned.
+func TestComputePoolDesiredStates_WakeKnownIdentityResolvesPersistedBoundAssignee(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("implementation-worker", "gascity-packs", intPtr(8), 0)},
+	}
+	legacyIdentity := "gascity-packs/gc.implementation-worker"
+	work := []beads.Bead{
+		workBead("gp-qx1o", legacyIdentity, legacyIdentity, "in_progress", 5),
+	}
+
+	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	if result[0].Template != "gascity-packs/implementation-worker" {
+		t.Fatalf("result template = %q, want current canonical template", result[0].Template)
+	}
+	reqs := result[0].Requests
+	if len(reqs) != 1 || reqs[0].Tier != "wake-known-identity" || reqs[0].WorkBeadID != "gp-qx1o" {
+		t.Fatalf("requests = %+v, want one wake-known-identity for gp-qx1o", reqs)
 	}
 }
 

@@ -10,6 +10,8 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/configedit"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/pathutil"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
 type failRenameFS struct {
@@ -19,7 +21,7 @@ type failRenameFS struct {
 }
 
 func (f *failRenameFS) Rename(oldpath, newpath string) error {
-	if !f.failed && filepath.Clean(newpath) == filepath.Clean(f.target) {
+	if !f.failed && pathutil.SamePath(newpath, f.target) {
 		f.failed = true
 		return errors.New("injected rename failure")
 	}
@@ -64,10 +66,32 @@ path = "/tmp/my-rig"
 `
 }
 
+func withTestProviderCatalog(content string) string {
+	additions := []struct {
+		name string
+		body string
+	}{
+		{name: "claude", body: `base = "builtin:claude"`},
+		{name: "codex", body: `base = "builtin:codex"`},
+		{name: "gemini", body: `base = "builtin:gemini"`},
+		{name: "legacy", body: `command = "legacy"`},
+	}
+	for _, addition := range additions {
+		if strings.Contains(content, "[providers."+addition.name+"]") {
+			continue
+		}
+		if !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		content += "\n[providers." + addition.name + "]\n" + addition.body + "\n"
+	}
+	return content
+}
+
 func writeTOML(t *testing.T, dir, content string) string {
 	t.Helper()
 	path := filepath.Join(dir, "city.toml")
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(withTestProviderCatalog(content)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -225,13 +249,13 @@ func TestSetAgentSuspended_NotFound(t *testing.T) {
 	}
 }
 
-func TestSetRigSuspended(t *testing.T) {
+func TestSetRigSuspendedOnStart(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, cityWithRig())
 	ed := configedit.NewEditor(fsys.OSFS{}, path)
 
 	err := ed.Edit(func(cfg *config.City) error {
-		return configedit.SetRigSuspended(cfg, "my-rig", true)
+		return configedit.SetRigSuspendedOnStart(cfg, "my-rig", true)
 	})
 	if err != nil {
 		t.Fatalf("Edit: %v", err)
@@ -240,8 +264,11 @@ func TestSetRigSuspended(t *testing.T) {
 	cfg := readTOML(t, path)
 	for _, r := range cfg.Rigs {
 		if r.Name == "my-rig" {
-			if !r.Suspended {
-				t.Error("expected my-rig to be suspended")
+			if !r.SuspendedOnStart {
+				t.Error("expected my-rig to have suspended_on_start = true")
+			}
+			if r.Suspended {
+				t.Error("legacy suspended field must not be set by SetRigSuspendedOnStart")
 			}
 			return
 		}
@@ -249,14 +276,14 @@ func TestSetRigSuspended(t *testing.T) {
 	t.Error("my-rig not found after edit")
 }
 
-func TestSetRigSuspended_NotFound(t *testing.T) {
+func TestSetRigSuspendedOnStart_NotFound(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, minimalCity())
 	cfg, err := config.Load(fsys.OSFS{}, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := configedit.SetRigSuspended(cfg, "nonexistent", true); err == nil {
+	if err := configedit.SetRigSuspendedOnStart(cfg, "nonexistent", true); err == nil {
 		t.Error("expected error for nonexistent rig")
 	}
 }
@@ -516,6 +543,126 @@ schema = 2
 	}
 	if worker.Provider != "codex" {
 		t.Fatalf("worker.Provider = %q, want codex", worker.Provider)
+	}
+}
+
+// setupSymlinkedConventionAgent builds a schema-2 city with a convention
+// "worker" whose agents/worker/agent.toml is a symlink into a separate
+// checked-in location. It returns the city.toml path, the agent.toml link
+// path, and the resolved checked-in target path.
+func setupSymlinkedConventionAgent(t *testing.T, agentTomlBody string) (cityTOML, link, target string) {
+	t.Helper()
+	dir := t.TempDir()
+	cityTOML = writeTOML(t, dir, `[workspace]
+name = "test-city"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte("[pack]\nname = \"test-city\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(dir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the worker.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkedIn := filepath.Join(dir, "checked-in")
+	if err := os.MkdirAll(checkedIn, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target = filepath.Join(checkedIn, "worker.agent.toml")
+	if err := os.WriteFile(target, []byte(agentTomlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link = filepath.Join(agentDir, "agent.toml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	return cityTOML, link, target
+}
+
+func assertStillSymlink(t *testing.T, link string) {
+	t.Helper()
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat %q: %v", link, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%q symlink was replaced by a regular file", link)
+	}
+}
+
+func TestSuspendAgent_LocalDiscovered_SymlinkedAgentTomlWritesThroughLink(t *testing.T) {
+	cityTOML, link, target := setupSymlinkedConventionAgent(t, "provider = \"codex\"\n")
+
+	ed := configedit.NewEditor(fsys.OSFS{}, cityTOML)
+	if err := ed.SuspendAgent("worker"); err != nil {
+		t.Fatalf("SuspendAgent: %v", err)
+	}
+
+	assertStillSymlink(t, link)
+	got := string(mustReadFile(t, target))
+	if !strings.Contains(got, "suspended = true") {
+		t.Fatalf("checked-in target = %q, want suspended = true written through the link", got)
+	}
+	if !strings.Contains(got, `provider = "codex"`) {
+		t.Fatalf("checked-in target = %q, want provider preserved", got)
+	}
+}
+
+func TestResumeAgent_LocalDiscovered_SymlinkedAgentTomlEmptyClearsTarget(t *testing.T) {
+	// Only the suspended flag is durable, so resume empties the config and the
+	// resolved checked-in target is cleared. The operator's link is left in
+	// place (edits act on the target, not the link).
+	cityTOML, link, target := setupSymlinkedConventionAgent(t, "suspended = true\n")
+
+	ed := configedit.NewEditor(fsys.OSFS{}, cityTOML)
+	if err := ed.ResumeAgent("worker"); err != nil {
+		t.Fatalf("ResumeAgent: %v", err)
+	}
+
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("checked-in target should be cleared on empty resume, stat err = %v", err)
+	}
+	assertStillSymlink(t, link)
+	cfg := readExpandedTOML(t, cityTOML)
+	if findAgent(t, cfg, "worker").Suspended {
+		t.Fatal("worker should not be suspended after resume")
+	}
+}
+
+func TestUpdateAgent_LocalDiscovered_SymlinkedAgentTomlWritesThroughLink(t *testing.T) {
+	cityTOML, link, target := setupSymlinkedConventionAgent(t, "provider = \"codex\"\n")
+
+	ed := configedit.NewEditor(fsys.OSFS{}, cityTOML)
+	if err := ed.UpdateAgent("worker", configedit.AgentUpdate{Provider: "claude"}); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+
+	assertStillSymlink(t, link)
+	got := string(mustReadFile(t, target))
+	if !strings.Contains(got, `provider = "claude"`) {
+		t.Fatalf("checked-in target = %q, want provider updated through the link", got)
+	}
+}
+
+func TestWriteLocalDiscoveredAgentConfig_SymlinkedAgentTomlWritesThroughLink(t *testing.T) {
+	cityTOML, link, target := setupSymlinkedConventionAgent(t, "provider = \"codex\"\n")
+	cityRoot := filepath.Dir(cityTOML)
+
+	agent := config.Agent{
+		Name:     "worker",
+		Provider: "claude",
+		Scope:    "city",
+	}
+	if err := configedit.WriteLocalDiscoveredAgentConfig(fsys.OSFS{}, cityRoot, agent); err != nil {
+		t.Fatalf("WriteLocalDiscoveredAgentConfig: %v", err)
+	}
+
+	assertStillSymlink(t, link)
+	got := string(mustReadFile(t, target))
+	if !strings.Contains(got, `provider = "claude"`) {
+		t.Fatalf("checked-in target = %q, want provider written through the link", got)
 	}
 }
 
@@ -857,9 +1004,30 @@ func TestSuspendRig(t *testing.T) {
 		t.Fatalf("SuspendRig: %v", err)
 	}
 
+	// Suspension is recorded in the runtime state file, not city.toml.
+	st, err := suspensionstate.Load(fsys.OSFS{}, dir)
+	if err != nil {
+		t.Fatalf("Load suspension state: %v", err)
+	}
+	if !suspensionstate.IsRigSuspended(st, "my-rig") {
+		t.Error("expected my-rig to be suspended in runtime state")
+	}
 	cfg := readTOML(t, path)
-	if !cfg.Rigs[0].Suspended {
-		t.Error("expected my-rig to be suspended")
+	if cfg.Rigs[0].Suspended {
+		t.Error("expected city.toml to NOT have suspended=true (legacy field is deprecated)")
+	}
+	if cfg.Rigs[0].SuspendedOnStart {
+		t.Error("expected city.toml to NOT have suspended_on_start=true (runtime state owns transient suspend)")
+	}
+}
+
+func TestSuspendRig_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, cityWithRig())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	if err := ed.SuspendRig("nonexistent"); err == nil {
+		t.Fatal("expected ErrNotFound for nonexistent rig")
 	}
 }
 
@@ -871,18 +1039,45 @@ name = "test-city"
 [[rigs]]
 name = "my-rig"
 path = "/tmp/my-rig"
-suspended = true
+suspended_on_start = true
 `
 	path := writeTOML(t, dir, city)
+	want := true
+	if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, dir, "my-rig", &want); err != nil {
+		t.Fatalf("pre-suspend: %v", err)
+	}
 	ed := configedit.NewEditor(fsys.OSFS{}, path)
 
 	if err := ed.ResumeRig("my-rig"); err != nil {
 		t.Fatalf("ResumeRig: %v", err)
 	}
 
+	// city.toml must NOT be edited; the SuspendedOnStart flag is the
+	// committable default and resume records the override in runtime state.
 	cfg := readTOML(t, path)
-	if cfg.Rigs[0].Suspended {
-		t.Error("expected my-rig to not be suspended")
+	if !cfg.Rigs[0].SuspendedOnStart {
+		t.Error("expected city.toml suspended_on_start to remain set after resume")
+	}
+	st, err := suspensionstate.Load(fsys.OSFS{}, dir)
+	if err != nil {
+		t.Fatalf("Load suspension state: %v", err)
+	}
+	if v, ok := suspensionstate.ExplicitRig(st, "my-rig"); !ok || v {
+		t.Errorf("expected explicit resume in runtime state, got (%v, %v)", v, ok)
+	}
+	// Effective state must be not-suspended (explicit resume wins).
+	if suspensionstate.EffectiveRigSuspended(st, "my-rig", cfg.Rigs[0].SuspendedOnStart) {
+		t.Error("explicit resume in runtime state must beat suspended_on_start=true")
+	}
+}
+
+func TestResumeRig_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, cityWithRig())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	if err := ed.ResumeRig("nonexistent"); err == nil {
+		t.Fatal("expected ErrNotFound for nonexistent rig")
 	}
 }
 
@@ -915,9 +1110,20 @@ func TestSuspendCity(t *testing.T) {
 		t.Fatalf("SuspendCity: %v", err)
 	}
 
+	// city.toml must remain untouched — suspension lives in runtime state.
 	cfg := readTOML(t, path)
-	if !cfg.Workspace.Suspended {
-		t.Error("expected workspace to be suspended")
+	if cfg.Workspace.Suspended {
+		t.Error("expected city.toml workspace.suspended to remain unset")
+	}
+	if cfg.Workspace.SuspendedOnStart {
+		t.Error("expected city.toml workspace.suspended_on_start to remain unset")
+	}
+	st, err := suspensionstate.Load(fsys.OSFS{}, dir)
+	if err != nil {
+		t.Fatalf("suspensionstate.Load: %v", err)
+	}
+	if !suspensionstate.IsCitySuspended(st) {
+		t.Error("expected city to be suspended in runtime state")
 	}
 }
 
@@ -925,18 +1131,34 @@ func TestResumeCity(t *testing.T) {
 	dir := t.TempDir()
 	city := `[workspace]
 name = "test-city"
-suspended = true
+suspended_on_start = true
 `
 	path := writeTOML(t, dir, city)
+	want := true
+	if err := suspensionstate.SetCitySuspended(fsys.OSFS{}, dir, &want); err != nil {
+		t.Fatalf("pre-suspend: %v", err)
+	}
 	ed := configedit.NewEditor(fsys.OSFS{}, path)
 
 	if err := ed.ResumeCity(); err != nil {
 		t.Fatalf("ResumeCity: %v", err)
 	}
 
+	// city.toml suspended_on_start stays as committed default; explicit
+	// resume sticks in runtime state and wins at read time.
 	cfg := readTOML(t, path)
-	if cfg.Workspace.Suspended {
-		t.Error("expected workspace to not be suspended")
+	if !cfg.Workspace.SuspendedOnStart {
+		t.Error("expected workspace.suspended_on_start to remain set after resume")
+	}
+	st, err := suspensionstate.Load(fsys.OSFS{}, dir)
+	if err != nil {
+		t.Fatalf("suspensionstate.Load: %v", err)
+	}
+	if v, ok := suspensionstate.ExplicitCity(st); !ok || v {
+		t.Errorf("expected explicit resume in runtime state, got (%v, %v)", v, ok)
+	}
+	if suspensionstate.EffectiveCitySuspended(st, cfg.Workspace.SuspendedOnStart) {
+		t.Error("explicit resume in runtime state must beat workspace.suspended_on_start=true")
 	}
 }
 
@@ -1445,12 +1667,12 @@ provider = "legacy"
 
 func TestDeleteAgentSchema2LocalConventionRollsBackScaffoldWhenRemoveFails(t *testing.T) {
 	fs := fsys.NewFake()
-	fs.Files["/city/city.toml"] = []byte(`[workspace]
+	fs.Files["/city/city.toml"] = []byte(withTestProviderCatalog(`[workspace]
 
 [[patches.agent]]
 name = "coder"
 provider = "legacy"
-`)
+`))
 	fs.Files["/city/pack.toml"] = []byte("[pack]\nname = \"test-city\"\nschema = 2\n")
 	if err := fs.MkdirAll("/city/agents/coder", 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -1488,7 +1710,8 @@ provider = "legacy"
 
 func TestDeleteAgentSchema2LocalConventionWithoutPatchRollsBackScaffoldWhenRemoveFails(t *testing.T) {
 	fs := fsys.NewFake()
-	fs.Files["/city/city.toml"] = []byte("[workspace]\n")
+	initialCity := withTestProviderCatalog("[workspace]\n")
+	fs.Files["/city/city.toml"] = []byte(initialCity)
 	fs.Files["/city/pack.toml"] = []byte("[pack]\nname = \"test-city\"\nschema = 2\n")
 	if err := fs.MkdirAll("/city/agents/coder", 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -1517,7 +1740,7 @@ func TestDeleteAgentSchema2LocalConventionWithoutPatchRollsBackScaffoldWhenRemov
 			t.Fatalf("%s = %q, want restored %q", path, got, want)
 		}
 	}
-	if got := string(fs.Files["/city/city.toml"]); got != "[workspace]\n" {
+	if got := string(fs.Files["/city/city.toml"]); got != initialCity {
 		t.Fatalf("city.toml = %q, want unchanged", got)
 	}
 }
@@ -2349,6 +2572,34 @@ func TestMergeOrderOverridePreservesExistingTriggerOnPartialUpdate(t *testing.T)
 	}
 }
 
+func TestMergeOrderOverrideMergesEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	_ = ed.SetOrderOverride(config.OrderOverride{
+		Name: "health-check",
+		Env:  map[string]string{"KEEP": "source", "OVERRIDE": "source"},
+	})
+
+	err := ed.MergeOrderOverride(config.OrderOverride{
+		Name: "health-check",
+		Env:  map[string]string{"OVERRIDE": "city", "ADD": "city"},
+	})
+	if err != nil {
+		t.Fatalf("MergeOrderOverride: %v", err)
+	}
+
+	cfg := readTOML(t, path)
+	if len(cfg.Orders.Overrides) != 1 {
+		t.Fatalf("expected 1 override, got %d", len(cfg.Orders.Overrides))
+	}
+	env := cfg.Orders.Overrides[0].Env
+	if env["KEEP"] != "source" || env["OVERRIDE"] != "city" || env["ADD"] != "city" {
+		t.Fatalf("Env = %+v, want merged env", env)
+	}
+}
+
 func TestDeleteOrderOverride(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, minimalCity())
@@ -2378,6 +2629,37 @@ func TestDeleteOrderOverride_NotFound(t *testing.T) {
 	err := ed.DeleteOrderOverride("nonexistent", "")
 	if err == nil {
 		t.Fatal("expected error for deleting nonexistent override")
+	}
+}
+
+func TestMergeOrderOverrideMergesIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	tru := true
+	if err := ed.SetOrderOverride(config.OrderOverride{Name: "unrouted-feeder", Idempotent: &tru}); err != nil {
+		t.Fatalf("SetOrderOverride: %v", err)
+	}
+
+	// A partial merge that does not mention idempotent must PRESERVE it.
+	trig := "cooldown"
+	if err := ed.MergeOrderOverride(config.OrderOverride{Name: "unrouted-feeder", Trigger: &trig}); err != nil {
+		t.Fatalf("MergeOrderOverride: %v", err)
+	}
+	cfg := readTOML(t, path)
+	if got := cfg.Orders.Overrides[0].Idempotent; got == nil || !*got {
+		t.Fatalf("idempotent should be preserved through a partial merge, got %v", got)
+	}
+
+	// An explicit idempotent=false must be APPLIED through the merge.
+	fls := false
+	if err := ed.MergeOrderOverride(config.OrderOverride{Name: "unrouted-feeder", Idempotent: &fls}); err != nil {
+		t.Fatalf("MergeOrderOverride: %v", err)
+	}
+	cfg = readTOML(t, path)
+	if got := cfg.Orders.Overrides[0].Idempotent; got == nil || *got {
+		t.Fatalf("idempotent=false should be applied through merge, got %v", got)
 	}
 }
 

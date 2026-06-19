@@ -18,23 +18,21 @@ func loadConfigCommandCityConfig(cityPath string) (*config.City, *config.Provena
 	return loadCityConfigWithBuiltinPacks(cityPath, extraConfigFiles...)
 }
 
+// loadCityConfigWithBuiltinPacks loads the city config after refreshing the
+// materialized builtin packs. The includes are caller-supplied extras (e.g.
+// --config files); builtin packs themselves compose only through the explicit
+// city.toml includes written by gc init and repaired by gc doctor --fix.
 func loadCityConfigWithBuiltinPacks(cityPath string, includes ...string) (*config.City, *config.Provenance, error) {
-	allIncludes, err := cityConfigIncludesWithBuiltinPacks(cityPath, includes...)
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	if err := ensureBuiltinPacksForConfigLoad(fsys.OSFS{}, tomlPath, resolveLoadCityConfigWarningWriter()); err != nil {
+		return nil, nil, err
+	}
+	cfg, prov, err := config.LoadWithIncludes(fsys.OSFS{}, tomlPath, includes...)
 	if err != nil {
 		return nil, nil, err
 	}
-	return config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"), allIncludes...)
-}
-
-func cityConfigIncludesWithBuiltinPacks(cityPath string, includes ...string) ([]string, error) {
-	if err := MaterializeBuiltinPacks(cityPath); err != nil {
-		return nil, fmt.Errorf("materializing builtin packs: %w", err)
-	}
-	builtinIncludes := builtinPackIncludes(cityPath)
-	allIncludes := make([]string, 0, len(includes)+len(builtinIncludes))
-	allIncludes = append(allIncludes, includes...)
-	allIncludes = append(allIncludes, builtinIncludes...)
-	return allIncludes, nil
+	warnMissingRequiredBuiltinImports(fsys.OSFS{}, cfg, tomlPath, resolveLoadCityConfigWarningWriter())
+	return cfg, prov, nil
 }
 
 func newConfigCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -397,7 +395,10 @@ func validateLegacyFormulaConfigRoutes(cfg *config.City) []string {
 			errs = append(errs, fmt.Sprintf("formula %q: %v", name, err))
 			continue
 		}
-		if resolved.Version < 2 || resolved.Type != formula.TypeWorkflow {
+		if resolved.Type != formula.TypeWorkflow {
+			continue
+		}
+		if !formula.UsesGraphCompiler(resolved) {
 			continue
 		}
 		collectLegacyGraphAssigneeErrors(name, resolved.Steps, agentTargets, namedTargets, &errs)

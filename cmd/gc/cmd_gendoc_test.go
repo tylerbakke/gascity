@@ -40,12 +40,73 @@ func TestGenDocProducesMarkdown(t *testing.T) {
 		t.Error("hidden command gen-doc should not appear")
 	}
 
-	// Check basic structure.
-	if !strings.Contains(out, "# CLI Reference") {
-		t.Error("missing CLI Reference header")
+	// Check basic structure: frontmatter title, never a body H1 (Mintlify
+	// renders the title; a body H1 would duplicate it).
+	if !strings.Contains(out, `title: "CLI Reference"`) {
+		t.Error("missing CLI Reference frontmatter title")
+	}
+	if strings.Contains(out, "# CLI Reference") {
+		t.Error("body H1 duplicates the frontmatter title")
 	}
 	if !strings.Contains(out, "Auto-generated") {
 		t.Error("missing auto-generated note")
+	}
+}
+
+func TestGenDocImportAddDocumentsSourceLanes(t *testing.T) {
+	var buf bytes.Buffer
+	root := newRootCmd(&buf, &buf)
+
+	var md bytes.Buffer
+	if err := docgen.RenderCLIMarkdown(&md, root); err != nil {
+		t.Fatalf("RenderCLIMarkdown: %v", err)
+	}
+
+	section, ok := cliDocSection(md.String(), "gc import add")
+	if !ok {
+		t.Fatal("missing gc import add section")
+	}
+	for _, want := range []string{
+		"local paths outside git worktrees",
+		"remote git repositories",
+		"remote GitHub repository subpaths",
+		"Registry catalog handles are lookup shortcuts",
+		"source and optional version",
+		"local binding name",
+		"display/advisory metadata",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("gc import add docs missing %q:\n%s", want, section)
+		}
+	}
+}
+
+func TestGenDocImportAddExamplesAvoidRejectedSourceRefs(t *testing.T) {
+	var buf bytes.Buffer
+	root := newRootCmd(&buf, &buf)
+
+	var md bytes.Buffer
+	if err := docgen.RenderCLIMarkdown(&md, root); err != nil {
+		t.Fatalf("RenderCLIMarkdown: %v", err)
+	}
+
+	section, ok := cliDocSection(md.String(), "gc import add")
+	if !ok {
+		t.Fatal("missing gc import add section")
+	}
+	for _, line := range strings.Split(section, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "gc import add ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			t.Fatalf("gc import add example missing source: %q", line)
+		}
+		source := fields[3]
+		if isRemoteImportSource(source) && hasRepositoryRefInSource(source) {
+			t.Fatalf("gc import add example uses rejected source ref %q in:\n%s", source, section)
+		}
 	}
 }
 

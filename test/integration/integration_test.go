@@ -7,7 +7,9 @@
 // By default tests use tmux. Set GC_SESSION=subprocess to use the subprocess
 // provider instead (no tmux required).
 //
-// Session safety: all test cities use the "gctest-<8hex>" naming prefix.
+// Session safety: no-guard test cities use randomized 6-letter lowercase
+// names (see uniqueCityName) so they spread across distinct Dolt DB
+// prefixes instead of all collapsing to "gc".
 // Three layers of cleanup (pre-sweep, per-test t.Cleanup, post-sweep)
 // prevent orphan tmux sessions on developer boxes.
 package integration
@@ -89,12 +91,43 @@ func TestMain(m *testing.M) {
 
 	subprocess := os.Getenv("GC_SESSION") == "subprocess"
 
+	// Build gc binary to a temp directory.
+	tmpDir, err := os.MkdirTemp("", "gc-integration-*")
+	if err != nil {
+		panic("integration: creating temp dir: " + err.Error())
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create the tmux socket root under /tmp rather than $TMPDIR.
+	// On macOS, $TMPDIR is ~80 chars (/private/var/folders/…/T/); nesting
+	// tmux sockets inside it pushes socket paths past macOS's 104-byte limit.
+	// /tmp is world-writable on macOS, Linux, and CI runners.
+	tmuxSocketParent, tmuxParentErr := os.MkdirTemp("/tmp", "gct-")
+	tmuxSocketRoot := filepath.Join(tmpDir, "tmux")
+	if tmuxParentErr == nil {
+		tmuxSocketRoot = filepath.Join(tmuxSocketParent, "tmux")
+		if err := os.MkdirAll(tmuxSocketRoot, 0o700); err != nil {
+			os.RemoveAll(tmuxSocketParent)
+			tmuxSocketParent = ""
+			tmuxSocketRoot = filepath.Join(tmpDir, "tmux")
+		} else {
+			defer os.RemoveAll(tmuxSocketParent)
+		}
+	}
+	if err := tmuxtest.ConfigureProcessEnv(tmuxSocketRoot); err != nil {
+		panic("integration: configuring tmux test env: " + err.Error())
+	}
+
 	// Tmux check: skip all tests if tmux not available AND not using subprocess.
 	if !subprocess {
 		if _, err := exec.LookPath("tmux"); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			if tmuxSocketParent != "" {
+				_ = os.RemoveAll(tmuxSocketParent)
+			}
 			os.Exit(0)
 		}
-		// Pre-sweep: kill any orphaned gc-gctest-* sessions from prior crashes.
+		// Pre-sweep: kill this run's root plus stale sibling orphans.
 		tmuxtest.KillAllTestSessions(&mainTB{})
 	} else {
 		// Best-effort pre-sweep of stale subprocess integration cities and
@@ -103,13 +136,6 @@ func TestMain(m *testing.M) {
 	}
 	stopSignalSweeper := installIntegrationSignalSweeper(subprocess)
 	defer stopSignalSweeper()
-
-	// Build gc binary to a temp directory.
-	tmpDir, err := os.MkdirTemp("", "gc-integration-*")
-	if err != nil {
-		panic("integration: creating temp dir: " + err.Error())
-	}
-	defer os.RemoveAll(tmpDir)
 
 	testGCHome = filepath.Join(tmpDir, "gc-home")
 	if err := os.MkdirAll(testGCHome, 0o755); err != nil {
@@ -150,6 +176,10 @@ func TestMain(m *testing.M) {
 		realBDBinary, err = exec.LookPath("bd")
 		if err != nil {
 			// bd not available — skip all integration tests.
+			_ = os.RemoveAll(tmpDir)
+			if tmuxSocketParent != "" {
+				_ = os.RemoveAll(tmuxSocketParent)
+			}
 			os.Exit(0)
 		}
 	}
@@ -206,6 +236,10 @@ func TestMain(m *testing.M) {
 		sweepSubprocessTestProcesses()
 	}
 
+	_ = os.RemoveAll(tmpDir)
+	if tmuxSocketParent != "" {
+		_ = os.RemoveAll(tmuxSocketParent)
+	}
 	os.Exit(code)
 }
 
@@ -963,6 +997,7 @@ func integrationEnvFor(gcHome, runtimeDir string, useDolt bool) []string {
 	env = filterEnv(env, "BEADS_DOLT_PASSWORD")
 	env = filterEnv(env, "GC_SUPERVISOR_ENV")
 	env = filterEnv(env, "GC_SUPERVISOR_PRESERVE_SESSIONS_ON_SIGNAL")
+	env = filterEnv(env, "GC_SUPERVISOR_LOG_TEE")
 	env = filterEnv(env, "DOLT_HOST")
 	env = filterEnv(env, "DOLT_PORT")
 	env = filterEnv(env, "DOLT_USER")
@@ -1769,17 +1804,29 @@ mode = "on_demand"
 	if cfg.Workspace.Name != "test-city" {
 		t.Fatalf("Workspace.Name = %q, want test-city", cfg.Workspace.Name)
 	}
-	if len(cfg.Agents) != 1 || cfg.Agents[0].Name != "worker" {
-		t.Fatalf("Agents = %+v, want restored worker", cfg.Agents)
+	var explicitAgents []config.Agent
+	for _, agent := range cfg.Agents {
+		if !agent.Implicit {
+			explicitAgents = append(explicitAgents, agent)
+		}
 	}
-	if got := cfg.Agents[0].StartCommand; got != "VERSION=v2 sleep 3600" {
+	if len(explicitAgents) != 1 || explicitAgents[0].Name != "worker" {
+		t.Fatalf("explicit agents = %+v, want restored worker; all agents = %+v", explicitAgents, cfg.Agents)
+	}
+	if got := explicitAgents[0].StartCommand; got != "VERSION=v2 sleep 3600" {
 		t.Fatalf("StartCommand = %q, want updated command", got)
 	}
-	if len(cfg.NamedSessions) != 2 {
-		t.Fatalf("len(NamedSessions) = %d, want 2\ncity.toml:\n%s\npack.toml:\n%s", len(cfg.NamedSessions), cityData, packData)
+	var userNamedSessions []config.NamedSession
+	for _, ns := range cfg.NamedSessions {
+		if ns.Template != config.ControlDispatcherAgentName {
+			userNamedSessions = append(userNamedSessions, ns)
+		}
+	}
+	if len(userNamedSessions) != 2 {
+		t.Fatalf("len(userNamedSessions) = %d, want 2; all named sessions = %+v\ncity.toml:\n%s\npack.toml:\n%s", len(userNamedSessions), cfg.NamedSessions, cityData, packData)
 	}
 	var workerSession config.NamedSession
-	for _, ns := range cfg.NamedSessions {
+	for _, ns := range userNamedSessions {
 		if ns.QualifiedName() == "worker" {
 			workerSession = ns
 			break

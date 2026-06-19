@@ -1,5 +1,11 @@
 # Pack/City v2 Conformance Matrix
 
+> **Historical PackV2 design note.** This page preserves design history and
+> rollout rationale. For current pack authoring guidance, use
+> `docs/reference/specs/pack-spec.md`, `docs/guides/understanding-packs.md`,
+> and `docs/guides/shareable-packs.md`. When this note disagrees with shipped
+> behavior, prefer the current docs, generated reference, code, and tests.
+
 This document turns the reconciled pack/city v.next docs into an
 executable conformance plan for the current Pack/City v2 rollout.
 
@@ -17,7 +23,7 @@ Use the sources in this order when deciding what the suite should assert:
 
 1. [skew-analysis.md](skew-analysis.md) — release gating ledger for the
    current desired state
-2. [migrating-to-pack-vnext.md](../../../docs/guides/migrating-to-pack-vnext.md) —
+2. [shareable-packs.md](../../../docs/guides/shareable-packs.md) —
    migration-target behavior, but only where `skew-analysis.md` does not
    mark the surface missing, deferred, or non-gating
 3. [doc-agent-v2.md](doc-agent-v2.md) — prompt, template, fragment, and
@@ -61,6 +67,7 @@ These are settled enough, and implemented enough, to block CI now.
 | Template fragments | `template-fragments/` and `agents/<name>/template-fragments/` are discovered and rendered into template prompts | Unit + testscript | `cmd/gc/prompt.go` |
 | Agent-local auto-append bridge | `append_fragments` declared on an agent applies only to `.template.md` prompts and does nothing to plain `.md` prompts | Unit + testscript | `cmd/gc/prompt.go` |
 | `[agent_defaults]` auto-append bridge | `[agent_defaults].append_fragments` composes and auto-appends only for `.template.md` prompts | Unit + testscript | `internal/config/compose.go`, `cmd/gc/prompt.go` |
+| `[agent_defaults] provider` defaults | `agent_defaults.provider` is parsed, merged, fills agents that do not set `provider`, and counts as a configured provider for implicit agent injection | Unit | `internal/config/config.go` |
 | Agent defaults layering | `[agent_defaults]` is legal in both `pack.toml` and `city.toml`, with city winning on merge; runtime inheritance is gated only for fields the implementation actually applies today | Unit | `internal/config/compose.go`, `internal/config/config.go` |
 | Qualified patch targeting | imported agents can be targeted by qualified name in `[[patches.agent]]` | Unit | `internal/config/patch.go` |
 | Patch prompt template gating | An explicitly patched `prompt_template` path follows the same `.template.` rule as agent prompt files: `.template.md` renders, plain `.md` stays inert | Unit | `internal/config/patch.go`, `cmd/gc/prompt.go` |
@@ -98,7 +105,6 @@ unsettled to be reliable release gates.
 | Area | Current status | Why it is non-gating for now |
 |---|---|---|
 | `[defaults.rig.imports.<binding>]` loader support | documented intent, not implemented | Migration tooling may write it, but the loader does not yet honor it |
-| `[agent_defaults] provider` driving runtime provider selection | migration target is documented, but runtime behavior is not aligned enough to gate | Current implementation still resolves runtime defaults through `workspace.provider` / `ResolveProvider`; locking in the future rule now would create false failures |
 | `patches/` directory convention for imported prompt replacements | documented in v.next docs, not implemented | Current implementation still relies on explicit patch fields rather than full loader-discovered patch files |
 | Pack `skills/` discovery | documented, not implemented | First slice is current-city-pack only with list-only visibility; imported-pack catalogs are later |
 | `mcp/` TOML abstraction | documented, not implemented | Same first-slice scope as skills: current-city-pack only, list-only visibility first, provider projection later |

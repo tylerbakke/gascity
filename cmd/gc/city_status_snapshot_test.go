@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -202,11 +203,11 @@ func TestCityStatusNamedSessionSurfacesLookupErrorWhenSnapshotDegraded(t *testin
 	}
 
 	store := beads.NewMemStore()
-	degraded := newSessionBeadSnapshotWithError(nil, errors.New("loading session snapshot timed out after 20ms"))
+	degraded := newSessionBeadSnapshotWithError(errors.New("loading session snapshot timed out after 20ms"))
 
 	status := namedSessionStatusForCity(
 		"/home/user/city", cfg, store, degraded,
-		"city", "refinery", "on_demand", nil,
+		"city", "refinery", "on_demand", suspensionstate.State{}, nil,
 	)
 	if !strings.HasPrefix(status, "lookup error:") {
 		t.Fatalf("named session status = %q, want a 'lookup error: ...' prefix when snapshot is degraded", status)
@@ -239,7 +240,7 @@ func TestCityStatusNamedSessionsCleanSnapshotStillSilent(t *testing.T) {
 
 	status := namedSessionStatusForCity(
 		"/home/user/city", cfg, store, clean,
-		"city", "refinery", "on_demand", nil,
+		"city", "refinery", "on_demand", suspensionstate.State{}, nil,
 	)
 	if strings.HasPrefix(status, "lookup error:") {
 		t.Fatalf("named session status = %q, want cfg-derived status (no lookup error) when snapshot loaded cleanly", status)
@@ -267,6 +268,18 @@ type failingListStatusStore struct {
 func (s *failingListStatusStore) List(_ beads.ListQuery) ([]beads.Bead, error) {
 	s.listCalls++
 	return nil, errors.New("unexpected list")
+}
+
+type listCountingStatusStore struct {
+	*beads.MemStore
+	sessionLabelLists int
+}
+
+func (s *listCountingStatusStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == session.LabelSession {
+		s.sessionLabelLists++
+	}
+	return s.MemStore.List(query)
 }
 
 type blockingListStatusStore struct {
@@ -310,6 +323,30 @@ func TestCityStatusAgentObservationDoesNotResolveRuntimeNamesThroughStore(t *tes
 	}
 	if len(store.ids) != 0 {
 		t.Fatalf("status observation performed bead Get calls for runtime names: %v", store.ids)
+	}
+}
+
+func TestCityStatusFallbackListsSessionsOnce(t *testing.T) {
+	store := &listCountingStatusStore{MemStore: beads.NewMemStore()}
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "city"}}
+	const agentCount = 20
+	for i := 0; i < agentCount; i++ {
+		cfg.Agents = append(cfg.Agents, config.Agent{
+			Name:              fmt.Sprintf("agent-%02d", i),
+			MaxActiveSessions: intPtr(1),
+		})
+	}
+
+	var stderr bytes.Buffer
+	cityPath := filepath.Join(t.TempDir(), "city")
+	snapshot := collectCityStatusSnapshot(sp, cfg, cityPath, store, &stderr)
+
+	if got := store.sessionLabelLists; got != 1 {
+		t.Fatalf("List(session label) calls = %d, want 1", got)
+	}
+	if got := len(snapshot.Agents); got != agentCount {
+		t.Fatalf("snapshot agents = %d, want %d", got, agentCount)
 	}
 }
 

@@ -81,8 +81,9 @@ const (
 )
 
 var builtinProviderOrder = []string{
-	"claude", "codex", "gemini", "kimi", "kiro", "cursor", "copilot",
-	"amp", "opencode", "auggie", "pi", "omp",
+	"claude", "codex", "gemini", "grok", "kimi", "kiro", "cursor", "copilot",
+	"amp", "opencode", "mimocode", "groq", "cerebras", "auggie", "pi", "omp",
+	"antigravity",
 }
 
 var builtinProviderSpecs = map[string]BuiltinProviderSpec{
@@ -144,6 +145,7 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 				Type:  "select",
 				Choices: []BuiltinOptionChoice{
 					{Value: "", Label: "Default"},
+					{Value: "fable-5", Label: "Fable 5", FlagArgs: []string{"--model", "claude-fable-5"}, FlagAliases: [][]string{{"-m", "claude-fable-5"}}},
 					{Value: "opus", Label: "Opus", FlagArgs: []string{"--model", "claude-opus-4-8"}, FlagAliases: [][]string{{"-m", "claude-opus-4-8"}}},
 					{Value: "opus-4-7", Label: "Opus 4.7", FlagArgs: []string{"--model", "claude-opus-4-7"}, FlagAliases: [][]string{{"-m", "claude-opus-4-7"}}},
 					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "claude-sonnet-4-6"}, FlagAliases: [][]string{{"-m", "claude-sonnet-4-6"}}},
@@ -270,6 +272,82 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 			},
 		},
 	},
+	"grok": {
+		DisplayName: "Grok Build",
+		Command:     "grok",
+		OptionDefaults: map[string]string{
+			"permission_mode": "unrestricted",
+			"model":           "grok-composer-2.5-fast",
+		},
+		// The grok TUI accepts no positional or flag-delivered initial
+		// prompt (`-p/--single` is print-and-exit), so prompts are
+		// delivered via tmux send-keys once the TUI is ready.
+		//
+		// grok's input handler does not accept send-keys until ~5-6s after
+		// launch (TUI init: auth check + model-list load). Its prompt box
+		// renders earlier (~3s) but silently drops keystrokes until then, so
+		// ReadyPromptPrefix-based readiness detection can't be used here — the
+		// box would match and we'd send into a not-yet-listening TUI. A blind
+		// 5000ms delay raced that window: the initial nudge was lost and the
+		// worker idled forever at the welcome screen (never running `gc hook`).
+		// 12000ms clears the ready threshold with margin for spawn-time load.
+		// Empirically verified against grok 0.2.32: send-keys is dropped at 5s
+		// and lands reliably from ~6s onward.
+		PromptMode:       "none",
+		ReadyDelayMs:     12000,
+		ProcessNames:     []string{"grok"},
+		InstructionsFile: "AGENTS.md",
+		ResumeFlag:       "--resume",
+		ResumeStyle:      "flag",
+		PrintArgs:        []string{"-p"},
+		TitleModel:       "grok-composer-2.5-fast",
+		PermissionModes: map[string]string{
+			"default":      "--permission-mode default",
+			"auto-edit":    "--permission-mode acceptEdits",
+			"plan":         "--permission-mode plan",
+			"full-auto":    "--permission-mode dontAsk",
+			"unrestricted": "--permission-mode bypassPermissions",
+		},
+		OptionsSchema: []BuiltinProviderOption{
+			{
+				Key:     "permission_mode",
+				Label:   "Permission Mode",
+				Type:    "select",
+				Default: "unrestricted",
+				Choices: []BuiltinOptionChoice{
+					{Value: "default", Label: "Ask before actions", FlagArgs: []string{"--permission-mode", "default"}},
+					{Value: "auto-edit", Label: "Auto-approve edits", FlagArgs: []string{"--permission-mode", "acceptEdits"}},
+					{Value: "plan", Label: "Plan mode", FlagArgs: []string{"--permission-mode", "plan"}},
+					{Value: "full-auto", Label: "Full auto", FlagArgs: []string{"--permission-mode", "dontAsk"}},
+					{Value: "unrestricted", Label: "Bypass permissions", FlagArgs: []string{"--permission-mode", "bypassPermissions"}},
+				},
+			},
+			{
+				Key:   "effort",
+				Label: "Effort",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default"},
+					{Value: "low", Label: "Low", FlagArgs: []string{"--effort", "low"}},
+					{Value: "medium", Label: "Medium", FlagArgs: []string{"--effort", "medium"}},
+					{Value: "high", Label: "High", FlagArgs: []string{"--effort", "high"}},
+					{Value: "xhigh", Label: "Extra High", FlagArgs: []string{"--effort", "xhigh"}},
+					{Value: "max", Label: "Max", FlagArgs: []string{"--effort", "max"}},
+				},
+			},
+			{
+				Key:   "model",
+				Label: "Model",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default"},
+					{Value: "grok-build", Label: "Grok Build", FlagArgs: []string{"--model", "grok-build"}, FlagAliases: [][]string{{"-m", "grok-build"}}},
+					{Value: "grok-composer-2.5", Label: "Grok Composer 2.5", FlagArgs: []string{"--model", "grok-composer-2.5"}, FlagAliases: [][]string{{"-m", "grok-composer-2.5"}}},
+					{Value: "grok-composer-2.5-fast", Label: "Grok Composer 2.5 Fast", FlagArgs: []string{"--model", "grok-composer-2.5-fast"}, FlagAliases: [][]string{{"-m", "grok-composer-2.5-fast"}}},
+				},
+			},
+		},
+	},
 	"kimi": {
 		DisplayName:          "Kimi Code CLI",
 		Command:              "kimi",
@@ -279,6 +357,7 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		ProcessNames:         []string{"kimi", "python"},
 		AcceptStartupDialogs: boolPtr(false),
 		SupportsACP:          true,
+		SupportsHooks:        true,
 		InstructionsFile:     "AGENTS.md",
 		ResumeFlag:           "--session",
 		ResumeStyle:          "flag",
@@ -299,16 +378,19 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		},
 	},
 	"kiro": {
-		DisplayName:      "Kiro",
-		Command:          "kiro-cli",
-		Args:             []string{"chat", "--no-interactive", "--agent", "gascity", "--trust-all-tools"},
-		PromptMode:       "arg",
-		ReadyDelayMs:     5000,
-		ProcessNames:     []string{"kiro-cli", "kiro", "node"},
-		SupportsACP:      true,
-		SupportsHooks:    true,
-		InstructionsFile: "AGENTS.md",
-		ACPArgs:          []string{"acp", "--agent", "gascity"},
+		DisplayName:  "Kiro",
+		Command:      "kiro-cli",
+		Args:         []string{"chat", "--no-interactive", "--agent", "gascity", "--trust-all-tools"},
+		PromptMode:   "arg",
+		ReadyDelayMs: 5000,
+		ProcessNames: []string{"kiro-cli", "kiro", "node"},
+		// kiro launches with --trust-all-tools and never shows trust/permission
+		// dialogs, so skip the 7-dialog startup polling (~56s/call, run twice).
+		AcceptStartupDialogs: boolPtr(false),
+		SupportsACP:          true,
+		SupportsHooks:        true,
+		InstructionsFile:     "AGENTS.md",
+		ACPArgs:              []string{"acp", "--agent", "gascity"},
 	},
 	"cursor": {
 		DisplayName:       "Cursor Agent",
@@ -403,6 +485,106 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 			},
 		},
 	},
+	"mimocode": {
+		// MiMo Code (Xiaomi's `mimo` CLI) is an OpenCode fork. Permission
+		// defaults are already permissive for bash/edit; only the
+		// question/plan interaction gates block headless runs, so
+		// --never-ask-questions is the only default arg needed. The flag is
+		// not taken by the `mimo acp` subcommand, so sessions default to the
+		// CLI transport (config.ProviderSessionCreateTransport) and ACP stays
+		// explicit opt-in until `mimo acp` has equivalent non-interactive
+		// conformance coverage. No mimocode.json is staged — staging one
+		// would clobber user config.
+		DisplayName:      "MiMo Code",
+		Command:          "mimo",
+		Args:             []string{"--never-ask-questions"},
+		PromptMode:       "flag",
+		PromptFlag:       "--prompt",
+		ReadyDelayMs:     8000,
+		ProcessNames:     []string{"mimo", ".mimocode", "node", "bun"},
+		SupportsACP:      true,
+		SupportsHooks:    true,
+		InstructionsFile: "AGENTS.md",
+		ResumeFlag:       "--session",
+		ResumeStyle:      "flag",
+		ACPArgs:          []string{"acp"},
+		OptionsSchema: []BuiltinProviderOption{
+			{
+				Key:   "model",
+				Label: "Model",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default"},
+					{Value: "mimo/mimo-auto", Label: "MiMo Auto (free)", FlagArgs: []string{"--model", "mimo/mimo-auto"}, FlagAliases: [][]string{{"-m", "mimo/mimo-auto"}}},
+					{Value: "xiaomi/mimo-v2.5-pro", Label: "MiMo V2.5 Pro", FlagArgs: []string{"--model", "xiaomi/mimo-v2.5-pro"}, FlagAliases: [][]string{{"-m", "xiaomi/mimo-v2.5-pro"}}},
+					{Value: "xiaomi/mimo-v2.5", Label: "MiMo V2.5", FlagArgs: []string{"--model", "xiaomi/mimo-v2.5"}, FlagAliases: [][]string{{"-m", "xiaomi/mimo-v2.5"}}},
+					{Value: "xiaomi-token-plan-sgp/mimo-v2.5-pro", Label: "MiMo V2.5 Pro (Token Plan SGP)", FlagArgs: []string{"--model", "xiaomi-token-plan-sgp/mimo-v2.5-pro"}, FlagAliases: [][]string{{"-m", "xiaomi-token-plan-sgp/mimo-v2.5-pro"}}},
+					{Value: "xiaomi-token-plan-sgp/mimo-v2.5", Label: "MiMo V2.5 (Token Plan SGP)", FlagArgs: []string{"--model", "xiaomi-token-plan-sgp/mimo-v2.5"}, FlagAliases: [][]string{{"-m", "xiaomi-token-plan-sgp/mimo-v2.5"}}},
+				},
+			},
+		},
+	},
+	"cerebras": {
+		DisplayName: "Cerebras (OpenCode)",
+		Command:     "opencode",
+		OptionDefaults: map[string]string{
+			"model": "cerebras/gpt-oss-120b",
+		},
+		PromptMode:       "none",
+		ReadyDelayMs:     8000,
+		ProcessNames:     []string{"opencode", "node", "bun"},
+		Env:              map[string]string{"OPENCODE_PERMISSION": `{"*":"allow"}`},
+		SupportsACP:      true,
+		SupportsHooks:    true,
+		InstructionsFile: "AGENTS.md",
+		ACPArgs:          []string{"acp"},
+		TitleModel:       "cerebras/gpt-oss-120b",
+		OptionsSchema: []BuiltinProviderOption{
+			{
+				Key:   "model",
+				Label: "Model",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default"},
+					{Value: "cerebras/gpt-oss-120b", Label: "GPT-OSS 120B", FlagArgs: []string{"--model", "cerebras/gpt-oss-120b"}},
+					{Value: "cerebras/zai-glm-4.7", Label: "GLM 4.7", FlagArgs: []string{"--model", "cerebras/zai-glm-4.7"}},
+					{Value: "cerebras/qwen-3-235b-a22b-instruct-2507", Label: "Qwen 3 235B A22B Instruct", FlagArgs: []string{"--model", "cerebras/qwen-3-235b-a22b-instruct-2507"}},
+				},
+			},
+		},
+	},
+	"groq": {
+		DisplayName: "Groq (OpenCode)",
+		Command:     "opencode",
+		OptionDefaults: map[string]string{
+			"model": "groq/openai/gpt-oss-120b",
+		},
+		PromptMode:       "none",
+		ReadyDelayMs:     8000,
+		ProcessNames:     []string{"opencode", "node", "bun"},
+		Env:              map[string]string{"OPENCODE_PERMISSION": `{"*":"allow"}`},
+		SupportsACP:      true,
+		SupportsHooks:    true,
+		InstructionsFile: "AGENTS.md",
+		ACPArgs:          []string{"acp"},
+		TitleModel:       "groq/openai/gpt-oss-20b",
+		OptionsSchema: []BuiltinProviderOption{
+			{
+				Key:   "model",
+				Label: "Model",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default"},
+					{Value: "groq/openai/gpt-oss-120b", Label: "GPT-OSS 120B", FlagArgs: []string{"--model", "groq/openai/gpt-oss-120b"}},
+					{Value: "groq/openai/gpt-oss-20b", Label: "GPT-OSS 20B", FlagArgs: []string{"--model", "groq/openai/gpt-oss-20b"}},
+					{Value: "groq/llama-3.3-70b-versatile", Label: "Llama 3.3 70B Versatile", FlagArgs: []string{"--model", "groq/llama-3.3-70b-versatile"}},
+					{Value: "groq/llama-3.1-8b-instant", Label: "Llama 3.1 8B Instant", FlagArgs: []string{"--model", "groq/llama-3.1-8b-instant"}},
+					{Value: "groq/qwen/qwen3-32b", Label: "Qwen 3 32B", FlagArgs: []string{"--model", "groq/qwen/qwen3-32b"}},
+					{Value: "groq/meta-llama/llama-4-scout-17b-16e-instruct", Label: "Llama 4 Scout 17B", FlagArgs: []string{"--model", "groq/meta-llama/llama-4-scout-17b-16e-instruct"}},
+				},
+			},
+		},
+	},
 	"auggie": {
 		// Hook mechanism: Auggie CLI exposes SessionStart, SessionEnd,
 		// Stop, PreToolUse, PostToolUse hooks via ~/.augment/settings.json
@@ -457,6 +639,47 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		ResumeFlag:       "--resume",
 		ResumeStyle:      "flag",
 	},
+	"antigravity": {
+		DisplayName: "Antigravity",
+		Command:     "agy",
+		OptionDefaults: map[string]string{
+			"permission_mode": "unrestricted",
+		},
+		PromptMode:        "flag",
+		PromptFlag:        "--prompt-interactive",
+		ReadyPromptPrefix: "> ",
+		ReadyDelayMs:      5000,
+		ProcessNames:      []string{"agy"},
+		SupportsHooks:     true,
+		InstructionsFile:  "AGENTS.md",
+		ResumeFlag:        "--conversation",
+		ResumeStyle:       "flag",
+		PrintArgs:         []string{"--print"},
+		PermissionModes: map[string]string{
+			"unrestricted": "--dangerously-skip-permissions",
+		},
+		OptionsSchema: []BuiltinProviderOption{
+			{
+				Key:     "permission_mode",
+				Label:   "Permission Mode",
+				Type:    "select",
+				Default: "unrestricted",
+				Choices: []BuiltinOptionChoice{
+					{Value: "unrestricted", Label: "Bypass permissions", FlagArgs: []string{"--dangerously-skip-permissions"}},
+					{Value: "standard", Label: "Standard (prompt for permissions)", FlagArgs: []string{}},
+				},
+			},
+			{
+				Key:   "sandbox",
+				Label: "Sandbox",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default"},
+					{Value: "enabled", Label: "Enabled", FlagArgs: []string{"--sandbox"}},
+				},
+			},
+		},
+	},
 }
 
 // BuiltinProviderOrder returns provider names in canonical order.
@@ -493,8 +716,12 @@ func CanonicalProfileIdentity(profile string) (ProfileIdentity, bool) {
 		return newProfileIdentity(profile, "kimi"), true
 	case "opencode/tmux-cli":
 		return newProfileIdentity(profile, "opencode"), true
+	case "mimocode/tmux-cli":
+		return newProfileIdentity(profile, "mimocode"), true
 	case "pi/tmux-cli":
 		return newProfileIdentity(profile, "pi"), true
+	case "antigravity/tmux-cli":
+		return newProfileIdentity(profile, "antigravity"), true
 	default:
 		return ProfileIdentity{}, false
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -23,6 +24,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionacp "github.com/gastownhall/gascity/internal/runtime/acp"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
+	sessioncloudflare "github.com/gastownhall/gascity/internal/runtime/cloudflare"
 	sessionexec "github.com/gastownhall/gascity/internal/runtime/exec"
 	sessionhybrid "github.com/gastownhall/gascity/internal/runtime/hybrid"
 	sessionk8s "github.com/gastownhall/gascity/internal/runtime/k8s"
@@ -148,6 +150,8 @@ func newSessionProviderByName(name string, sc config.SessionConfig, cityName, ci
 		return sessionacp.NewProvider(cfg), nil
 	case "t3bridge":
 		return sessiont3bridge.NewProvider(), nil
+	case "cloudflare":
+		return sessioncloudflare.NewProvider()
 	case "k8s":
 		return sessionk8s.NewProvider()
 	case "hybrid":
@@ -179,12 +183,12 @@ func newSessionProviderForCity(cfg *config.City, cityPath string) runtime.Provid
 
 func newStatusSessionProviderForCity(cfg *config.City, cityPath string) runtime.Provider {
 	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
-	return newSessionProviderFromContext(ctx, nil)
+	return newBoundedStatusProvider(newSessionProviderFromContext(ctx, nil))
 }
 
 func newStatusSessionProviderForCityWithSnapshot(cfg *config.City, cityPath string, sessionBeads *sessionBeadSnapshot) runtime.Provider {
 	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
-	return newSessionProviderFromContext(ctx, sessionBeads)
+	return newBoundedStatusProvider(newSessionProviderFromContext(ctx, sessionBeads))
 }
 
 func registerStatusProviderACPRoutes(sp runtime.Provider, snapshot *sessionBeadSnapshot, cityName string, cfg *config.City) {
@@ -485,7 +489,7 @@ func scopedBeadsProviderOverride(cityPath, scopeRoot string) (string, bool) {
 
 // normalizeRawBeadsProvider maps the city-managed gc-beads-bd wrapper back to
 // the logical "bd" provider for command-time store selection. Managed sessions
-// set GC_BEADS=exec:<cityPath>/.gc/system/packs/bd/assets/scripts/gc-beads-bd.sh
+// set GC_BEADS=exec:<cityPath>/.gc/scripts/gc-beads-bd.sh (the stable shim)
 // so lifecycle operations stay pinned to the city's Dolt server, but general
 // gc commands still need a CRUD-capable store.
 func normalizeRawBeadsProvider(cityPath, provider string) string {
@@ -494,7 +498,7 @@ func normalizeRawBeadsProvider(cityPath, provider string) string {
 		return provider
 	}
 	script := strings.TrimSpace(strings.TrimPrefix(provider, "exec:"))
-	if samePath(script, gcBeadsBdScriptPath(cityPath)) || samePath(script, legacyGcBeadsBdScriptPath(cityPath)) {
+	if samePath(script, gcBeadsBdScriptPath(cityPath)) || samePath(script, legacySystemPacksGcBeadsBdScriptPath(cityPath)) {
 		return "bd"
 	}
 	return provider
@@ -518,19 +522,35 @@ func rawBeadsProviderFromConfig(cityPath string) string {
 	return "bd"
 }
 
+func configuredBeadsBackendValue(cityPath string) string {
+	if v := strings.TrimSpace(os.Getenv("GC_BEADS_BACKEND")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(peekBeadsBackend(filepath.Join(cityPath, "city.toml")))
+}
+
+func beadsBackend(cityPath string) string {
+	backend := strings.ToLower(configuredBeadsBackendValue(cityPath))
+	if backend == "" {
+		return "dolt"
+	}
+	return backend
+}
+
+func cityUsesDoltliteBeadsBackend(cityPath string) bool {
+	return beadsBackend(cityPath) == "doltlite"
+}
+
 func providerUsesBdStoreContract(provider string) bool {
-	provider = strings.TrimSpace(provider)
-	if provider == "" || provider == "bd" {
-		return true
-	}
-	if strings.HasPrefix(provider, "exec:") && execProviderBase(provider) == "gc-beads-bd" {
-		return true
-	}
-	return false
+	return contract.ProviderUsesBDContract(provider)
 }
 
 func cityUsesBdStoreContract(cityPath string) bool {
 	return providerUsesBdStoreContract(rawBeadsProvider(cityPath))
+}
+
+func cityUsesManagedDoltBeadsLifecycle(cityPath string) bool {
+	return cityUsesBdStoreContract(cityPath) && !cityUsesDoltliteBeadsBackend(cityPath)
 }
 
 func rawBeadsProviderForScope(scopeRoot, cityPath string) string {
@@ -624,7 +644,7 @@ func bdProviderMismatchHint(scopeRoot, resolvedProvider string) string {
 }
 
 // beadsProvider returns the bead store provider name for lifecycle operations.
-// Maps "bd" → "exec:<cityPath>/.gc/system/packs/bd/assets/scripts/gc-beads-bd.sh"
+// Maps "bd" → "exec:<cityPath>/.gc/scripts/gc-beads-bd.sh" (the stable shim)
 // so all lifecycle operations route through the exec: protocol. Other providers
 // pass through unchanged.
 //
@@ -639,14 +659,21 @@ func beadsProvider(cityPath string) string {
 	return raw
 }
 
-// gcBeadsBdScriptPath returns the absolute path to the gc-beads-bd script
-// inside the materialized bd pack (.gc/system/packs/bd/assets/scripts/).
+// gcBeadsBdScriptPath returns the stable per-city gc-beads-bd entrypoint:
+// a generated shim under .gc/scripts that execs the bundled bd pack's
+// lifecycle script in the user-global repo cache. The shim path never
+// changes across binary upgrades, so session environments and provider
+// pins stay valid while the cache target moves with the binary content.
 func gcBeadsBdScriptPath(cityPath string) string {
-	return filepath.Join(cityPath, citylayout.SystemPacksRoot, "bd", "assets", "scripts", "gc-beads-bd.sh")
+	return filepath.Join(cityPath, ".gc", "scripts", "gc-beads-bd.sh")
 }
 
-func legacyGcBeadsBdScriptPath(cityPath string) string {
-	return filepath.Join(cityPath, ".gc", "scripts", "gc-beads-bd.sh")
+// legacySystemPacksGcBeadsBdScriptPath is the retired materialized-pack
+// location (.gc/system/packs/bd/assets/scripts). Sessions and provider
+// pins created by older binaries may still reference it; provider
+// normalization keeps matching it.
+func legacySystemPacksGcBeadsBdScriptPath(cityPath string) string {
+	return filepath.Join(cityPath, citylayout.SystemPacksRoot, "bd", "assets", "scripts", "gc-beads-bd.sh")
 }
 
 // mailProviderName returns the mail provider name.
@@ -670,15 +697,17 @@ func mailProviderNameForCity(cityPath string) string {
 
 // newMailProvider returns a mail.Provider based on the mail provider name
 // (env var → city.toml → default) and the given bead store (used as the
-// default backend). Shared callers such as the API use the stateless beadmail
-// provider so long-lived instances observe fresh session state.
+// default backend). Shared callers such as the API use the cached beadmail
+// provider so repeated mail reads reuse one session-topology enumeration.
+// The cache lasts for the provider lifetime; topology refresh for long-lived
+// providers is handled by rebuilding the provider.
 //
 //   - "fake" → in-memory fake (all ops succeed)
 //   - "fail" → broken fake (all ops return errors)
 //   - "exec:<script>" → user-supplied script (absolute path or PATH lookup)
 //   - default → beadmail (backed by beads.Store, no subprocess)
 func newMailProvider(store beads.Store) mail.Provider {
-	return newMailProviderNamed(mailProviderName(), store, false)
+	return newMailProviderNamed(mailProviderName(), store, true)
 }
 
 func newCommandMailProvider(store beads.Store) mail.Provider {
