@@ -20,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
+	"github.com/gastownhall/gascity/internal/telemetry"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 	"github.com/gastownhall/gascity/internal/worker"
 	"github.com/spf13/cobra"
@@ -2234,6 +2235,7 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 		Message: "killed",
 		Payload: api.SessionLifecyclePayloadJSON(sessionID, "", "killed"),
 	})
+	recordSessionKillStop(bead, beadErr, cfg)
 	if asJSON {
 		if err := writeSessionActionJSON(stdout, sessionActionResult{
 			Action:    "kill",
@@ -2246,6 +2248,24 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 	}
 	fmt.Fprintf(stdout, "Session %s killed.\n", sessionID) //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+// recordSessionKillStop records gc.agent.stops.total for a manual
+// "gc session kill", beside the SessionStopped emission. The metric reason is
+// "killed" to match the adjacent SessionStopped event payload so operators can
+// distinguish a manual kill from an ordinary stop. Skip-on-unknown: when the
+// session bead failed to load (or carries no bounded session name) nothing is
+// recorded — an unknown identity must not become a garbage metric label.
+// Purely observational: it never influences control flow or the exit code.
+func recordSessionKillStop(bead beads.Bead, beadErr error, cfg *config.City) {
+	if beadErr != nil {
+		return
+	}
+	sessionName := strings.TrimSpace(bead.Metadata["session_name"])
+	if sessionName == "" {
+		return
+	}
+	telemetry.RecordAgentStop(context.Background(), sessionName, sessionAgentMetricIdentity(bead, cfg), "killed", nil)
 }
 
 func sessionKillRuntimeAlreadyInactive(bead beads.Bead, sp runtime.Provider) bool {

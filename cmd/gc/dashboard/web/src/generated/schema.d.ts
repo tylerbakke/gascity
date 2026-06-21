@@ -797,23 +797,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v0/city/{cityName}/fleet/status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get v0 city by city name fleet status */
-        get: operations["get-v0-city-by-city-name-fleet-status"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v0/city/{cityName}/formula/{name}": {
         parameters: {
             query?: never;
@@ -2268,6 +2251,11 @@ export interface components {
             /** @description Assignee name. */
             assignee?: string;
         };
+        BeadClaimRejectedPayload: {
+            attempted_claimant: string;
+            bead_id: string;
+            existing_claimant: string;
+        };
         BeadCreateInputBody: {
             /** @description Assigned agent. */
             assignee?: string;
@@ -2360,6 +2348,7 @@ export interface components {
          */
         BindingStatus: "active" | "ended";
         BoundEventPayload: {
+            agent_name?: string;
             conversation_id: string;
             provider: string;
             session_id: string;
@@ -2485,14 +2474,6 @@ export interface components {
             valid: boolean;
             /** @description Validation warnings. */
             warnings: string[] | null;
-        };
-        ControllerRestartPayload: {
-            city: string;
-            /** Format: int64 */
-            drain_duration_ms: number;
-            forced: boolean;
-            new_binary_sha?: string;
-            old_binary_sha?: string;
         };
         ConversationGroupParticipant: {
             GroupID: string;
@@ -2687,7 +2668,7 @@ export interface components {
             /** @description Event type. */
             type: string;
         };
-        EventPayload: components["schemas"]["AdapterEventPayload"] | components["schemas"]["BeadEventPayload"] | components["schemas"]["BeadWorktreeReapSkippedPayload"] | components["schemas"]["BeadWorktreeReapedPayload"] | components["schemas"]["BoundEventPayload"] | components["schemas"]["CityCreateSucceededPayload"] | components["schemas"]["CityLifecyclePayload"] | components["schemas"]["CityUnregisterSucceededPayload"] | components["schemas"]["ControllerRestartPayload"] | components["schemas"]["GroupCreatedEventPayload"] | components["schemas"]["InboundEventPayload"] | components["schemas"]["MailEventPayload"] | components["schemas"]["NoPayload"] | components["schemas"]["OutboundEventPayload"] | components["schemas"]["PostgresCredentialResolvedPayload"] | components["schemas"]["ProjectIdentityStampedPayload"] | components["schemas"]["Record"] | components["schemas"]["RequestFailedPayload"] | components["schemas"]["RotatedPayload"] | components["schemas"]["SessionCreateSucceededPayload"] | components["schemas"]["SessionDrainAckedWithAssignedWorkPayload"] | components["schemas"]["SessionLifecyclePayload"] | components["schemas"]["SessionMessageSucceededPayload"] | components["schemas"]["SessionResetStalledPayload"] | components["schemas"]["SessionStrandedPayload"] | components["schemas"]["SessionSubmitSucceededPayload"] | components["schemas"]["StoreDiskCriticalPayload"] | components["schemas"]["StoreDiskWarnPayload"] | components["schemas"]["StoreMaintenanceDonePayload"] | components["schemas"]["StoreMaintenanceFailedPayload"] | components["schemas"]["SupervisorFSPressureSkippedTickPayload"] | components["schemas"]["SupervisorRequestPayload"] | components["schemas"]["SupervisorShutdownPayload"] | components["schemas"]["SupervisorStartedPayload"] | components["schemas"]["UnboundEventPayload"] | components["schemas"]["WorkerOperationEventPayload"];
+        EventPayload: components["schemas"]["AdapterEventPayload"] | components["schemas"]["BeadClaimRejectedPayload"] | components["schemas"]["BeadEventPayload"] | components["schemas"]["BeadWorktreeReapSkippedPayload"] | components["schemas"]["BeadWorktreeReapedPayload"] | components["schemas"]["BoundEventPayload"] | components["schemas"]["CityCreateSucceededPayload"] | components["schemas"]["CityLifecyclePayload"] | components["schemas"]["CityUnregisterSucceededPayload"] | components["schemas"]["GroupCreatedEventPayload"] | components["schemas"]["InboundEventPayload"] | components["schemas"]["MailEventPayload"] | components["schemas"]["NoPayload"] | components["schemas"]["OutboundChannelMismatchPayload"] | components["schemas"]["OutboundEventPayload"] | components["schemas"]["PostgresCredentialResolvedPayload"] | components["schemas"]["ProjectIdentityStampedPayload"] | components["schemas"]["Record"] | components["schemas"]["RequestFailedPayload"] | components["schemas"]["RotatedPayload"] | components["schemas"]["SessionCreateSucceededPayload"] | components["schemas"]["SessionDrainAckedWithAssignedWorkPayload"] | components["schemas"]["SessionLifecyclePayload"] | components["schemas"]["SessionMessageSucceededPayload"] | components["schemas"]["SessionResetStalledPayload"] | components["schemas"]["SessionStrandedPayload"] | components["schemas"]["SessionSubmitSucceededPayload"] | components["schemas"]["StoreDiskCriticalPayload"] | components["schemas"]["StoreDiskWarnPayload"] | components["schemas"]["StoreMaintenanceDonePayload"] | components["schemas"]["StoreMaintenanceFailedPayload"] | components["schemas"]["SupervisorFSPressureSkippedTickPayload"] | components["schemas"]["SupervisorRequestPayload"] | components["schemas"]["SupervisorShutdownPayload"] | components["schemas"]["SupervisorStartedPayload"] | components["schemas"]["UnboundEventPayload"] | components["schemas"]["WorkerOperationEventPayload"];
         EventRotateAnchor: {
             /**
              * Format: int64
@@ -2778,14 +2759,16 @@ export interface components {
             provider: string;
         };
         ExtMsgBindInputBody: {
+            /** @description Configured agent identity to bind; its live session is resolved at delivery time, cold-waking one when none is live (mutually exclusive with session_id). */
+            agent_name?: string;
             /** @description Conversation to bind. */
             conversation?: components["schemas"]["ConversationRef"];
             /** @description Optional binding metadata. */
             metadata?: {
                 [key: string]: string;
             };
-            /** @description Session ID to bind. */
-            session_id: string;
+            /** @description Session ID to bind (mutually exclusive with agent_name). */
+            session_id?: string;
         };
         ExtMsgGroupEnsureInputBody: {
             /** @description Default handle for the group. */
@@ -2857,10 +2840,12 @@ export interface components {
             unbound: components["schemas"]["SessionBindingRecord"][] | null;
         };
         ExtMsgUnbindInputBody: {
-            /** @description Conversation to unbind (nil = all). */
+            /** @description Configured agent identity to unbind. */
+            agent_name?: string;
+            /** @description Conversation to unbind (nil = filter by session_id/agent_name). */
             conversation?: components["schemas"]["ConversationRef"];
             /** @description Session ID to unbind. */
-            session_id: string;
+            session_id?: string;
         };
         ExternalActor: {
             display_name: string;
@@ -2899,90 +2884,6 @@ export interface components {
             MaxPeerTriggeredPublishes: number;
             /** Format: int64 */
             MaxTotalPeerDeliveries: number;
-        };
-        FleetHost: {
-            /** @description Configured primary address (Tailscale, LAN, or DNS). */
-            address: string;
-            /** @description Address the probe actually reached (may differ from address when public-fallback fired). */
-            address_used: string;
-            /**
-             * Format: double
-             * @description Free disk space in GiB on the host. Null when unreachable.
-             */
-            disk_free_gb: number | null;
-            /**
-             * Format: int64
-             * @description Running dolt server count on the host. Null when unreachable.
-             */
-            dolt_servers: number | null;
-            /** @description Probe error string for unreachable hosts. Null on success. */
-            error: string | null;
-            /** @description Bus event name the snapshot row came from (e.g. "fleet.host"). */
-            event: string;
-            /** @description gc binary version reported by the host. Null when unreachable or not installed. */
-            gc_version: string | null;
-            /** @description Logical host name (matches the fleet inventory). */
-            host: string;
-            /**
-             * Format: double
-             * @description Free memory in GiB on the host. Null when unreachable.
-             */
-            mem_free_gb: number | null;
-            /** @description True when the probe successfully completed. */
-            reachable: boolean;
-            /** @description Host role label (e.g. primary-control-plane, worker, dr-target). */
-            role: string;
-            /**
-             * Format: int64
-             * @description Active session count on the host. Null when unreachable.
-             */
-            sessions_active: number | null;
-            /** @description True when a gc supervisor is running on the host. Null when unreachable. */
-            supervisor_running: boolean | null;
-            /** @description Transport the probe used (local, tailscale, public-fallback, unreachable). */
-            via: string;
-        };
-        FleetStatusBody: {
-            /**
-             * Format: int64
-             * @description Age of the snapshot in seconds, computed from generated_at.
-             */
-            age_sec: number;
-            /**
-             * Format: date-time
-             * @description When the snapshot was written by the fleet-status order.
-             */
-            generated_at: string;
-            /** @description Per-host probe rows from the snapshot. */
-            hosts: components["schemas"]["FleetHost"][] | null;
-            /** @description True when the snapshot is older than the freshness window (30 minutes). The data is still returned so the dashboard can render an honest "last seen" rather than disappearing. */
-            stale: boolean;
-            /** @description Aggregated fleet summary from the snapshot. */
-            summary: components["schemas"]["FleetSummary"];
-        };
-        FleetSummary: {
-            /** @description Bus event name (e.g. "fleet.summary"). */
-            event: string;
-            /**
-             * Format: date-time
-             * @description When the snapshot was written.
-             */
-            generated_at: string;
-            /**
-             * Format: int64
-             * @description Number of hosts the probe successfully reached.
-             */
-            reachable: number;
-            /**
-             * Format: int64
-             * @description Total host count probed.
-             */
-            total: number;
-            /**
-             * Format: int64
-             * @description Number of hosts the probe could not reach.
-             */
-            unreachable: number;
         };
         FormulaDetailResponse: {
             deps: components["schemas"]["FormulaPreviewEdgeResponse"][] | null;
@@ -3122,12 +3023,14 @@ export interface components {
             actor: string;
             conversation_id: string;
             provider: string;
+            target_agent?: string;
             target_session: string;
         };
         InboundResult: {
             Binding: components["schemas"]["SessionBindingRecord"];
             GroupRoute: components["schemas"]["GroupRouteDecision"];
             Message: components["schemas"]["ExternalInboundMessage"];
+            TargetAgentName: string;
             TargetSessionID: string;
             TranscriptEntry: components["schemas"]["ConversationTranscriptRecord"];
         };
@@ -3581,6 +3484,12 @@ export interface components {
             items: components["schemas"]["MonitorFeedItemResponse"][] | null;
             partial: boolean;
             partial_errors?: string[] | null;
+        };
+        OutboundChannelMismatchPayload: {
+            conversation_id: string;
+            owner_session: string;
+            posting_session: string;
+            provider: string;
         };
         OutboundEventPayload: {
             conversation_id: string;
@@ -4037,6 +3946,7 @@ export interface components {
             agents: components["schemas"]["AgentMapping"][] | null;
         };
         SessionBindingRecord: {
+            AgentName: string;
             /** Format: int64 */
             BindingGeneration: number;
             /** Format: date-time */
@@ -4723,7 +4633,24 @@ export interface components {
          * Typed city event stream envelope
          * @description Discriminated union of city event stream envelopes. Each variant constrains the envelope type and payload schema together.
          */
-        TypedEventStreamEnvelope: components["schemas"]["TypedEventStreamEnvelopeBeadClosed"] | components["schemas"]["TypedEventStreamEnvelopeBeadCreated"] | components["schemas"]["TypedEventStreamEnvelopeBeadDeleted"] | components["schemas"]["TypedEventStreamEnvelopeBeadUpdated"] | components["schemas"]["TypedEventStreamEnvelopeBeadWorktreeReapSkipped"] | components["schemas"]["TypedEventStreamEnvelopeBeadWorktreeReaped"] | components["schemas"]["TypedEventStreamEnvelopeCityCreated"] | components["schemas"]["TypedEventStreamEnvelopeCityResumed"] | components["schemas"]["TypedEventStreamEnvelopeCitySuspended"] | components["schemas"]["TypedEventStreamEnvelopeCityUnregisterRequested"] | components["schemas"]["TypedEventStreamEnvelopeControllerRestart"] | components["schemas"]["TypedEventStreamEnvelopeControllerStarted"] | components["schemas"]["TypedEventStreamEnvelopeControllerStopped"] | components["schemas"]["TypedEventStreamEnvelopeConvoyClosed"] | components["schemas"]["TypedEventStreamEnvelopeConvoyCreated"] | components["schemas"]["TypedEventStreamEnvelopeEmergencyAcked"] | components["schemas"]["TypedEventStreamEnvelopeEmergencySignaled"] | components["schemas"]["TypedEventStreamEnvelopeEventsRotated"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgAdapterAdded"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgAdapterRemoved"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgBound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgGroupCreated"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgInbound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgOutbound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgUnbound"] | components["schemas"]["TypedEventStreamEnvelopeGcStoreDiskCritical"] | components["schemas"]["TypedEventStreamEnvelopeGcStoreDiskWarn"] | components["schemas"]["TypedEventStreamEnvelopeGcStoreMaintenanceDone"] | components["schemas"]["TypedEventStreamEnvelopeGcStoreMaintenanceFailed"] | components["schemas"]["TypedEventStreamEnvelopeMailArchived"] | components["schemas"]["TypedEventStreamEnvelopeMailDeleted"] | components["schemas"]["TypedEventStreamEnvelopeMailMarkedRead"] | components["schemas"]["TypedEventStreamEnvelopeMailMarkedUnread"] | components["schemas"]["TypedEventStreamEnvelopeMailRead"] | components["schemas"]["TypedEventStreamEnvelopeMailReplied"] | components["schemas"]["TypedEventStreamEnvelopeMailSent"] | components["schemas"]["TypedEventStreamEnvelopeOrderCompleted"] | components["schemas"]["TypedEventStreamEnvelopeOrderFailed"] | components["schemas"]["TypedEventStreamEnvelopeOrderFired"] | components["schemas"]["TypedEventStreamEnvelopePgCredentialResolved"] | components["schemas"]["TypedEventStreamEnvelopeProjectIdentityStamped"] | components["schemas"]["TypedEventStreamEnvelopeProviderSwapped"] | components["schemas"]["TypedEventStreamEnvelopeRequestFailed"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultCityCreate"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultCityUnregister"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultSessionCreate"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultSessionMessage"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultSessionSubmit"] | components["schemas"]["TypedEventStreamEnvelopeSessionColdStartTimeout"] | components["schemas"]["TypedEventStreamEnvelopeSessionCrashed"] | components["schemas"]["TypedEventStreamEnvelopeSessionDrainAckedWithAssignedWork"] | components["schemas"]["TypedEventStreamEnvelopeSessionDraining"] | components["schemas"]["TypedEventStreamEnvelopeSessionIdleKilled"] | components["schemas"]["TypedEventStreamEnvelopeSessionMaxAgeKilled"] | components["schemas"]["TypedEventStreamEnvelopeSessionQuarantined"] | components["schemas"]["TypedEventStreamEnvelopeSessionResetStalled"] | components["schemas"]["TypedEventStreamEnvelopeSessionStopped"] | components["schemas"]["TypedEventStreamEnvelopeSessionStranded"] | components["schemas"]["TypedEventStreamEnvelopeSessionSuspended"] | components["schemas"]["TypedEventStreamEnvelopeSessionUndrained"] | components["schemas"]["TypedEventStreamEnvelopeSessionUpdated"] | components["schemas"]["TypedEventStreamEnvelopeSessionWoke"] | components["schemas"]["TypedEventStreamEnvelopeSessionWorkQueryFailed"] | components["schemas"]["TypedEventStreamEnvelopeSupervisorFsPressureSkippedTick"] | components["schemas"]["TypedEventStreamEnvelopeSupervisorRequest"] | components["schemas"]["TypedEventStreamEnvelopeSupervisorShutdownRequested"] | components["schemas"]["TypedEventStreamEnvelopeSupervisorStarted"] | components["schemas"]["TypedEventStreamEnvelopeWorkerOperation"] | components["schemas"]["TypedEventStreamEnvelopeCustom"];
+        TypedEventStreamEnvelope: components["schemas"]["TypedEventStreamEnvelopeBeadClaimRejected"] | components["schemas"]["TypedEventStreamEnvelopeBeadClosed"] | components["schemas"]["TypedEventStreamEnvelopeBeadCreated"] | components["schemas"]["TypedEventStreamEnvelopeBeadDeleted"] | components["schemas"]["TypedEventStreamEnvelopeBeadUpdated"] | components["schemas"]["TypedEventStreamEnvelopeBeadWorktreeReapSkipped"] | components["schemas"]["TypedEventStreamEnvelopeBeadWorktreeReaped"] | components["schemas"]["TypedEventStreamEnvelopeCityCreated"] | components["schemas"]["TypedEventStreamEnvelopeCityResumed"] | components["schemas"]["TypedEventStreamEnvelopeCitySuspended"] | components["schemas"]["TypedEventStreamEnvelopeCityUnregisterRequested"] | components["schemas"]["TypedEventStreamEnvelopeControllerStarted"] | components["schemas"]["TypedEventStreamEnvelopeControllerStopped"] | components["schemas"]["TypedEventStreamEnvelopeConvoyClosed"] | components["schemas"]["TypedEventStreamEnvelopeConvoyCreated"] | components["schemas"]["TypedEventStreamEnvelopeEmergencyAcked"] | components["schemas"]["TypedEventStreamEnvelopeEmergencySignaled"] | components["schemas"]["TypedEventStreamEnvelopeEventsRotated"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgAdapterAdded"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgAdapterRemoved"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgBound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgGroupCreated"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgInbound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgOutbound"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgOutboundChannelMismatch"] | components["schemas"]["TypedEventStreamEnvelopeExtmsgUnbound"] | components["schemas"]["TypedEventStreamEnvelopeGcStoreDiskCritical"] | components["schemas"]["TypedEventStreamEnvelopeGcStoreDiskWarn"] | components["schemas"]["TypedEventStreamEnvelopeGcStoreMaintenanceDone"] | components["schemas"]["TypedEventStreamEnvelopeGcStoreMaintenanceFailed"] | components["schemas"]["TypedEventStreamEnvelopeMailArchived"] | components["schemas"]["TypedEventStreamEnvelopeMailDeleted"] | components["schemas"]["TypedEventStreamEnvelopeMailMarkedRead"] | components["schemas"]["TypedEventStreamEnvelopeMailMarkedUnread"] | components["schemas"]["TypedEventStreamEnvelopeMailRead"] | components["schemas"]["TypedEventStreamEnvelopeMailReplied"] | components["schemas"]["TypedEventStreamEnvelopeMailSent"] | components["schemas"]["TypedEventStreamEnvelopeOrderCompleted"] | components["schemas"]["TypedEventStreamEnvelopeOrderFailed"] | components["schemas"]["TypedEventStreamEnvelopeOrderFired"] | components["schemas"]["TypedEventStreamEnvelopePgCredentialResolved"] | components["schemas"]["TypedEventStreamEnvelopeProjectIdentityStamped"] | components["schemas"]["TypedEventStreamEnvelopeProviderSwapped"] | components["schemas"]["TypedEventStreamEnvelopeRequestFailed"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultCityCreate"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultCityUnregister"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultSessionCreate"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultSessionMessage"] | components["schemas"]["TypedEventStreamEnvelopeRequestResultSessionSubmit"] | components["schemas"]["TypedEventStreamEnvelopeSessionColdStartTimeout"] | components["schemas"]["TypedEventStreamEnvelopeSessionCrashed"] | components["schemas"]["TypedEventStreamEnvelopeSessionDrainAckedWithAssignedWork"] | components["schemas"]["TypedEventStreamEnvelopeSessionDraining"] | components["schemas"]["TypedEventStreamEnvelopeSessionIdleKilled"] | components["schemas"]["TypedEventStreamEnvelopeSessionMaxAgeKilled"] | components["schemas"]["TypedEventStreamEnvelopeSessionQuarantined"] | components["schemas"]["TypedEventStreamEnvelopeSessionResetStalled"] | components["schemas"]["TypedEventStreamEnvelopeSessionStopped"] | components["schemas"]["TypedEventStreamEnvelopeSessionStranded"] | components["schemas"]["TypedEventStreamEnvelopeSessionSuspended"] | components["schemas"]["TypedEventStreamEnvelopeSessionUndrained"] | components["schemas"]["TypedEventStreamEnvelopeSessionUpdated"] | components["schemas"]["TypedEventStreamEnvelopeSessionWoke"] | components["schemas"]["TypedEventStreamEnvelopeSessionWorkQueryFailed"] | components["schemas"]["TypedEventStreamEnvelopeSupervisorFsPressureSkippedTick"] | components["schemas"]["TypedEventStreamEnvelopeSupervisorRequest"] | components["schemas"]["TypedEventStreamEnvelopeSupervisorShutdownRequested"] | components["schemas"]["TypedEventStreamEnvelopeSupervisorStarted"] | components["schemas"]["TypedEventStreamEnvelopeWorkerOperation"] | components["schemas"]["TypedEventStreamEnvelopeCustom"];
+        /** TypedEventStreamEnvelope bead.claim_rejected */
+        TypedEventStreamEnvelopeBeadClaimRejected: {
+            actor: string;
+            message?: string;
+            payload: components["schemas"]["BeadClaimRejectedPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "bead.claim_rejected";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
         /** TypedEventStreamEnvelope bead.closed */
         TypedEventStreamEnvelopeBeadClosed: {
             actor: string;
@@ -4892,23 +4819,6 @@ export interface components {
              * @enum {string}
              */
             type: "city.unregister_requested";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
-        /** TypedEventStreamEnvelope controller.restart */
-        TypedEventStreamEnvelopeControllerRestart: {
-            actor: string;
-            message?: string;
-            payload: components["schemas"]["ControllerRestartPayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "controller.restart";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
         /** TypedEventStreamEnvelope controller.started */
@@ -5147,6 +5057,23 @@ export interface components {
              * @enum {string}
              */
             type: "extmsg.outbound";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedEventStreamEnvelope extmsg.outbound_channel_mismatch */
+        TypedEventStreamEnvelopeExtmsgOutboundChannelMismatch: {
+            actor: string;
+            message?: string;
+            payload: components["schemas"]["OutboundChannelMismatchPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "extmsg.outbound_channel_mismatch";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
         /** TypedEventStreamEnvelope extmsg.unbound */
@@ -5901,7 +5828,25 @@ export interface components {
          * Typed supervisor event stream envelope
          * @description Discriminated union of supervisor event stream envelopes. Each variant constrains the envelope type and payload schema together and includes the source city.
          */
-        TypedTaggedEventStreamEnvelope: components["schemas"]["TypedTaggedEventStreamEnvelopeBeadClosed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadDeleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadUpdated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadWorktreeReapSkipped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadWorktreeReaped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityResumed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCitySuspended"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityUnregisterRequested"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerRestart"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerStarted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerStopped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeConvoyClosed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeConvoyCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeEmergencyAcked"] | components["schemas"]["TypedTaggedEventStreamEnvelopeEmergencySignaled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeEventsRotated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgAdapterAdded"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgAdapterRemoved"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgBound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgGroupCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgInbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgOutbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgUnbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeGcStoreDiskCritical"] | components["schemas"]["TypedTaggedEventStreamEnvelopeGcStoreDiskWarn"] | components["schemas"]["TypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone"] | components["schemas"]["TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailArchived"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailDeleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailMarkedRead"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailMarkedUnread"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailRead"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailReplied"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailSent"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderCompleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderFired"] | components["schemas"]["TypedTaggedEventStreamEnvelopePgCredentialResolved"] | components["schemas"]["TypedTaggedEventStreamEnvelopeProjectIdentityStamped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeProviderSwapped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultCityCreate"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultCityUnregister"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultSessionCreate"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultSessionMessage"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionColdStartTimeout"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionCrashed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionDrainAckedWithAssignedWork"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionDraining"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionIdleKilled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionQuarantined"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionResetStalled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionStopped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionStranded"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionSuspended"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionUndrained"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionUpdated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionWoke"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionWorkQueryFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSupervisorFsPressureSkippedTick"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSupervisorRequest"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSupervisorShutdownRequested"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSupervisorStarted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeWorkerOperation"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCustom"];
+        TypedTaggedEventStreamEnvelope: components["schemas"]["TypedTaggedEventStreamEnvelopeBeadClaimRejected"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadClosed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadDeleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadUpdated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadWorktreeReapSkipped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeBeadWorktreeReaped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityResumed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCitySuspended"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCityUnregisterRequested"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerStarted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeControllerStopped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeConvoyClosed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeConvoyCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeEmergencyAcked"] | components["schemas"]["TypedTaggedEventStreamEnvelopeEmergencySignaled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeEventsRotated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgAdapterAdded"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgAdapterRemoved"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgBound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgGroupCreated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgInbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgOutbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgOutboundChannelMismatch"] | components["schemas"]["TypedTaggedEventStreamEnvelopeExtmsgUnbound"] | components["schemas"]["TypedTaggedEventStreamEnvelopeGcStoreDiskCritical"] | components["schemas"]["TypedTaggedEventStreamEnvelopeGcStoreDiskWarn"] | components["schemas"]["TypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone"] | components["schemas"]["TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailArchived"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailDeleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailMarkedRead"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailMarkedUnread"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailRead"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailReplied"] | components["schemas"]["TypedTaggedEventStreamEnvelopeMailSent"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderCompleted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeOrderFired"] | components["schemas"]["TypedTaggedEventStreamEnvelopePgCredentialResolved"] | components["schemas"]["TypedTaggedEventStreamEnvelopeProjectIdentityStamped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeProviderSwapped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultCityCreate"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultCityUnregister"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultSessionCreate"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultSessionMessage"] | components["schemas"]["TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionColdStartTimeout"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionCrashed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionDrainAckedWithAssignedWork"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionDraining"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionIdleKilled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionQuarantined"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionResetStalled"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionStopped"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionStranded"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionSuspended"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionUndrained"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionUpdated"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionWoke"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSessionWorkQueryFailed"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSupervisorFsPressureSkippedTick"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSupervisorRequest"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSupervisorShutdownRequested"] | components["schemas"]["TypedTaggedEventStreamEnvelopeSupervisorStarted"] | components["schemas"]["TypedTaggedEventStreamEnvelopeWorkerOperation"] | components["schemas"]["TypedTaggedEventStreamEnvelopeCustom"];
+        /** TypedTaggedEventStreamEnvelope bead.claim_rejected */
+        TypedTaggedEventStreamEnvelopeBeadClaimRejected: {
+            actor: string;
+            city: string;
+            message?: string;
+            payload: components["schemas"]["BeadClaimRejectedPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "bead.claim_rejected";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
         /** TypedTaggedEventStreamEnvelope bead.closed */
         TypedTaggedEventStreamEnvelopeBeadClosed: {
             actor: string;
@@ -6080,24 +6025,6 @@ export interface components {
              * @enum {string}
              */
             type: "city.unregister_requested";
-            workflow?: components["schemas"]["WorkflowEventProjection"];
-        };
-        /** TypedTaggedEventStreamEnvelope controller.restart */
-        TypedTaggedEventStreamEnvelopeControllerRestart: {
-            actor: string;
-            city: string;
-            message?: string;
-            payload: components["schemas"]["ControllerRestartPayload"];
-            /** Format: int64 */
-            seq: number;
-            subject?: string;
-            /** Format: date-time */
-            ts: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "controller.restart";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
         /** TypedTaggedEventStreamEnvelope controller.started */
@@ -6350,6 +6277,24 @@ export interface components {
              * @enum {string}
              */
             type: "extmsg.outbound";
+            workflow?: components["schemas"]["WorkflowEventProjection"];
+        };
+        /** TypedTaggedEventStreamEnvelope extmsg.outbound_channel_mismatch */
+        TypedTaggedEventStreamEnvelopeExtmsgOutboundChannelMismatch: {
+            actor: string;
+            city: string;
+            message?: string;
+            payload: components["schemas"]["OutboundChannelMismatchPayload"];
+            /** Format: int64 */
+            seq: number;
+            subject?: string;
+            /** Format: date-time */
+            ts: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "extmsg.outbound_channel_mismatch";
             workflow?: components["schemas"]["WorkflowEventProjection"];
         };
         /** TypedTaggedEventStreamEnvelope extmsg.unbound */
@@ -9859,40 +9804,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExtMsgUnbindBody"];
-                };
-            };
-            /** @description Error */
-            default: {
-                headers: {
-                    "X-GC-Request-Id": components["headers"]["X-GC-Request-Id"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ErrorModel"];
-                };
-            };
-        };
-    };
-    "get-v0-city-by-city-name-fleet-status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description City name. */
-                cityName: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    "X-GC-Request-Id": components["headers"]["X-GC-Request-Id"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["FleetStatusBody"];
                 };
             };
             /** @description Error */

@@ -61,8 +61,19 @@ var (
 	workflowServeIdlePollAttempts  = 3
 	workflowServeWakeSweepInterval = 1 * time.Second
 	workflowServeMaxIdleSleep      = 30 * time.Second
-	workflowServeWaitForWake       = waitForRelevantWorkflowWakeWithTrace
-	workflowTraceNow               = time.Now
+	// workflowServeWakeDebounce is the coalescing window opened once the first
+	// relevant event wakes the --follow loop. Additional buffered events that
+	// arrive during the window are drained and folded into the same wake so a
+	// burst of N bead.* events (e.g. an mc-wisp-* event storm) collapses into a
+	// single work/ready re-scan instead of N heavy per-event Dolt scans. This is
+	// a fixed (max-wait) window, so a lone relevant wake also waits out the
+	// window before its drain; the delay is intentional and small relative to
+	// the 1–30s idle sleeps it replaces. Set it to 0 to disable coalescing and
+	// restore one-event-one-drain. Injectable so tests can shrink it. Fixes
+	// gastownhall/gascity#3206.
+	workflowServeWakeDebounce = 250 * time.Millisecond
+	workflowServeWaitForWake  = waitForRelevantWorkflowWakeWithTrace
+	workflowTraceNow          = time.Now
 	// The trace helper is intentionally process-global because workflowTracef
 	// does not carry per-invocation context. Nested installs (serve ->
 	// runControlDispatcherWithStore) reuse the active dedup map so one bad trace
@@ -507,6 +518,7 @@ func runWorkflowServeFollow(agentCfg config.Agent, cityPath, storePath, workQuer
 	go pumpWorkflowEvents(done, watcher, eventCh)
 
 	idleSweeps := 0
+	var pendingWakeErr error
 	for {
 		drainResult, err := drainWorkflowServeWork(agentCfg, cityPath, storePath, workQuery, workEnv, stderr)
 		if err != nil {
@@ -525,6 +537,13 @@ func runWorkflowServeFollow(agentCfg config.Agent, cityPath, storePath, workQuer
 			workflowTracef("serve drain-transient-retry agent=%s err=%v", agentCfg.QualifiedName(), err)
 			drainResult = workflowServeDrainResult{}
 		}
+		if pendingWakeErr != nil {
+			// The previous wait observed a relevant event and then a fatal
+			// watcher error in the same coalescing window. The drain above is
+			// the one re-scan that wake promised, so the observed work is now
+			// serviced; surface the watcher error to end the loop.
+			return pendingWakeErr
+		}
 		if drainResult.processedAny || drainResult.pendingAny {
 			idleSweeps = 0
 		}
@@ -539,7 +558,17 @@ func runWorkflowServeFollow(agentCfg config.Agent, cityPath, storePath, workQuer
 		)
 		eventWake, err := workflowServeWaitForWake(eventCh, sleepDur, idleSweeps)
 		if err != nil {
-			return err
+			if !eventWake {
+				// Fatal stream error with no relevant event observed: nothing to
+				// re-scan, so terminate immediately.
+				return err
+			}
+			// A relevant event was observed just before the fatal error. Loop
+			// once more so the next drain services that wake, then surface the
+			// error on the following iteration.
+			pendingWakeErr = err
+			idleSweeps = 0
+			continue
 		}
 		switch {
 		case eventWake, drainResult.pendingAny:
@@ -593,7 +622,23 @@ func waitForRelevantWorkflowWakeWithTrace(eventCh <-chan workflowWatchResult, sl
 				} else {
 					workflowTracef("serve wake-event type=%s subject=%s", res.evt.Type, res.evt.Subject)
 				}
-				return true, nil
+				// Coalesce a burst: keep draining buffered events for a short
+				// debounce window so N relevant events collapse into one drain.
+				// runWorkflowServeFollow does exactly one drain per return=true,
+				// so the trailing events are already covered by that single
+				// re-scan — no event is dropped, only batched.
+				coalesced, coalesceErr := coalesceWorkflowWakeBurst(eventCh)
+				if coalesced > 0 {
+					workflowTracef("serve wake-coalesce extra=%d debounce=%s", coalesced, workflowServeWakeDebounce)
+				}
+				// Report the wake even when a fatal stream error arrived during
+				// the coalescing window: a relevant event was already observed,
+				// so runWorkflowServeFollow must still perform the one re-scan it
+				// promised for that wake before terminating. Surfacing
+				// (true, err) lets the caller drain the observed wake and then
+				// exit on the error, instead of stranding newly-ready work until
+				// a dispatcher restart re-scans.
+				return true, coalesceErr
 			}
 			workflowTracef("serve ignore-event type=%s subject=%s", res.evt.Type, res.evt.Subject)
 		case <-timer.C:
@@ -603,6 +648,36 @@ func waitForRelevantWorkflowWakeWithTrace(eventCh <-chan workflowWatchResult, sl
 				workflowTracef("serve wake-sweep")
 			}
 			return false, nil
+		}
+	}
+}
+
+// coalesceWorkflowWakeBurst drains additional buffered events from eventCh for
+// the workflowServeWakeDebounce window after a relevant event has already
+// decided to wake the loop. It returns the number of extra events it folded
+// into this wake so the caller emits a single drain for the whole burst, plus
+// any watcher error encountered while draining. The caller pairs that error
+// with the already-observed wake (returning true, err) so the serve loop still
+// performs the one promised re-scan before terminating on a fatal stream
+// failure. Events are only batched here, never dropped: the caller's single
+// re-scan already reflects every drained event.
+func coalesceWorkflowWakeBurst(eventCh <-chan workflowWatchResult) (int, error) {
+	if workflowServeWakeDebounce <= 0 {
+		return 0, nil
+	}
+	debounce := time.NewTimer(workflowServeWakeDebounce)
+	defer debounce.Stop()
+
+	coalesced := 0
+	for {
+		select {
+		case res := <-eventCh:
+			if res.err != nil {
+				return coalesced, res.err
+			}
+			coalesced++
+		case <-debounce.C:
+			return coalesced, nil
 		}
 	}
 }

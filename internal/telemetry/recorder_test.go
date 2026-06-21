@@ -17,8 +17,8 @@ import (
 // the current (noop) global MeterProvider during tests.
 func resetInstruments(t *testing.T) {
 	t.Helper()
-	instOnce = sync.Once{}
-	t.Cleanup(func() { instOnce = sync.Once{} })
+	ResetInstrumentsForTest()
+	t.Cleanup(ResetInstrumentsForTest)
 }
 
 // --- helper functions ---
@@ -97,8 +97,8 @@ func TestRecordAgentStop(t *testing.T) {
 	resetInstruments(t)
 	ctx := context.Background()
 
-	RecordAgentStop(ctx, "gc-test-agent1", "orphan", nil)
-	RecordAgentStop(ctx, "gc-test-agent2", "drift", errors.New("stop error"))
+	RecordAgentStop(ctx, "gc-test-session1", "gc-test-agent1", "orphan", nil)
+	RecordAgentStop(ctx, "gc-test-session2", "gc-test-agent2", "drift", errors.New("stop error"))
 }
 
 func TestRecordAgentCrash(t *testing.T) {
@@ -127,8 +127,8 @@ func TestRecordReconcileCycle(t *testing.T) {
 	resetInstruments(t)
 	ctx := context.Background()
 
-	RecordReconcileCycle(ctx, 3, 1, 2)
-	RecordReconcileCycle(ctx, 0, 0, 0)
+	RecordReconcileCycle(ctx, 3)
+	RecordReconcileCycle(ctx, 0)
 }
 
 func TestRecordNudge(t *testing.T) {
