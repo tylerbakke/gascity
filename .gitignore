@@ -29,6 +29,11 @@ cmd/gc/.runtime/
 !/.claude/
 /.claude/*
 !/.claude/skills/
+# gc-generated core skills (regenerated each run; not source). Tracking them
+# left the gascity tree perpetually "dirty", which made the maintainer
+# fork-sync skip every cycle (skipped-dirty-tree). Keep authored skills
+# (e.g. gascity-docs) tracked; ignore only the generated core.gc-* set.
+/.claude/skills/core.gc-*
 
 # sync-project-agents writes local migration backups here; don't commit them.
 .agents/migration/
