@@ -27,6 +27,7 @@ func TestDecorateGraphWorkflowRecipeSubstitutesRouteTargetsWithinRigContext(t *t
 		},
 	}
 	config.InjectImplicitAgents(cfg)
+	addTestControlDispatcherAgents(cfg, "", "frontend")
 
 	defaultTarget := "codex"
 	recipe := &formula.Recipe{
@@ -169,12 +170,13 @@ type = "task"
 	store := &graphApplySpyStore{MemStore: beads.NewMemStore()}
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
-		Daemon:    config.DaemonConfig{FormulaV2: true},
+		Daemon:    config.DaemonConfig{FormulaV2: boolPtr(true)},
 		Agents: []config.Agent{
 			{Name: "worker", MaxActiveSessions: intPtr(1)},
 		},
 	}
 	config.InjectImplicitAgents(cfg)
+	addTestControlDispatcherAgents(cfg, "", "frontend")
 
 	deps := slingDeps{
 		CityName: "test-city",

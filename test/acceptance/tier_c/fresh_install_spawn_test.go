@@ -244,6 +244,12 @@ func configureFreshInitClaudePool(t *testing.T, c *helpers.City) {
 		`min_active_sessions = 0`,
 		`max_active_sessions = 1`,
 	)
+	promptPath := filepath.Join(helpers.FindModuleRoot(), "internal", "bootstrap", "packs", "core", "assets", "prompts", "pool-worker.md")
+	prompt, err := os.ReadFile(promptPath)
+	require.NoError(t, err, "read canonical pool-worker prompt")
+	prompt = append(prompt, []byte("\n## Acceptance Fixture\n\nFor file-writing tasks in this acceptance test, create or update the requested file in the city directory before closing the work bead.\n")...)
+	err = os.WriteFile(filepath.Join(c.Dir, "agents", "claude", "prompt.template.md"), []byte(prompt), 0o644)
+	require.NoError(t, err, "write claude test prompt")
 }
 
 func runGCWithTimeout(timeout time.Duration, env *helpers.Env, dir string, args ...string) (string, error) {

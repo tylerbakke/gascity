@@ -72,7 +72,7 @@
             "city",
             "rig"
           ],
-          "description": "Scope defines where this agent is instantiated: \"city\" (one per city)\nor \"rig\" (one per rig, the default). Only meaningful for pack-defined\nagents; inline agents in city.toml use Dir directly."
+          "description": "Scope defines where this agent is instantiated: \"city\" (one per city) or\n\"rig\" (one per rig). Omit the field for an unscoped agent instantiated in\nboth city and rig expansion contexts. Only meaningful for pack-defined\nagents; inline agents in city.toml use Dir directly."
         },
         "suspended": {
           "type": "boolean",
@@ -103,6 +103,10 @@
         "provider": {
           "type": "string",
           "description": "Provider names the provider preset to use for this agent."
+        },
+        "upstream": {
+          "type": "string",
+          "description": "Upstream selects the model-serving endpoint (a key in [upstreams]) for\nthis agent — WHO serves the model. \"\" (default) falls back to\nagent_defaults.upstream; if still empty, no upstream env is injected\n(ambient behavior). Switching it relaunches the agent in the warm box."
         },
         "start_command": {
           "type": "string",
@@ -341,6 +345,10 @@
           "type": "string",
           "description": "Model is the parsed/composed default model name for agents\n(e.g., \"claude-sonnet-4-6\"), but it is not yet auto-applied at\nruntime. Agents with their own model override would take precedence."
         },
+        "upstream": {
+          "type": "string",
+          "description": "Upstream is the default model-serving endpoint (a key in [upstreams])\nfor agents that do not set their own upstream (Phase C — the Upstream\naxis). Applied to agents with an empty Upstream by ApplyAgentDefaults."
+        },
         "wake_mode": {
           "type": "string",
           "enum": [
@@ -455,6 +463,10 @@
         "provider": {
           "type": "string",
           "description": "Provider overrides the provider name."
+        },
+        "upstream": {
+          "type": "string",
+          "description": "Upstream overrides the model-serving endpoint selection (Phase C)."
         },
         "args": {
           "items": {
@@ -732,6 +744,10 @@
         "provider": {
           "type": "string",
           "description": "Provider overrides the provider name."
+        },
+        "upstream": {
+          "type": "string",
+          "description": "Upstream overrides the model-serving endpoint selection (Phase C)."
         },
         "args": {
           "items": {
@@ -1039,6 +1055,13 @@
           "type": "object",
           "description": "Providers defines named provider presets for agent startup."
         },
+        "upstreams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/UpstreamSpec"
+          },
+          "type": "object",
+          "description": "Upstreams defines named model-serving endpoint presets selectable per\nagent via the Upstream axis (Phase C). Each maps a name → serving env\n(base URL + credential refs); see UpstreamSpec."
+        },
         "imports": {
           "additionalProperties": {
             "$ref": "#/$defs/Import"
@@ -1090,6 +1113,10 @@
         "events": {
           "$ref": "#/$defs/EventsConfig",
           "description": "Events configures the events provider backend."
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageConfig",
+          "description": "Usage configures the usage-fact sink backend."
         },
         "dolt": {
           "$ref": "#/$defs/DoltConfig",
@@ -1182,7 +1209,7 @@
       "properties": {
         "formula_v2": {
           "type": "boolean",
-          "description": "FormulaV2 enables formula compiler v2 workflow infrastructure: the\ncontrol-dispatcher implicit agent and on-demand named session,\ncompiler-v2 workflow compilation, and batch graph-apply bead creation.\nThe implicit dispatcher follows normal session idle-sleep policy.\nRequires bd with --graph support. Default: true. Set false only for cities\npinned to formula compiler v1.",
+          "description": "FormulaV2 enables formula compiler v2 workflow infrastructure:\ncompiler-v2 workflow compilation, batch graph-apply bead creation, and\nrouting to the core pack's control-dispatcher worker.\nRequires bd with --graph support. Default: ENABLED. A nil pointer means\nthe default-on behavior and is OMITTED from generated configs (so\nauto-generated city.toml files never pin the default and never\naccidentally write formula_v2=false); an explicit formula_v2=false (or\nthe deprecated graph_workflows=false alias) is preserved as a non-nil\nfalse. Read the effective value via FormulaV2Enabled(), never the field.",
           "default": true
         },
         "graph_workflows": {
@@ -1782,7 +1809,7 @@
             "city",
             "rig"
           ],
-          "description": "Scope defines where this named session is instantiated in pack\nexpansion: \"city\" (one per city) or \"rig\" (one per rig)."
+          "description": "Scope defines where this named session is instantiated in pack\nexpansion: \"city\" (one per city) or \"rig\" (one per rig). Omit the\nfield for an unscoped session instantiated in both city and rig\nexpansion contexts."
         },
         "dir": {
           "type": "string",
@@ -1834,10 +1861,12 @@
     "OptionChoice": {
       "properties": {
         "value": {
-          "type": "string"
+          "type": "string",
+          "description": "Value is the choice identifier matched against ProviderOption.Default and\nthe user's selection (e.g. \"opus-4.8\")."
         },
         "label": {
-          "type": "string"
+          "type": "string",
+          "description": "Label is the human-readable choice name shown in tooling."
         },
         "flag_args": {
           "items": {
@@ -2058,23 +2087,27 @@
     "ProviderOption": {
       "properties": {
         "key": {
-          "type": "string"
+          "type": "string",
+          "description": "Key is the option identifier (e.g. \"model\"); also the merge key for\noptions_schema_merge = \"by_key\"."
         },
         "label": {
-          "type": "string"
+          "type": "string",
+          "description": "Label is the human-readable option name shown in tooling."
         },
         "type": {
           "type": "string",
           "description": "\"select\" only (v1)"
         },
         "default": {
-          "type": "string"
+          "type": "string",
+          "description": "Default is the Value of the choice selected when the user makes none."
         },
         "choices": {
           "items": {
             "$ref": "#/$defs/OptionChoice"
           },
-          "type": "array"
+          "type": "array",
+          "description": "Choices are the allowed values; selecting one injects its FlagArgs into the\nagent command line (how the Model axis renders to a harness CLI flag)."
         },
         "omit": {
           "type": "boolean",
@@ -2294,7 +2327,7 @@
         },
         "session_id_flag": {
           "type": "string",
-          "description": "SessionIDFlag is the CLI flag for creating a session with a specific ID.\nEnables the Generate \u0026 Pass strategy for session key management.\nExample: \"--session-id\" (claude)"
+          "description": "SessionIDFlag is the CLI flag for providers that support creating a\nfresh session with a caller-supplied ID. Empty means fresh starts cannot\nreceive a preselected provider session ID; resume metadata must come from\nthe provider after startup."
         },
         "permission_modes": {
           "additionalProperties": {
@@ -2316,6 +2349,10 @@
           },
           "type": "array",
           "description": "OptionsSchema declares the configurable options this provider supports.\nEach option maps to CLI args via its Choices[].FlagArgs field.\nSerialized via a dedicated DTO (not directly to JSON) so FlagArgs stays server-side."
+        },
+        "upstream_env": {
+          "$ref": "#/$defs/UpstreamEnvBinding",
+          "description": "UpstreamEnv is this harness's serving-env contract (Phase C — the Upstream\naxis): the env-var NAMES this CLI reads for the model-serving base URL and\ncredential. It lets the resolver render an abstract [upstreams.\u003cname\u003e] onto\nthe right names for this harness, so an upstream preset is portable across\nharnesses (claude → ANTHROPIC_*, codex → OPENAI_*)."
         },
         "print_args": {
           "items": {
@@ -2686,6 +2723,78 @@
         "cache_creation_usd_per_1m"
       ],
       "description": "Tier defines per-token-type rates in USD per 1 million tokens."
+    },
+    "UpstreamEnvBinding": {
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "description": "BaseURL is the env var name the harness reads for the serving base URL."
+        },
+        "api_key": {
+          "type": "string",
+          "description": "APIKey is the env var name the harness reads for the API key."
+        },
+        "auth_token": {
+          "type": "string",
+          "description": "AuthToken is the env var name the harness reads for a bearer auth token."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "UpstreamEnvBinding is a harness's serving-env contract: the env-var NAMES this CLI reads for the model-serving endpoint and credential."
+    },
+    "UpstreamSpec": {
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Description is a human-readable summary shown in tooling."
+        },
+        "base_url": {
+          "type": "string",
+          "description": "BaseURL is the abstract serving endpoint, rendered onto the harness's\nbase_url env var name (UpstreamEnvBinding.BaseURL)."
+        },
+        "api_key": {
+          "type": "string",
+          "description": "APIKey is the abstract credential, rendered onto the harness's api_key env\nvar name. May be a $VAR ref so the secret stays out of config."
+        },
+        "auth_token": {
+          "type": "string",
+          "description": "AuthToken is an abstract bearer-token credential (an alternative to APIKey\nfor harnesses/upstreams that use a token), rendered onto the harness's\nauth_token env var name."
+        },
+        "base_url_env": {
+          "type": "string",
+          "description": "BaseURLEnv/APIKeyEnv/AuthTokenEnv override the HARNESS binding's env-var\nname for the corresponding abstract field. Needed for GATEWAY harnesses —\none CLI (e.g. opencode) fronting many upstreams where the credential env\nvar is upstream-dependent (GROQ_API_KEY, CEREBRAS_API_KEY, …), so the\nHARNESS has no single binding and the UPSTREAM names its own target.\nPrecedence per field: this override \u003e the harness binding \u003e error."
+        },
+        "api_key_env": {
+          "type": "string",
+          "description": "APIKeyEnv overrides the harness binding's api_key env-var name for this\nupstream (see BaseURLEnv for when this is needed)."
+        },
+        "auth_token_env": {
+          "type": "string",
+          "description": "AuthTokenEnv overrides the harness binding's auth_token env-var name for this\nupstream (see BaseURLEnv)."
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Env is a harness-specific escape hatch: raw env keys merged AFTER the\nabstract fields render. Values may use $VAR refs."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "UpstreamSpec is a named model-serving endpoint preset (Phase C — the Upstream axis: WHO serves+resolves the model)."
+    },
+    "UsageConfig": {
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Provider selects the usage sink backend:\n  - \"discard\" / \"fake\" → drop all facts\n  - \"exec:\u003cscript\u003e\" → user-supplied script (JSON fact per line on stdin)\n  - \"\" / \"local\" → durable file-backed JSONL at .gc/usage.jsonl (default)"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "UsageConfig holds usage-fact sink settings."
     },
     "Workspace": {
       "properties": {

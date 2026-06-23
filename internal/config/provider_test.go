@@ -392,18 +392,15 @@ func TestBuiltinProvidersResumeFlags(t *testing.T) {
 	}
 }
 
-// TestBuiltinProvidersSessionIDFlag pins which providers populate
-// SessionIDFlag. Claude is the only provider with a documented "start a new
-// session with this id" flag (--session-id). Codex exposes session ids only
-// through `codex resume <id>` (a resume path, not a fresh-start path), so it
-// stays empty — populating it would make resolveSessionCommand emit
-// `codex --session-id <key>` on first start, which codex rejects.
+// TestBuiltinProvidersSessionIDFlag pins that built-in providers only populate
+// SessionIDFlag when their CLI supports caller-supplied fresh session IDs.
+// Claude and Codex expose session ids through resume paths, not fresh-start
+// creation flags; populating this field makes resolveSessionCommand emit an
+// unsupported first-start command and prevents hook-time provider session IDs
+// from becoming the durable session_key.
 func TestBuiltinProvidersSessionIDFlag(t *testing.T) {
 	providers := BuiltinProviders()
-	if got := providers["claude"].SessionIDFlag; got != "--session-id" {
-		t.Errorf("claude SessionIDFlag = %q, want --session-id", got)
-	}
-	for _, name := range []string{"codex", "gemini", "cursor", "copilot", "amp", "opencode", "auggie", "pi", "omp"} {
+	for _, name := range []string{"claude", "codex", "gemini", "cursor", "copilot", "amp", "opencode", "auggie", "pi", "omp"} {
 		if got := providers[name].SessionIDFlag; got != "" {
 			t.Errorf("%s SessionIDFlag = %q, want empty (no documented start-with-id flag)", name, got)
 		}

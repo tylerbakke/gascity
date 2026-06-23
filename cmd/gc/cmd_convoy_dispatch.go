@@ -556,11 +556,20 @@ func decorateDynamicFragmentRecipe(fragment *formula.FragmentRecipe, source bead
 	}
 	routingRigContext := strings.TrimSpace(defaultRoute.RigContext)
 	if routingRigContext == "" {
-		routingRigContext = graphRouteRigContext(defaultRoute.QualifiedName)
+		routingRigContext = graphroute.GraphRouteRigContext(defaultRoute.QualifiedName)
 	}
-	controlRoute, err := controlDispatcherBinding(store, cityName, cfg, routingRigContext)
-	if err != nil {
-		return err
+	controlRoutes := map[string]graphRouteBinding{}
+	controlRouteFor := func(rigContext string) (graphRouteBinding, error) {
+		rigContext = strings.TrimSpace(rigContext)
+		if binding, ok := controlRoutes[rigContext]; ok {
+			return binding, nil
+		}
+		binding, err := controlDispatcherBinding(store, cityName, cfg, rigContext)
+		if err != nil {
+			return graphRouteBinding{}, err
+		}
+		controlRoutes[rigContext] = binding
+		return binding, nil
 	}
 
 	for i := range fragment.Steps {
@@ -603,12 +612,27 @@ func decorateDynamicFragmentRecipe(fragment *formula.FragmentRecipe, source bead
 			return err
 		}
 		if graphroute.IsControlDispatcherKind(step.Metadata[beadmeta.KindMetadataKey]) {
+			controlRigContext := graphRouteBindingRigContext(binding)
+			if controlRigContext == "" {
+				controlRigContext = routingRigContext
+			}
+			controlRoute, err := controlRouteFor(controlRigContext)
+			if err != nil {
+				return err
+			}
 			graphroute.AssignGraphStepRoute(step, binding, &controlRoute)
 			continue
 		}
 		graphroute.AssignGraphStepRoute(step, binding, nil)
 	}
 	return nil
+}
+
+func graphRouteBindingRigContext(binding graphRouteBinding) string {
+	if rigContext := strings.TrimSpace(binding.RigContext); rigContext != "" {
+		return rigContext
+	}
+	return graphroute.GraphRouteRigContext(binding.QualifiedName)
 }
 
 func decorateDrainItemRecipe(recipe *formula.Recipe, source beads.Bead, store beads.Store, storeRef, cityName, cityPath string, cfg *config.City) error {
@@ -647,7 +671,7 @@ func decorateDrainItemRecipe(recipe *formula.Recipe, source beads.Bead, store be
 	}
 	scopeKind := strings.TrimSpace(source.Metadata[beadmeta.ScopeKindMetadataKey])
 	scopeRef := strings.TrimSpace(source.Metadata[beadmeta.ScopeRefMetadataKey])
-	if binding, ok, err := resolveGraphDirectSessionBinding(store, cityName, cityPath, cfg, routedTo, workflowExecutionRigContext(source)); err != nil {
+	if binding, ok, err := graphroute.ResolveGraphDirectSessionBinding(store, cityName, cfg, routedTo, workflowExecutionRigContext(source), cliGraphrouteDeps(cityPath)); err != nil {
 		return err
 	} else if ok {
 		defaultRoute := graphroute.GraphRouteBinding{DirectSessionID: binding.DirectSessionID, RigContext: binding.RigContext}
@@ -663,7 +687,7 @@ func workflowExecutionRigContext(bead beads.Bead) string {
 	if rigContext := strings.TrimSpace(bead.Metadata[graphroute.GraphExecutionRigContextMetaKey]); rigContext != "" {
 		return rigContext
 	}
-	return graphRouteRigContext(graphroute.WorkflowExecutionRoute(bead))
+	return graphroute.GraphRouteRigContext(graphroute.WorkflowExecutionRoute(bead))
 }
 
 func drainItemRecipeVars(recipe *formula.Recipe) (map[string]string, error) {
@@ -689,7 +713,7 @@ func graphFallbackBindingForBead(source beads.Bead, store beads.Store, cityName,
 		return graphRouteBinding{SessionName: source.Assignee}, nil
 	}
 	rigContext := workflowExecutionRigContext(source)
-	if binding, ok, err := resolveGraphDirectSessionBinding(store, cityName, cityPath, cfg, routedTo, rigContext); err != nil {
+	if binding, ok, err := graphroute.ResolveGraphDirectSessionBinding(store, cityName, cfg, routedTo, rigContext, cliGraphrouteDeps(cityPath)); err != nil {
 		return graphRouteBinding{}, err
 	} else if ok {
 		return binding, nil

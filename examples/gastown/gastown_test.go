@@ -483,6 +483,46 @@ func TestRefineryFormulaChainsMergeMetadataWithClose(t *testing.T) {
 	)
 }
 
+// TestRefineryFormulaDirectMergeUsesDetachedWorktree guards the RC-blocking
+// regression where the refinery tried `git checkout $TARGET` in its active
+// worktree while the target branch was already checked out by the rig's main
+// worktree. That checkout failed, but the agent still wrote merged metadata
+// and closed the bead. Direct merges must use a temporary detached worktree,
+// verify origin/<target> reaches the merged SHA, and only then mutate bead
+// state.
+func TestRefineryFormulaDirectMergeUsesDetachedWorktree(t *testing.T) {
+	body := refineryMergePushDescription(t)
+	direct := sectionBetween(t, body,
+		`**If MERGE_STRATEGY = "direct" (default):**`,
+		`**If MERGE_STRATEGY = "mr":**`,
+	)
+
+	for _, line := range strings.Split(direct, "\n") {
+		if strings.TrimSpace(line) == `git checkout $TARGET` {
+			t.Fatalf("direct refinery merge checks out target branch in active worktree:\n%s", direct)
+		}
+	}
+
+	assertContainsInOrder(t, direct,
+		`branch_has_real_change "origin/$TARGET" temp ||`,
+		"set -e",
+		`MERGE_PARENT=$(mktemp -d "${TMPDIR:-/tmp}/gascity-refinery-merge.XXXXXX")`,
+		`git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"`,
+		`TEMP_SHA=$(git rev-parse temp)`,
+		`git worktree add --detach "$MERGE_WT" "origin/$TARGET"`,
+		`git -C "$MERGE_WT" merge --ff-only "$TEMP_SHA"`,
+		`MERGED_SHA=$(git -C "$MERGE_WT" rev-parse HEAD)`,
+		`git -C "$MERGE_WT" push origin "HEAD:$TARGET"`,
+		`REMOTE=$(git rev-parse "origin/$TARGET")`,
+		`if [ "$MERGED_SHA" != "$REMOTE" ]; then`,
+		"STOP. Do not mutate bead state.",
+		"gc runtime drain-ack",
+		"exit 1",
+		"--set-metadata merge_result=merged",
+		`gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"`,
+	)
+}
+
 // TestRefineryFormulaRefusesZeroDiffMerge guards the false-completion
 // fix (gco-hu0p / upstream #3048): nothing previously stopped the refinery
 // from recording a 0-commit / no-diff branch as close-as-merged, producing
@@ -2189,6 +2229,42 @@ func TestNonDogStartupPromptsUseAssignedInProgressQuery(t *testing.T) {
 	}
 }
 
+func TestPolecatStartupUsesHookClaim(t *testing.T) {
+	rel := "packs/gastown/agents/polecat/prompt.template.md"
+	data, err := os.ReadFile(gastownRel(rel))
+	if err != nil {
+		t.Fatalf("reading %s: %v", rel, err)
+	}
+	body := sectionBetween(t, string(data), "## Startup Protocol", "## Context Exhaustion")
+	for _, want := range []string{
+		"gc hook --claim --json",
+		"checks assigned work first",
+		"performs the atomic",
+		"claim before you inspect the bead",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("%s Startup Protocol missing %q", rel, want)
+		}
+	}
+	for _, forbidden := range []string{
+		"{{ .AssignedInProgressQuery }}",
+		"{{ .WorkQuery }}",
+		`gc bd list --assignee="$GC_SESSION_NAME" --status=in_progress`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("%s Startup Protocol still contains stale direct query/claim %q", rel, forbidden)
+		}
+	}
+
+	rendered := renderGastownPromptForPack(t, rel, "gastown/polecat", "polecat", "demo", "gastown", "gastown.")
+	if strings.Contains(rendered, "{{ .") {
+		t.Fatalf("%s rendered prompt still contains template placeholders: %q", rel, rendered)
+	}
+	if !strings.Contains(rendered, "gc hook --claim --json") {
+		t.Fatalf("%s rendered prompt missing hook claim: %q", rel, rendered)
+	}
+}
+
 // TestWitnessStartupAndNoIdleReconcileWisps is the regression guard for the
 // town-wide witness wisp leak (ga-7c6). The witness's patrol wisps are
 // ephemeral molecules on the town ledger, poured/assigned with `gc bd`. Its
@@ -3704,11 +3780,12 @@ func TestCityAgentsFilter(t *testing.T) {
 	// Verify config.LoadWithIncludes with both packs produces
 	// only city-scoped agents when no rigs are registered:
 	// mayor/deacon/boot + the gastown dog pool + the dolt maintenance dog
-	// contributed by the composed builtin bd pack = 5. The two dogs keep
-	// distinct binding-qualified identities (gastown.dog vs bd.dog).
+	// contributed by the composed builtin bd pack + the core control dispatcher
+	// = 6. The two dogs keep distinct binding-qualified identities
+	// (gastown.dog vs bd.dog).
 	cfg := loadExpanded(t)
 
-	cityAgents := map[string]bool{"mayor": true, "deacon": true, "boot": true, "dog": true}
+	cityAgents := map[string]bool{"mayor": true, "deacon": true, "boot": true, "dog": true, "control-dispatcher": true}
 	var explicit int
 	for _, a := range cfg.Agents {
 		if a.Implicit {
@@ -3722,8 +3799,8 @@ func TestCityAgentsFilter(t *testing.T) {
 			t.Errorf("city agent %q: dir = %q, want empty", a.Name, a.Dir)
 		}
 	}
-	if explicit != 5 {
-		t.Errorf("got %d explicit agents, want 5 city-scoped agents (incl. both dogs)", explicit)
+	if explicit != 6 {
+		t.Errorf("got %d explicit agents, want 6 city-scoped agents (incl. both dogs and control-dispatcher)", explicit)
 	}
 }
 

@@ -346,6 +346,7 @@ type formulaShowJSON struct {
 	CityPath      string                `json:"city_path,omitempty"`
 	Name          string                `json:"name"`
 	Description   string                `json:"description,omitempty"`
+	Metadata      map[string]any        `json:"metadata,omitempty"`
 	Phase         string                `json:"phase,omitempty"`
 	Pour          bool                  `json:"pour,omitempty"`
 	RootOnly      bool                  `json:"root_only,omitempty"`
@@ -531,6 +532,7 @@ func formulaShowJSONFromRecipe(recipe *formula.Recipe, cityPath string, scope fo
 		CityPath:      cityPath,
 		Name:          recipe.Name,
 		Description:   recipe.Description,
+		Metadata:      recipe.Metadata,
 		Phase:         recipe.Phase,
 		Pour:          recipe.Pour,
 		RootOnly:      recipe.RootOnly,

@@ -128,7 +128,7 @@ func (c *FormulaRequirementsCheck) collectIssues() []formulaRequirementIssue {
 					message:  err.Error(),
 				})
 			}
-			if err := formula.ValidateHostRequirements(resolved, c.cfg.Daemon.FormulaV2); err != nil {
+			if err := formula.ValidateHostRequirements(resolved, c.cfg.Daemon.FormulaV2Enabled()); err != nil {
 				addIssue(formulaRequirementIssue{
 					severity: StatusError,
 					scope:    scope.name,

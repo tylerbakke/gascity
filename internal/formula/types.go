@@ -72,6 +72,11 @@ type Formula struct {
 	// Catalog opts the formula into user-facing workflow discovery.
 	Catalog *CatalogMetadata `json:"catalog,omitempty" toml:"catalog,omitempty"`
 
+	// Metadata holds formula-level metadata for inspection APIs.
+	// Unlike step metadata, these values are not copied into bead metadata and
+	// may contain nested TOML/JSON structures.
+	Metadata map[string]any `json:"metadata,omitempty" toml:"metadata,omitempty"`
+
 	// Contract opts the formula into a specific runtime contract.
 	// "graph.v2" enables graph-first workflow compilation when formula_v2 is enabled.
 	Contract string `json:"contract,omitempty" toml:"contract,omitempty"`

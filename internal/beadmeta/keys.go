@@ -4,9 +4,9 @@
 //
 // Before beadmeta, these keys were ~126 raw string literals scattered across
 // ~70 files with no central declaration: the real interface between modules was
-// folklore. This package makes the seam named and compiler-checked. It is a
-// zero-dependency leaf (it imports nothing) so every workflow package can import
-// it without risk of an import cycle, mirroring internal/events.
+// folklore. This package makes the seam named and compiler-checked. It imports
+// only the standard library, so every workflow package can import it without
+// risk of an import cycle, mirroring internal/events.
 //
 // Scope: this package owns engine-touched bead-metadata KEY NAMES only. It
 // deliberately excludes (each a separate owner): gc.* event-type names

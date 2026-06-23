@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sling"
+	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
 
 // sessionBeadAssigneeIdentities returns every identifier under which a work
@@ -139,6 +140,9 @@ func releaseOrphanedPoolAssignments(
 			continue
 		}
 		assignee := strings.TrimSpace(wb.Assignee)
+		if assignee == "" && wb.Status == "in_progress" && isCanonicalWorkflowRoot(wb) {
+			continue
+		}
 		template := routedToOrLegacyWorkflowTarget(wb)
 		if template == "" {
 			continue
@@ -243,6 +247,12 @@ func clearDetachedProbeMetadata(store beads.Store, id string) {
 
 const unresolvedOpenSessionStoreRef = "\x00unresolved"
 
+// crossStoreOpenSessionStoreRef marks an open session whose backing agent is
+// cross-store eligible (city-scoped). Such a session federates across every
+// store (vp-kvp), so openSessionOwnsWork matches it against any work store-ref.
+// The \x00 prefix cannot collide with a real rig name.
+const crossStoreOpenSessionStoreRef = "\x00crossstore"
+
 func makeOpenSessionStoreRefIndex(cityPath string, cfg *config.City, openSessionBeads []beads.Bead, storeRefAware bool) map[string]map[string]struct{} {
 	index := make(map[string]map[string]struct{}, len(openSessionBeads)*5)
 	if !storeRefAware {
@@ -252,10 +262,7 @@ func makeOpenSessionStoreRefIndex(cityPath string, cfg *config.City, openSession
 		if sb.Status == "closed" {
 			continue
 		}
-		storeRef, ok := assignedWorkStoreRefForSession(cityPath, cfg, sb)
-		if !ok {
-			storeRef = unresolvedOpenSessionStoreRef
-		}
+		storeRef := openSessionReachableStoreRef(cityPath, cfg, sb)
 		for _, id := range sessionBeadAssigneeIdentities(sb) {
 			addOpenSessionStoreRef(index, id, storeRef)
 		}
@@ -286,6 +293,9 @@ func openSessionOwnsWork(legacyIdentifiers map[string]struct{}, scopedIdentifier
 		return false
 	}
 	if _, ok := refs[unresolvedOpenSessionStoreRef]; ok {
+		return true
+	}
+	if _, ok := refs[crossStoreOpenSessionStoreRef]; ok {
 		return true
 	}
 	_, ok := refs[workStoreRef]
@@ -323,8 +333,15 @@ func isRecoverableUnassignedInProgressPoolWork(cfg *config.City, wb beads.Bead) 
 	if template == "" {
 		return false
 	}
+	if isCanonicalWorkflowRoot(wb) {
+		return false
+	}
 	agentCfg := findAgentByTemplate(cfg, template)
 	return agentCfg != nil && agentCfg.SupportsGenericEphemeralSessions()
+}
+
+func isCanonicalWorkflowRoot(wb beads.Bead) bool {
+	return sourceworkflow.IsWorkflowRoot(wb) && legacyWorkflowRunTarget(wb) == ""
 }
 
 func releaseOrphanedPoolAssignment(store beads.Store, id string, clearDetached bool) bool {

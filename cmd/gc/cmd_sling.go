@@ -21,7 +21,6 @@ import (
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/runtime"
-	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -569,6 +568,10 @@ func populateSlingDepsCallbacks(deps *slingDeps) {
 
 func cliDirectSessionResolver(store beads.Store, cityName, cityPath string, cfg *config.City, target, rigContext string) (string, bool, error) {
 	if cfg == nil {
+		return "", false, nil
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
 		return "", false, nil
 	}
 	if cityName == "" {
@@ -1284,7 +1287,7 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 		return graphRouteBinding{}, fmt.Errorf("formulas v2 routing for %s requires config", stepID)
 	}
 	if target.fromAssignee {
-		binding, ok, err := resolveGraphDirectSessionBinding(store, cityName, cityPath, cfg, target.value, rigContext)
+		binding, ok, err := graphroute.ResolveGraphDirectSessionBinding(store, cityName, cfg, target.value, rigContext, cliGraphrouteDeps(cityPath))
 		if err != nil {
 			return graphRouteBinding{}, fmt.Errorf("step %s: %w", stepID, err)
 		}
@@ -1325,84 +1328,6 @@ func graphStepRouteTarget(step *formula.RecipeStep, routeVars map[string]string)
 		return graphStepTarget{}
 	}
 	return graphStepTarget{value: strings.TrimSpace(formula.Substitute(step.Metadata[beadmeta.RunTargetMetadataKey], routeVars))}
-}
-
-func resolveGraphDirectSessionBinding(store beads.Store, cityName, cityPath string, cfg *config.City, target, rigContext string) (graphRouteBinding, bool, error) {
-	target = strings.TrimSpace(target)
-	if store == nil || target == "" {
-		return graphRouteBinding{}, false, nil
-	}
-	if cfg == nil {
-		id, err := session.ResolveSessionID(store, target)
-		if err != nil {
-			return graphRouteBinding{}, false, nil
-		}
-		if bead, getErr := store.Get(id); getErr == nil && session.IsSessionBeadOrRepairable(bead) && bead.Status != "closed" {
-			return graphRouteBinding{DirectSessionID: bead.ID, RigContext: graphDirectSessionRigContext(target, rigContext, bead)}, true, nil
-		}
-		return graphRouteBinding{}, false, nil
-	}
-	if cityName == "" {
-		cityName = config.EffectiveCityName(cfg, filepath.Base(cityPath))
-	}
-	spec, ok, err := resolveNamedSessionSpecForConfigTarget(cfg, cityName, target, rigContext)
-	if err != nil {
-		return graphRouteBinding{}, false, err
-	}
-	if !ok {
-		// Exact session bead IDs are unambiguous and must win even when they
-		// collide with a config target name.
-		if id, err := session.ResolveSessionIDByExactID(store, target); err == nil {
-			if bead, getErr := store.Get(id); getErr == nil && session.IsSessionBeadOrRepairable(bead) && bead.Status != "closed" {
-				return graphRouteBinding{DirectSessionID: bead.ID, RigContext: graphDirectSessionRigContext(target, rigContext, bead)}, true, nil
-			}
-		}
-		if _, ok := resolveAgentIdentity(cfg, target, rigContext); ok {
-			return graphRouteBinding{}, false, nil
-		}
-		if id, err := session.ResolveSessionID(store, target); err == nil {
-			if bead, getErr := store.Get(id); getErr == nil && session.IsSessionBeadOrRepairable(bead) && bead.Status != "closed" {
-				return graphRouteBinding{DirectSessionID: bead.ID, RigContext: graphDirectSessionRigContext(target, rigContext, bead)}, true, nil
-			}
-		}
-		return graphRouteBinding{}, false, nil
-	}
-	id, err := resolveSessionIDMaterializingNamed(cityPath, cfg, store, spec.Identity)
-	if err != nil {
-		return graphRouteBinding{}, false, err
-	}
-	return graphRouteBinding{DirectSessionID: id, RigContext: graphRouteRigContext(spec.Identity)}, true, nil
-}
-
-func graphRouteRigContext(route string) string {
-	route = strings.TrimSpace(route)
-	if route == "" {
-		return ""
-	}
-	idx := strings.LastIndex(route, "/")
-	if idx <= 0 {
-		return ""
-	}
-	return route[:idx]
-}
-
-func graphDirectSessionRigContext(target, rigContext string, bead beads.Bead) string {
-	if rigContext = strings.TrimSpace(rigContext); rigContext != "" {
-		return rigContext
-	}
-	if rigContext = graphRouteRigContext(target); rigContext != "" {
-		return rigContext
-	}
-	for _, candidate := range []string{
-		bead.Metadata[namedSessionIdentityMetadata],
-		bead.Metadata["alias"],
-		bead.Metadata["template"],
-	} {
-		if rigContext = graphRouteRigContext(candidate); rigContext != "" {
-			return rigContext
-		}
-	}
-	return ""
 }
 
 // targetType returns "pool" or "agent" for telemetry attributes.

@@ -1358,7 +1358,7 @@ name = "test-city"
 	if err != nil {
 		t.Fatalf("loadCityConfigFS() error = %v", err)
 	}
-	if !cfg.Daemon.FormulaV2 {
+	if !cfg.Daemon.FormulaV2Enabled() {
 		t.Fatalf("cfg.Daemon.FormulaV2 = false, want true")
 	}
 	if !formula.IsFormulaV2Enabled() {

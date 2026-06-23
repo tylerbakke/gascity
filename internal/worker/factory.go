@@ -10,6 +10,7 @@ import (
 	"github.com/gastownhall/gascity/internal/pricing"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/usage"
 )
 
 // SessionRuntimeResolver resolves provider/runtime details for an existing
@@ -24,6 +25,7 @@ type FactoryConfig struct {
 	CityPath              string
 	SearchPaths           []string
 	Recorder              events.Recorder
+	UsageSink             usage.Sink
 	ResolveTransport      func(template, provider string) string
 	ResolveSessionRuntime SessionRuntimeResolver
 	// Pricing estimates per-invocation cost for telemetry. Nil falls back
@@ -39,6 +41,7 @@ type Factory struct {
 	provider              runtime.Provider
 	searchPaths           []string
 	recorder              events.Recorder
+	usageSink             usage.Sink
 	resolveSessionRuntime SessionRuntimeResolver
 	pricing               *pricing.Registry
 }
@@ -60,18 +63,21 @@ func NewFactory(cfg FactoryConfig) (*Factory, error) {
 	default:
 		manager = sessionpkg.NewManager(cfg.Store, cfg.Provider)
 	}
-	return newFactory(manager, cfg.Store, cfg.Provider, cfg.SearchPaths, cfg.Recorder, cfg.ResolveSessionRuntime, cfg.Pricing)
+	return newFactory(manager, cfg.Store, cfg.Provider, cfg.SearchPaths, cfg.Recorder, cfg.UsageSink, cfg.ResolveSessionRuntime, cfg.Pricing)
 }
 
 // NewFactoryFromManager wraps an already-constructed session manager behind the
 // worker boundary. Primarily useful in tests.
 func NewFactoryFromManager(manager *sessionpkg.Manager, searchPaths []string) (*Factory, error) {
-	return newFactory(manager, nil, nil, searchPaths, nil, nil, nil)
+	return newFactory(manager, nil, nil, searchPaths, nil, nil, nil, nil)
 }
 
-func newFactory(manager *sessionpkg.Manager, store beads.Store, provider runtime.Provider, searchPaths []string, recorder events.Recorder, resolveRuntime SessionRuntimeResolver, registry *pricing.Registry) (*Factory, error) {
+func newFactory(manager *sessionpkg.Manager, store beads.Store, provider runtime.Provider, searchPaths []string, recorder events.Recorder, usageSink usage.Sink, resolveRuntime SessionRuntimeResolver, registry *pricing.Registry) (*Factory, error) {
 	if manager == nil {
 		return nil, fmt.Errorf("%w: manager is required", ErrHandleConfig)
+	}
+	if usageSink == nil {
+		usageSink = usage.Discard
 	}
 	return &Factory{
 		manager:               manager,
@@ -79,6 +85,7 @@ func newFactory(manager *sessionpkg.Manager, store beads.Store, provider runtime
 		provider:              provider,
 		searchPaths:           append([]string(nil), searchPaths...),
 		recorder:              recorder,
+		usageSink:             usageSink,
 		resolveSessionRuntime: resolveRuntime,
 		pricing:               registry,
 	}, nil
@@ -90,6 +97,15 @@ func (f *Factory) Catalog() (*SessionCatalog, error) {
 	return NewSessionCatalog(f.manager)
 }
 
+// UsageSink returns the usage-fact sink the factory threads into every handle it
+// constructs. Never nil: usage.Discard when usage is disabled or unset.
+func (f *Factory) UsageSink() usage.Sink {
+	if f.usageSink == nil {
+		return usage.Discard
+	}
+	return f.usageSink
+}
+
 // Session returns a worker-owned session handle backed by the factory's
 // session manager and transcript search paths.
 func (f *Factory) Session(spec SessionSpec) (*SessionHandle, error) {
@@ -97,6 +113,7 @@ func (f *Factory) Session(spec SessionSpec) (*SessionHandle, error) {
 		Manager:     f.manager,
 		SearchPaths: append([]string(nil), f.searchPaths...),
 		Recorder:    f.recorder,
+		UsageSink:   f.usageSink,
 		Session:     spec,
 		Pricing:     f.pricing,
 	})

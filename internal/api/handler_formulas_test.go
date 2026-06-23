@@ -21,7 +21,6 @@ import (
 func TestFormulaListReturnsCatalogSummaries(t *testing.T) {
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -562,7 +561,6 @@ func TestFormulaPreviewAcceptsTypedVarsBody(t *testing.T) {
 	// formula_v2 back out of cfg.Daemon and overrides the global set above.
 	// Without this, the server sees v2 as disabled and rejects the v2
 	// formula compile with a 400 "formula_v2 is disabled" error.
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -627,7 +625,6 @@ func TestFormulaPreviewGraphV2InjectsTargetConvoy(t *testing.T) {
 
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -674,7 +671,6 @@ func TestFormulaPreviewGraphV2UsesPreviewInputConvoyForBeadTarget(t *testing.T) 
 
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -729,7 +725,6 @@ func TestFormulaPreviewRequiresGraphCompilerInjectsTargetConvoy(t *testing.T) {
 
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -796,7 +791,6 @@ func TestFormulaDetailGraphV2TargetlessAcceptsAgentTarget(t *testing.T) {
 
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -854,7 +848,6 @@ func TestFormulaDetailGraphV2AcceptsConfiguredAgentTarget(t *testing.T) {
 
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -893,7 +886,6 @@ func TestFormulaPreviewGraphV2AcceptsConfiguredAgentTarget(t *testing.T) {
 
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -933,7 +925,6 @@ func TestFormulaDetailGraphV2AcceptsBindingQualifiedAgentTarget(t *testing.T) {
 
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	state.cfg.Agents = append(state.cfg.Agents, config.Agent{
 		Name:              "operator",
 		Dir:               "myrig",
@@ -1006,7 +997,6 @@ func TestFormulaDetailGraphV2UnknownTargetStillRejected(t *testing.T) {
 
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -1032,7 +1022,6 @@ func TestFormulaPreviewRejectsMissingRequiredVars(t *testing.T) {
 	formulatest.EnableV2ForTest(t)
 
 	state := newFakeState(t)
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -1077,7 +1066,6 @@ func TestFormulaPreviewRejectsMissingRequiredVarsWithoutVarsBody(t *testing.T) {
 	formulatest.EnableV2ForTest(t)
 
 	state := newFakeState(t)
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 
@@ -1123,7 +1111,6 @@ func TestFormulaDetailGraphV2DrainSkipsItemRuntimeValidation(t *testing.T) {
 
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
-	state.cfg.Daemon.FormulaV2 = true
 	formulaDir := t.TempDir()
 	state.cfg.FormulaLayers.City = []string{formulaDir}
 	target, err := state.cityBeadStore.Create(beads.Bead{Title: "target", Type: "task"})

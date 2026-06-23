@@ -18,6 +18,7 @@ City is the top-level configuration for a Gas City instance.
 | `include` | []string |  |  | Include lists config fragment files to merge into this config. Processed by LoadWithIncludes; not recursive (fragments cannot include). |
 | `workspace` | Workspace | **yes** |  | Workspace holds city-level metadata (name, default provider). |
 | `providers` | map[string]ProviderSpec |  |  | Providers defines named provider presets for agent startup. |
+| `upstreams` | map[string]UpstreamSpec |  |  | Upstreams defines named model-serving endpoint presets selectable per agent via the Upstream axis (Phase C). Each maps a name → serving env (base URL + credential refs); see UpstreamSpec. |
 | `imports` | map[string]Import |  |  | Imports defines named pack imports. Each key is a local binding name; the authored public contract stores a durable source plus optional version. Processed during ExpandCityPacks. |
 | `defaults` | PackDefaults |  |  | Defaults holds city-level defaults that seed generated config. The canonical default-rig import table is [defaults.rig.imports]. |
 | `agent` | []Agent |  |  | Agents lists all configured agents in this city. Pack-composed cities can compose agents through [imports.*] and ship without any [[agent]] block. |
@@ -28,6 +29,7 @@ City is the top-level configuration for a Gas City instance.
 | `session` | SessionConfig |  |  | Session configures the session provider backend. |
 | `mail` | MailConfig |  |  | Mail configures the mail provider backend. |
 | `events` | EventsConfig |  |  | Events configures the events provider backend. |
+| `usage` | UsageConfig |  |  | Usage configures the usage-fact sink backend. |
 | `dolt` | DoltConfig |  |  | Dolt configures optional dolt server connection overrides. |
 | `formulas` | FormulasConfig |  |  | Formulas is the legacy [formulas] table; authored [formulas].dir is rejected at config load. Formulas live in the well-known formulas/ directory. |
 | `daemon` | DaemonConfig |  |  | Daemon configures controller daemon settings. |
@@ -74,13 +76,14 @@ Agent defines a configured agent in the city.
 | `dir` | string |  |  | Dir is the identity prefix for rig-scoped agents and the default working directory when WorkDir is not set. |
 | `work_dir` | string |  |  | WorkDir overrides the session working directory without changing the agent's qualified identity. Relative paths resolve against city root and may use the same template placeholders as session_setup. |
 | `tmux_alias` | string |  |  | TmuxAlias overrides the tmux session_name for pool and factory-created manual sessions of this agent. When unset, sessions fall back to the universal derivation ("s-&lt;beadID&gt;" for ad-hoc sessions, "&lt;basename&gt;-&lt;beadID&gt;" for pool sessions). When set, it is expanded as a Go text/template using the same PathContext fields as work_dir / session_setup (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName), sanitized for tmux, and validated as an explicit session name. For pool sessions, a live-name collision appends the bead ID as a deterministic suffix. For manual `gc session new` sessions, tmux_alias becomes the explicit session_name and takes precedence over --alias, which remains the command/mail alias; duplicate explicit names fail closed. Configured named sessions keep their named-session runtime name instead of using tmux_alias. When no --alias is supplied, work_dir templates that use &#123;&#123;.Agent&#125;&#125; see the resolved tmux_alias as the concrete session identity. |
-| `scope` | string |  |  | Scope defines where this agent is instantiated: "city" (one per city) or "rig" (one per rig, the default). Only meaningful for pack-defined agents; inline agents in city.toml use Dir directly. Enum: `city`, `rig` |
+| `scope` | string |  |  | Scope defines where this agent is instantiated: "city" (one per city) or "rig" (one per rig). Omit the field for an unscoped agent instantiated in both city and rig expansion contexts. Only meaningful for pack-defined agents; inline agents in city.toml use Dir directly. Enum: `city`, `rig` |
 | `suspended` | boolean |  |  | Suspended prevents the reconciler from spawning this agent. Toggle with gc agent suspend/resume. |
 | `pre_start` | []string |  |  | PreStart is a list of shell commands run before session creation. Commands run on the target filesystem: locally for tmux, inside the pod/container for exec providers. Template variables same as session_setup. On failure, the last 4 KiB of the command's stdout/stderr is included in the error and may appear in controller and reconciler logs; avoid set -x or echoing secrets in setup commands. |
 | `prompt_template` | string |  |  | PromptTemplate is the path to this agent's prompt template file. Relative paths resolve against the city directory. |
 | `nudge` | string |  |  | Nudge is text typed into the agent's tmux session after startup. Used for CLI agents that don't accept command-line prompts. |
 | `session` | string |  |  | Session overrides the session transport for this agent. "" (default) uses the city-level session provider (typically tmux). "acp" uses the Agent Client Protocol (JSON-RPC over stdio). The agent's resolved provider must have supports_acp = true. Enum: `acp` |
 | `provider` | string |  |  | Provider names the provider preset to use for this agent. |
+| `upstream` | string |  |  | Upstream selects the model-serving endpoint (a key in [upstreams]) for this agent — WHO serves the model. "" (default) falls back to agent_defaults.upstream; if still empty, no upstream env is injected (ambient behavior). Switching it relaunches the agent in the warm box. |
 | `start_command` | string |  |  | StartCommand overrides the provider's command for this agent. |
 | `lifecycle` | string |  |  | Lifecycle controls runtime lifetime semantics. Empty uses the default long-lived session lifecycle; "one_shot" means the command is expected to do bounded work and exit cleanly. Enum: `one_shot` |
 | `args` | []string |  |  | Args overrides the provider's default arguments. |
@@ -131,6 +134,7 @@ AgentDefaults provides agent defaults declared via [agent_defaults] in city.toml
 |-------|------|----------|---------|-------------|
 | `provider` | string |  |  | Provider is the default provider name for agents that do not set their own provider. It also counts as a configured provider for implicit agent injection. |
 | `model` | string |  |  | Model is the parsed/composed default model name for agents (e.g., "claude-sonnet-4-6"), but it is not yet auto-applied at runtime. Agents with their own model override would take precedence. |
+| `upstream` | string |  |  | Upstream is the default model-serving endpoint (a key in [upstreams]) for agents that do not set their own upstream (Phase C — the Upstream axis). Applied to agents with an empty Upstream by ApplyAgentDefaults. |
 | `wake_mode` | string |  |  | WakeMode is the parsed/composed default wake mode ("resume" or "fresh"), but it is not yet auto-applied at runtime. Enum: `resume`, `fresh` |
 | `default_sling_formula` | string |  |  | DefaultSlingFormula is the default formula used for agents that inherit [agent_defaults]. Explicit agents only receive this value when agent_defaults.default_sling_formula is set; implicit multi-session configs are seeded with "mol-do-work" elsewhere when no explicit default is set. |
 | `allow_overlay` | []string |  |  | AllowOverlay is parsed and composed as a config-level allowlist for session overlays, but it is not yet inherited onto agents automatically at runtime. |
@@ -158,6 +162,7 @@ AgentOverride modifies a pack-stamped agent for a specific rig.
 | `prompt_template` | string |  |  | PromptTemplate overrides the prompt template path. Relative paths resolve against the declaring config file's directory (pack-safe). Paths prefixed with "//" resolve against the city root. |
 | `session` | string |  |  | Session overrides the session transport ("acp"). |
 | `provider` | string |  |  | Provider overrides the provider name. |
+| `upstream` | string |  |  | Upstream overrides the model-serving endpoint selection (Phase C). |
 | `args` | []string |  |  | Args overrides the provider's default arguments. Leave unset to keep the pack-defined args; set to an empty list to clear them; set to a populated list to replace them entirely (full replace, not append). |
 | `start_command` | string |  |  | StartCommand overrides the start command. |
 | `lifecycle` | string |  |  | Lifecycle overrides the runtime lifecycle ("one_shot" or empty). Enum: `one_shot` |
@@ -214,6 +219,7 @@ AgentPatch modifies an existing agent identified by (Dir, Name).
 | `prompt_template` | string |  |  | PromptTemplate overrides the prompt template path. Relative paths resolve against the declaring config file's directory (pack-safe). Paths prefixed with "//" resolve against the city root. |
 | `session` | string |  |  | Session overrides the session transport ("acp" or "tmux"). |
 | `provider` | string |  |  | Provider overrides the provider name. |
+| `upstream` | string |  |  | Upstream overrides the model-serving endpoint selection (Phase C). |
 | `args` | []string |  |  | Args overrides the provider's default arguments. Leave unset to keep the pack-defined args; set to an empty list to clear them; set to a populated list to replace them entirely (full replace, not append). |
 | `start_command` | string |  |  | StartCommand overrides the start command. |
 | `lifecycle` | string |  |  | Lifecycle overrides the runtime lifecycle ("one_shot" or empty). Enum: `one_shot` |
@@ -296,7 +302,7 @@ DaemonConfig holds controller daemon settings.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `formula_v2` | boolean |  | `true` | FormulaV2 enables formula compiler v2 workflow infrastructure: the control-dispatcher implicit agent and on-demand named session, compiler-v2 workflow compilation, and batch graph-apply bead creation. The implicit dispatcher follows normal session idle-sleep policy. Requires bd with --graph support. Default: true. Set false only for cities pinned to formula compiler v1. |
+| `formula_v2` | boolean |  | `true` | FormulaV2 enables formula compiler v2 workflow infrastructure: compiler-v2 workflow compilation, batch graph-apply bead creation, and routing to the core pack's control-dispatcher worker. Requires bd with --graph support. Default: ENABLED. A nil pointer means the default-on behavior and is OMITTED from generated configs (so auto-generated city.toml files never pin the default and never accidentally write formula_v2=false); an explicit formula_v2=false (or the deprecated graph_workflows=false alias) is preserved as a non-nil false. Read the effective value via FormulaV2Enabled(), never the field. |
 | `graph_workflows` | boolean |  |  | GraphWorkflows is the deprecated predecessor of FormulaV2. Retained for backwards compatibility as an alias. Explicit formula_v2 wins. |
 | `patrol_interval` | string |  | `30s` | PatrolInterval is the health patrol interval. Duration string (e.g., "30s", "5m", "1h"). Defaults to "30s". |
 | `max_restarts` | integer |  | `5` | MaxRestarts is the maximum number of agent restarts within RestartWindow before the agent is quarantined. 0 means unlimited (no crash loop detection). Defaults to 5. |
@@ -501,7 +507,7 @@ NamedSession defines a canonical persistent session backed by an agent template.
 |-------|------|----------|---------|-------------|
 | `name` | string |  |  | Name is the configured public session identity. When omitted, Template remains the compatibility identity. |
 | `template` | string | **yes** |  | Template is the referenced agent template name. Root declarations may target imported agents via "binding.agent". |
-| `scope` | string |  |  | Scope defines where this named session is instantiated in pack expansion: "city" (one per city) or "rig" (one per rig). Enum: `city`, `rig` |
+| `scope` | string |  |  | Scope defines where this named session is instantiated in pack expansion: "city" (one per city) or "rig" (one per rig). Omit the field for an unscoped session instantiated in both city and rig expansion contexts. Enum: `city`, `rig` |
 | `dir` | string |  |  | Dir is the identity prefix for rig-scoped named sessions after pack expansion. Empty means city-scoped. |
 | `mode` | string |  |  | Mode controls when the controller ensures this named session is live. "on_demand" (default): reserve identity and materialize when work or an explicit reference requires it. "always": keep the canonical session controller-managed. Note: mode="always" is independent of min_active_sessions; both produce sessions, and gc doctor reports accidental duplicate-pool combinations. Enum: `on_demand`, `always` |
 
@@ -522,8 +528,8 @@ OptionChoice is one allowed value for a "select" option.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `value` | string | **yes** |  |  |
-| `label` | string | **yes** |  |  |
+| `value` | string | **yes** |  | Value is the choice identifier matched against ProviderOption.Default and the user's selection (e.g. "opus-4.8"). |
+| `label` | string | **yes** |  | Label is the human-readable choice name shown in tooling. |
 | `flag_args` | []string | **yes** |  | FlagArgs are the CLI arguments injected when this choice is selected. json:"-" is intentional: FlagArgs must never appear in the public API DTO (security boundary — prevents clients from seeing internal CLI flags). |
 | `flag_aliases` | []array |  |  | FlagAliases are equivalent CLI argument sequences stripped from legacy provider args. Like FlagArgs, they stay server-side only. |
 
@@ -604,11 +610,11 @@ ProviderOption declares a single configurable option for a provider.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `key` | string | **yes** |  |  |
-| `label` | string | **yes** |  |  |
+| `key` | string | **yes** |  | Key is the option identifier (e.g. "model"); also the merge key for options_schema_merge = "by_key". |
+| `label` | string | **yes** |  | Label is the human-readable option name shown in tooling. |
 | `type` | string | **yes** |  | "select" only (v1) |
-| `default` | string | **yes** |  |  |
-| `choices` | []OptionChoice | **yes** |  |  |
+| `default` | string | **yes** |  | Default is the Value of the choice selected when the user makes none. |
+| `choices` | []OptionChoice | **yes** |  | Choices are the allowed values; selecting one injects its FlagArgs into the agent command line (how the Model axis renders to a harness CLI flag). |
 | `omit` | boolean |  |  | Omit is the removal sentinel for options_schema_merge = "by_key". When set on a child layer's entry, the matching Key inherited from a parent layer is pruned from the resolved schema. |
 
 ## ProviderPatch
@@ -660,10 +666,11 @@ ProviderSpec defines a named provider's startup parameters.
 | `resume_flag` | string |  |  | ResumeFlag is the CLI flag for resuming a session by ID. Empty means the provider does not support resume. Examples: "--resume" (claude), "resume" (codex) |
 | `resume_style` | string |  |  | ResumeStyle controls how ResumeFlag is applied:   "flag"       → command --resume &lt;key&gt;              (default)   "subcommand" → command resume &lt;key&gt; |
 | `resume_command` | string |  |  | ResumeCommand is the full shell command to run when resuming a session. Supports only the &#123;&#123;.SessionKey&#125;&#125; template variable. When set, takes precedence over ResumeFlag/ResumeStyle. When schema-managed defaults are inserted, the resolver tokenizes and re-emits the command; for subcommand-style resume it inserts after the ResumeFlag token that precedes &#123;&#123;.SessionKey&#125;&#125;. Example:   "claude --resume &#123;&#123;.SessionKey&#125;&#125; --dangerously-skip-permissions" Schema-managed defaults missing from a subcommand-style resume command are inserted before &#123;&#123;.SessionKey&#125;&#125; during provider resolution. |
-| `session_id_flag` | string |  |  | SessionIDFlag is the CLI flag for creating a session with a specific ID. Enables the Generate & Pass strategy for session key management. Example: "--session-id" (claude) |
+| `session_id_flag` | string |  |  | SessionIDFlag is the CLI flag for providers that support creating a fresh session with a caller-supplied ID. Empty means fresh starts cannot receive a preselected provider session ID; resume metadata must come from the provider after startup. |
 | `permission_modes` | map[string]string |  |  | PermissionModes maps permission mode names to CLI flags. Example: &#123;"unrestricted": "--dangerously-skip-permissions", "plan": "--permission-mode plan"&#125; This is a config-only lookup table consumed by external clients (e.g., real-world app) to populate permission mode dropdowns. Launch-time flag substitution is planned for a follow-up PR — currently no runtime code reads this field. |
 | `option_defaults` | map[string]string |  |  | OptionDefaults overrides the Default value in OptionsSchema entries without redefining the schema itself. Keys are option keys (e.g., "permission_mode"), values are choice values (e.g., "unrestricted"). city.toml users set this to customize provider behavior without touching Args or OptionsSchema. |
 | `options_schema` | []ProviderOption |  |  | OptionsSchema declares the configurable options this provider supports. Each option maps to CLI args via its Choices[].FlagArgs field. Serialized via a dedicated DTO (not directly to JSON) so FlagArgs stays server-side. |
+| `upstream_env` | UpstreamEnvBinding |  |  | UpstreamEnv is this harness's serving-env contract (Phase C — the Upstream axis): the env-var NAMES this CLI reads for the model-serving base URL and credential. It lets the resolver render an abstract [upstreams.&lt;name&gt;] onto the right names for this harness, so an upstream preset is portable across harnesses (claude → ANTHROPIC_*, codex → OPENAI_*). |
 | `print_args` | []string |  |  | PrintArgs are CLI arguments that enable one-shot non-interactive mode. The provider prints its response to stdout and exits. When empty, the provider does not support one-shot invocation. Examples: ["-p"] (claude, gemini), ["exec"] (codex), ["--quiet", "--prompt"] (kimi) |
 | `title_model` | string |  |  | TitleModel is the OptionsSchema model key used for title generation. Resolved via the "model" option in OptionsSchema to get FlagArgs. Defaults to the cheapest/fastest model for each provider. Examples: "haiku" (claude), "o4-mini" (codex), "gemini-2.5-flash" (gemini) |
 | `acp_command` | string |  |  | ACPCommand overrides Command when the session transport is ACP. When empty, Command is used for both tmux and ACP transports. |
@@ -788,6 +795,39 @@ Tier defines per-token-type rates in USD per 1 million tokens.
 | `completion_usd_per_1m` | number | **yes** |  |  |
 | `cache_read_usd_per_1m` | number | **yes** |  |  |
 | `cache_creation_usd_per_1m` | number | **yes** |  |  |
+
+## UpstreamEnvBinding
+
+UpstreamEnvBinding is a harness's serving-env contract: the env-var NAMES this CLI reads for the model-serving endpoint and credential.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `base_url` | string |  |  | BaseURL is the env var name the harness reads for the serving base URL. |
+| `api_key` | string |  |  | APIKey is the env var name the harness reads for the API key. |
+| `auth_token` | string |  |  | AuthToken is the env var name the harness reads for a bearer auth token. |
+
+## UpstreamSpec
+
+UpstreamSpec is a named model-serving endpoint preset (Phase C — the Upstream axis: WHO serves+resolves the model).
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `description` | string |  |  | Description is a human-readable summary shown in tooling. |
+| `base_url` | string |  |  | BaseURL is the abstract serving endpoint, rendered onto the harness's base_url env var name (UpstreamEnvBinding.BaseURL). |
+| `api_key` | string |  |  | APIKey is the abstract credential, rendered onto the harness's api_key env var name. May be a $VAR ref so the secret stays out of config. |
+| `auth_token` | string |  |  | AuthToken is an abstract bearer-token credential (an alternative to APIKey for harnesses/upstreams that use a token), rendered onto the harness's auth_token env var name. |
+| `base_url_env` | string |  |  | BaseURLEnv/APIKeyEnv/AuthTokenEnv override the HARNESS binding's env-var name for the corresponding abstract field. Needed for GATEWAY harnesses — one CLI (e.g. opencode) fronting many upstreams where the credential env var is upstream-dependent (GROQ_API_KEY, CEREBRAS_API_KEY, …), so the HARNESS has no single binding and the UPSTREAM names its own target. Precedence per field: this override &gt; the harness binding &gt; error. |
+| `api_key_env` | string |  |  | APIKeyEnv overrides the harness binding's api_key env-var name for this upstream (see BaseURLEnv for when this is needed). |
+| `auth_token_env` | string |  |  | AuthTokenEnv overrides the harness binding's auth_token env-var name for this upstream (see BaseURLEnv). |
+| `env` | map[string]string |  |  | Env is a harness-specific escape hatch: raw env keys merged AFTER the abstract fields render. Values may use $VAR refs. |
+
+## UsageConfig
+
+UsageConfig holds usage-fact sink settings.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `provider` | string |  |  | Provider selects the usage sink backend:   - "discard" / "fake" → drop all facts   - "exec:&lt;script&gt;" → user-supplied script (JSON fact per line on stdin)   - "" / "local" → durable file-backed JSONL at .gc/usage.jsonl (default) |
 
 ## Workspace
 

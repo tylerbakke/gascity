@@ -43,6 +43,54 @@ func TestNewHookCmdUsesRoutedWorkHelp(t *testing.T) {
 	}
 }
 
+func TestHookClaimJSONPassesRootJSONContract(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "worker"
+work_query = "printf '[]'"
+` + builtinImportsTOML("core", "bd")
+	writeBuiltinImportsLock(t, cityDir, "core", "bd")
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_SESSION_NAME", "worker-session")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--city", cityDir, "hook", "worker", "--claim", "--json"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("run(hook worker --claim --json) = 0, want no-work exit")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		OK      bool   `json:"ok"`
+		Command string `json:"command"`
+		Action  string `json:"action"`
+		Reason  string `json:"reason"`
+		Error   struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("hook claim payload is not JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.Error.Code == "json_unsupported" {
+		t.Fatalf("hook claim was rejected by global JSON contract gate: %s", stdout.String())
+	}
+	if !payload.OK || payload.Command != "hook" || payload.Action != "drain" || payload.Reason != "no_work" {
+		t.Fatalf("payload = %+v, want hook drain no_work", payload)
+	}
+}
+
 // TestShellWorkQueryTimeoutClassifiesTransient guards the contract the
 // control-dispatcher --follow loop depends on: a work-query timeout must be
 // classifiable as a transient store error (wrapping context.DeadlineExceeded)

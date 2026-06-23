@@ -446,6 +446,68 @@ func TestProcessScopeCheckAbortsScopeOnFailure(t *testing.T) {
 	}
 }
 
+func TestProcessScopeCheckHardFailureOverridesClosedPassBody(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	body := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "body",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": "wf-1",
+			"gc.step_ref":     "demo.body",
+			"gc.outcome":      "pass",
+		},
+	})
+	failed := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "preflight",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id":  "wf-1",
+			"gc.scope_ref":     "body",
+			"gc.scope_role":    "member",
+			"gc.outcome":       "fail",
+			"gc.failure_class": "hard",
+			"gc.on_fail":       "abort_scope",
+			"preflight.report": "failed",
+		},
+	})
+	control := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for preflight",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": "wf-1",
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+		},
+	})
+	mustDepAdd(t, store, control.ID, failed.ID, "blocks")
+
+	result, err := ProcessControl(store, mustGetBead(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(scope-check hard fail): %v", err)
+	}
+	if !result.Processed || result.Action != "scope-fail" {
+		t.Fatalf("scope result = %+v, want processed scope-fail", result)
+	}
+
+	bodyAfter := mustGetBead(t, store, body.ID)
+	if bodyAfter.Status != "closed" {
+		t.Fatalf("body status = %q, want closed", bodyAfter.Status)
+	}
+	if got := bodyAfter.Metadata["gc.outcome"]; got != "fail" {
+		t.Fatalf("body outcome = %q, want fail", got)
+	}
+	if got := bodyAfter.Metadata["preflight.report"]; got != "failed" {
+		t.Fatalf("body preflight.report = %q, want failed", got)
+	}
+}
+
 // scopeCheckAbortScopeFixture builds the canonical scope topology used by the
 // gc.on_fail=abort_scope contract tests: a scope body, a closed subject member
 // (metadata supplied by the caller), the subject's scope-check control, and a
@@ -576,6 +638,127 @@ func TestProcessScopeCheckAbortScopeNormalizesFailureContract(t *testing.T) {
 				t.Fatalf("downstream member %s is claimable after abort_scope failure", futureMember.ID)
 			}
 		})
+	}
+}
+
+func TestProcessRetryControlHardFailClosesScopeBodyWithPendingScopeCheck(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	body := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_role":   "body",
+			"gc.step_ref":     "demo.body",
+		},
+	})
+	preflight := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "preflight",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "retry",
+			"gc.max_attempts": "1",
+			"gc.on_exhausted": "hard_fail",
+			"gc.on_fail":      "abort_scope",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+			"gc.step_id":      "preflight-tests",
+			"gc.step_ref":     "demo.preflight-tests",
+		},
+	})
+	preflightAttempt := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "preflight attempt",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.attempt":         "1",
+			"gc.logical_bead_id": preflight.ID,
+			"gc.outcome":         "fail",
+			"gc.failure_class":   "hard",
+			"gc.failure_reason":  "preflight_failed",
+			"gc.root_bead_id":    workflow.ID,
+			"gc.step_id":         "preflight-tests",
+			"gc.step_ref":        "demo.preflight-tests.attempt.1",
+		},
+	})
+	preflightScopeCheck := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for preflight",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.control_for":  "preflight-tests",
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+			"gc.step_id":      "preflight-tests",
+			"gc.step_ref":     "demo.preflight-tests-scope-check",
+		},
+	})
+	implement := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "implement",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "retry",
+			"gc.max_attempts": "1",
+			"gc.on_exhausted": "hard_fail",
+			"gc.on_fail":      "abort_scope",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+			"gc.step_id":      "implement",
+			"gc.step_ref":     "demo.implement",
+		},
+	})
+	implementScopeCheck := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize scope for implement",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.control_for":  "implement",
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+			"gc.step_id":      "implement",
+			"gc.step_ref":     "demo.implement-scope-check",
+		},
+	})
+	mustDepAdd(t, store, preflight.ID, preflightAttempt.ID, "blocks")
+	mustDepAdd(t, store, preflightScopeCheck.ID, preflight.ID, "blocks")
+	mustDepAdd(t, store, implement.ID, preflightScopeCheck.ID, "blocks")
+	mustDepAdd(t, store, implementScopeCheck.ID, implement.ID, "blocks")
+	mustDepAdd(t, store, body.ID, preflightScopeCheck.ID, "blocks")
+	mustDepAdd(t, store, body.ID, implementScopeCheck.ID, "blocks")
+
+	result, err := ProcessControl(store, mustGetBead(t, store, preflight.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(retry hard fail): %v", err)
+	}
+	if !result.Processed || result.Action != "hard-fail" {
+		t.Fatalf("result = %+v, want processed hard-fail", result)
+	}
+	bodyAfter := mustGetBead(t, store, body.ID)
+	if bodyAfter.Status != "closed" || bodyAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("body = status %q outcome %q, want closed/fail", bodyAfter.Status, bodyAfter.Metadata["gc.outcome"])
+	}
+	controlAfter := mustGetBead(t, store, preflightScopeCheck.ID)
+	if controlAfter.Status != "open" {
+		t.Fatalf("failed member scope-check status = %q, want open for idempotent body-close recovery", controlAfter.Status)
+	}
+	downstreamControlAfter := mustGetBead(t, store, implementScopeCheck.ID)
+	if downstreamControlAfter.Status != "closed" || downstreamControlAfter.Metadata["gc.outcome"] != "skipped" {
+		t.Fatalf("downstream scope-check = status %q outcome %q, want closed/skipped", downstreamControlAfter.Status, downstreamControlAfter.Metadata["gc.outcome"])
 	}
 }
 
@@ -2213,6 +2396,140 @@ func TestProcessWorkflowFinalizeAbortScopeBareCloseFailsWorkflow(t *testing.T) {
 	rootAfter := mustGetBead(t, store, workflow.ID)
 	if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "fail" {
 		t.Fatalf("workflow = status %q outcome %q, want closed/fail", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
+	}
+}
+
+func TestProcessWorkflowFinalizeFailsOnHardFailedAbortScopeDescendant(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	_ = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "body",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "demo.body",
+			"gc.outcome":      "pass",
+		},
+	})
+	_ = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "preflight",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id":  workflow.ID,
+			"gc.scope_ref":     "body",
+			"gc.scope_role":    "member",
+			"gc.outcome":       "fail",
+			"gc.failure_class": "hard",
+			"gc.on_fail":       "abort_scope",
+		},
+	})
+	cleanup := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "cleanup",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": workflow.ID,
+			"gc.kind":         "cleanup",
+			"gc.outcome":      "pass",
+		},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+
+	mustDepAdd(t, store, finalizer.ID, cleanup.ID, "blocks")
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-fail" {
+		t.Fatalf("workflow result = %+v, want processed workflow-fail", result)
+	}
+	rootAfter := mustGetBead(t, store, workflow.ID)
+	if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("workflow = status %q outcome %q, want closed/fail", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
+	}
+}
+
+func TestProcessWorkflowFinalizeIgnoresTransientRetryDescendant(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	_ = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "retry attempt 1",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.kind":          "retry-run",
+			"gc.root_bead_id":  workflow.ID,
+			"gc.scope_ref":     "body",
+			"gc.scope_role":    "member",
+			"gc.outcome":       "fail",
+			"gc.failure_class": "transient",
+			"gc.on_fail":       "abort_scope",
+			"gc.attempt":       "1",
+		},
+	})
+	cleanup := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "cleanup",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": workflow.ID,
+			"gc.kind":         "cleanup",
+			"gc.outcome":      "pass",
+		},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+
+	mustDepAdd(t, store, finalizer.ID, cleanup.ID, "blocks")
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+	}
+	rootAfter := mustGetBead(t, store, workflow.ID)
+	if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "pass" {
+		t.Fatalf("workflow = status %q outcome %q, want closed/pass", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
 	}
 }
 
@@ -5262,11 +5579,11 @@ on_exhausted = "hard_fail"
 	if logical.Metadata["gc.kind"] != "retry" {
 		t.Fatalf("logical gc.kind = %q, want retry", logical.Metadata["gc.kind"])
 	}
-	if got := logical.Assignee; got != "gascity--control-dispatcher" {
-		t.Fatalf("logical retry assignee = %q, want gascity--control-dispatcher", got)
+	if got := logical.Assignee; got != "" {
+		t.Fatalf("logical retry assignee = %q, want empty routed control-dispatcher queue", got)
 	}
-	if got := logical.Metadata["gc.routed_to"]; got != "" {
-		t.Fatalf("logical retry gc.routed_to = %q, want empty direct dispatcher assignee", got)
+	if got := logical.Metadata["gc.routed_to"]; got != "gascity/control-dispatcher" {
+		t.Fatalf("logical retry gc.routed_to = %q, want gascity/control-dispatcher", got)
 	}
 	if got := logical.Metadata["gc.execution_routed_to"]; got != "gascity/reviewer" {
 		t.Fatalf("logical retry gc.execution_routed_to = %q, want gascity/reviewer", got)
@@ -5556,8 +5873,8 @@ on_exhausted = "hard_fail"
 					continue
 				case "scope-check", "workflow-finalize", "fanout", "check", "retry-eval":
 					step.Metadata["gc.execution_routed_to"] = "gascity/reviewer"
-					delete(step.Metadata, "gc.routed_to")
-					step.Assignee = "gascity--control-dispatcher"
+					step.Metadata["gc.routed_to"] = "gascity/control-dispatcher"
+					step.Assignee = ""
 				default:
 					step.Metadata["gc.routed_to"] = "gascity/reviewer"
 					delete(step.Metadata, "gc.execution_routed_to")
@@ -5581,8 +5898,11 @@ on_exhausted = "hard_fail"
 	if retryControl.Metadata["gc.kind"] != "retry" {
 		t.Fatalf("retry control gc.kind = %q, want retry", retryControl.Metadata["gc.kind"])
 	}
-	if got := retryControl.Assignee; got != "gascity--control-dispatcher" {
-		t.Fatalf("retry control assignee = %q, want gascity--control-dispatcher", got)
+	if got := retryControl.Assignee; got != "" {
+		t.Fatalf("retry control assignee = %q, want empty routed control-dispatcher queue", got)
+	}
+	if got := retryControl.Metadata["gc.routed_to"]; got != "gascity/control-dispatcher" {
+		t.Fatalf("retry control gc.routed_to = %q, want gascity/control-dispatcher", got)
 	}
 	if got := retryControl.Metadata["gc.execution_routed_to"]; got != "gascity/reviewer" {
 		t.Fatalf("retry control gc.execution_routed_to = %q, want gascity/reviewer", got)
@@ -5595,11 +5915,11 @@ on_exhausted = "hard_fail"
 	if scopeCheck.Metadata["gc.kind"] != "scope-check" {
 		t.Fatalf("scope-check gc.kind = %q, want scope-check", scopeCheck.Metadata["gc.kind"])
 	}
-	if got := scopeCheck.Assignee; got != "gascity--control-dispatcher" {
-		t.Fatalf("scope-check assignee = %q, want gascity--control-dispatcher", got)
+	if got := scopeCheck.Assignee; got != "" {
+		t.Fatalf("scope-check assignee = %q, want empty routed control-dispatcher queue", got)
 	}
-	if got := scopeCheck.Metadata["gc.routed_to"]; got != "" {
-		t.Fatalf("scope-check gc.routed_to = %q, want empty direct dispatcher assignee", got)
+	if got := scopeCheck.Metadata["gc.routed_to"]; got != "gascity/control-dispatcher" {
+		t.Fatalf("scope-check gc.routed_to = %q, want gascity/control-dispatcher", got)
 	}
 	if got := scopeCheck.Metadata["gc.execution_routed_to"]; got != "gascity/reviewer" {
 		t.Fatalf("scope-check gc.execution_routed_to = %q, want gascity/reviewer", got)

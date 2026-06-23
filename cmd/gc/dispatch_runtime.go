@@ -714,7 +714,8 @@ func workflowServeWorkQuery(agentCfg config.Agent, expandedWorkQuery ...string) 
 func isWorkflowServeControlDispatcherAgent(agentCfg config.Agent) bool {
 	qualified := strings.TrimSpace(agentCfg.QualifiedName())
 	return qualified == config.ControlDispatcherAgentName ||
-		strings.HasSuffix(qualified, "/"+config.ControlDispatcherAgentName)
+		strings.HasSuffix(qualified, "/"+config.ControlDispatcherAgentName) ||
+		strings.HasSuffix(qualified, "."+config.ControlDispatcherAgentName)
 }
 
 func workflowServeControlReadyQuery(agentCfg config.Agent, controlSessionNames ...string) string {
@@ -750,6 +751,9 @@ func workflowServeControlReadyQueryForBeads(agentCfg config.Agent, beadsCfg conf
 	if legacy := workflowServeLegacyControlRoute(target); legacy != "" {
 		queryPrefix += ` GC_CONTROL_LEGACY_TARGET=` + shellquote.Quote(legacy)
 	}
+	if bare := controlDispatcherBareRoute(target); bare != "" {
+		queryPrefix += ` GC_CONTROL_BARE_TARGET=` + shellquote.Quote(bare)
+	}
 	query := queryPrefix + ` sh -c '` +
 		`set -e; ` +
 		`tmp=$(mktemp); seen="$tmp.seen"; err="$tmp.err"; : > "$seen"; trap "rm -f \"$tmp\" \"$seen\" \"$err\"" EXIT; ` +
@@ -770,6 +774,7 @@ func workflowServeControlReadyQueryForBeads(agentCfg config.Agent, beadsCfg conf
 		`done; ` +
 		`routed_ready "$GC_CONTROL_TARGET"; ` +
 		`routed_ready "${GC_CONTROL_LEGACY_TARGET:-}"; ` +
+		`routed_ready "${GC_CONTROL_BARE_TARGET:-}"; ` +
 		`if [ -s "$tmp" ]; then jq -s "` + jqFilter + `" "$tmp"; else printf "[]"; fi` + `'`
 	return query
 }
@@ -784,6 +789,32 @@ func workflowServeLegacyControlRoute(target string) string {
 		return strings.TrimSuffix(target, suffix) + "/workflow-control"
 	}
 	return ""
+}
+
+// controlDispatcherBareRoute returns the binding-stripped alias of a control
+// dispatcher's qualified name, e.g. "core.control-dispatcher" ->
+// "control-dispatcher" and "rig/core.control-dispatcher" ->
+// "rig/control-dispatcher". Pre-1.3 builds routed control beads to this bare
+// form (see the pre-migration controlDispatcherTargetForExecutionTarget), so
+// the qualified-name consumers must still claim/scale them after an upgrade.
+// Returns "" when target is already bare (no distinct alias) or is not a
+// control-dispatcher route.
+func controlDispatcherBareRoute(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" || target == config.ControlDispatcherAgentName {
+		return ""
+	}
+	dir, name := config.ParseQualifiedName(target)
+	if name == config.ControlDispatcherAgentName {
+		return "" // already bare (possibly rig-scoped); the target itself matches
+	}
+	if !strings.HasSuffix(name, "."+config.ControlDispatcherAgentName) {
+		return ""
+	}
+	if dir != "" {
+		return dir + "/" + config.ControlDispatcherAgentName
+	}
+	return config.ControlDispatcherAgentName
 }
 
 func nextWorkflowServeBeads(workQuery, dir string, env map[string]string) ([]hookBead, error) {

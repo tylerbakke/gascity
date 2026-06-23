@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/testfixtures/reviewworkflows"
 )
 
@@ -573,9 +574,21 @@ func dumpReviewFormulaCityState(t *testing.T, cityDir string) {
 	t.Helper()
 	out, _ := bdDolt(cityDir, "list", "--json", "--all", "--limit=0")
 	t.Logf("all beads:\n%s", out)
+	sessionList, _ := gcDolt(cityDir, "session", "list")
+	t.Logf("sessions:\n%s", sessionList)
 	if traceFile := filepath.Join(cityDir, "graph-workflow-trace.log"); fileExists(traceFile) {
 		data, _ := os.ReadFile(traceFile)
 		t.Logf("agent trace:\n%s", string(data))
+	}
+	for _, traceFile := range []string{
+		citylayout.ControlDispatcherTraceDefaultPath(cityDir),
+		citylayout.ControlDispatcherTraceDefaultPathFor(cityDir, "core.control-dispatcher"),
+	} {
+		if !fileExists(traceFile) {
+			continue
+		}
+		data, _ := os.ReadFile(traceFile)
+		t.Logf("control dispatcher trace %s:\n%s", traceFile, string(data))
 	}
 }
 

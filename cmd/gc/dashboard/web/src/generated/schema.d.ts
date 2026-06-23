@@ -2117,6 +2117,7 @@ export interface components {
             StartCommand: string | null;
             Suspended: boolean | null;
             TmuxAlias: string | null;
+            Upstream: string | null;
             WakeMode: string | null;
             WorkDir: string | null;
         };
@@ -7146,12 +7147,16 @@ export interface components {
             provider?: string;
             queued?: boolean;
             result: string;
+            /** @description Run-root identifier for rolling this operation up to a workflow/molecule/chat run (best-effort). */
+            run_id?: string;
             session_id?: string;
             session_name?: string;
             /** Format: date-time */
             started_at: string;
             template?: string;
             transport?: string;
+            /** @description True when tokens were observed but no price resolved (best-effort tri-state; absent = not evaluated). */
+            unpriced?: boolean;
         };
         WorkflowAttemptSummary: {
             /** Format: int64 */

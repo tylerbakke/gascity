@@ -367,7 +367,7 @@ func newStartCmd(stdout, stderr io.Writer) *cobra.Command {
 	var foregroundMode bool
 	var jsonOut bool
 	cmd := &cobra.Command{
-		Use:   "start [path]",
+		Use:   "start [path|name]",
 		Short: "Start the city under the machine-wide supervisor",
 		Long: `Start the city under the machine-wide supervisor.
 
@@ -379,7 +379,8 @@ Use "gc supervisor run" for foreground operation.`,
   gc start ~/my-city
   gc start --dry-run
   gc supervisor run`,
-		Args: cobra.MaximumNArgs(1),
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: completeCityNames,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if jsonOut && (foregroundMode || dryRunMode) {
 				fmt.Fprintln(stderr, "gc start: --json is only supported for supervisor-managed start") //nolint:errcheck // best-effort stderr
@@ -566,12 +567,31 @@ func doStartWithNameOverrideJSON(args []string, controllerMode bool, stdout, std
 func resolveStartDir(args []string) (string, error) {
 	switch {
 	case len(args) > 0:
-		return filepath.Abs(args[0])
+		return resolveStartDirRef(args[0])
 	case cityFlag != "":
-		return filepath.Abs(cityFlag)
+		return resolveStartDirRef(cityFlag)
 	default:
 		return os.Getwd()
 	}
+}
+
+// resolveStartDirRef resolves a name-or-path start/restart reference to a
+// directory that requireBootstrappedCity can turn into a bootstrapped city. A
+// name-shaped reference is routed through the shared name resolver (the same
+// rig-aware path used by resolveCommandContext and resolveStopCityPath) so a
+// slashless local rig directory such as "frontend" resolves to its owning city
+// instead of failing as an unknown city name. Path-shaped references keep the
+// original filepath.Abs behavior, leaving city validation to
+// requireBootstrappedCity.
+func resolveStartDirRef(ref string) (string, error) {
+	if classifyCityRef(ref) == cityRefName {
+		ctx, err := resolveCityNameContext(ref, resolveContextFromPath)
+		if err != nil {
+			return "", err
+		}
+		return ctx.CityPath, nil
+	}
+	return filepath.Abs(ref)
 }
 
 func requireBootstrappedCity(dir string) (string, error) {

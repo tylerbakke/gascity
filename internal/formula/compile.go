@@ -300,6 +300,7 @@ func toRecipeWithGraph(f *Formula, graphWorkflow bool) (*Recipe, error) {
 	r := &Recipe{
 		Name:          f.Formula,
 		Description:   f.Description,
+		Metadata:      cloneFormulaMetadata(f.Metadata),
 		Vars:          f.Vars,
 		Phase:         f.Phase,
 		Pour:          f.Pour,

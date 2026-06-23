@@ -32,6 +32,7 @@ import (
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
+	"github.com/gastownhall/gascity/internal/usage"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
@@ -48,6 +49,7 @@ type controllerState struct {
 	cityBeadsDiagnostic    *beads.BeadsDiagnostic
 	cityMailProv           mail.Provider // city-level mail provider (all mail is city-scoped)
 	eventProv              events.Provider
+	usageSink              usage.Sink
 	editor                 *configedit.Editor
 	cityName               string
 	cityPath               string
@@ -126,6 +128,7 @@ func newControllerState(
 		sp:                sp,
 		cacheCtx:          ctx,
 		eventProv:         ep,
+		usageSink:         usageSinkForCity(cfg, cityPath),
 		editor:            configedit.NewEditor(fsys.OSFS{}, tomlPath),
 		cityName:          cityName,
 		cityPath:          cityPath,
@@ -576,6 +579,9 @@ func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	// Build new stores outside the lock (may do file I/O / subprocess spawns).
 	stores := cs.buildStores(cfg)
 	storeSignature := storeMetadataSignature(cs.cityPath, cfg)
+	// Recompute the usage sink so a changed [usage].provider takes effect on
+	// reload instead of writing to the old sink until the controller restarts.
+	usageSink := usageSinkForCity(cfg, cs.cityPath)
 	// Reopen city-level store for session beads and mail.
 	openedCityStore, err := newControllerStateOpenCityStore(cs.cityPath)
 	if err != nil {
@@ -598,6 +604,7 @@ func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	cs.mu.Lock()
 	cs.cfg = cfg
 	cs.sp = sp
+	cs.usageSink = usageSink
 	oldRigStores = cs.beadStores
 	cs.beadStores = stores
 	if cityStore != nil {
@@ -717,9 +724,13 @@ func (cs *controllerState) updateConfigAndProviderOnly(cfg *config.City, sp runt
 	cs.updateMu.Lock()
 	defer cs.updateMu.Unlock()
 
+	// Recompute the usage sink so a changed [usage].provider takes effect even on
+	// the store-reuse reload path.
+	usageSink := usageSinkForCity(cfg, cs.cityPath)
 	cs.mu.Lock()
 	cs.cfg = cfg
 	cs.sp = sp
+	cs.usageSink = usageSink
 	cs.mu.Unlock()
 }
 
@@ -1010,6 +1021,17 @@ func (cs *controllerState) EventProvider() events.Provider {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	return cs.eventProv
+}
+
+// UsageSink returns the usage-fact sink. Never nil: usage.Discard when usage is
+// disabled or unset.
+func (cs *controllerState) UsageSink() usage.Sink {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.usageSink == nil {
+		return usage.Discard
+	}
+	return cs.usageSink
 }
 
 // CityName returns the city name.

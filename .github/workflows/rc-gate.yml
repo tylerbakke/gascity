@@ -8,7 +8,16 @@ permissions:
 
 env:
   DOLT_VERSION: "2.1.7"
-  BD_VERSION: "v1.0.5"
+  BD_VERSION: "v1.0.4"
+  # Bypass the systemd gascity-test.slice re-exec on CI runners. The Blacksmith
+  # runners' user systemd cannot reliably create a transient --scope for the
+  # heavy acceptance workloads; gc_test_slice_reexec then exec's
+  # `systemd-run --quiet`, which fails with no output and silently fails every
+  # acceptance shard before any test runs (observed in run 27745473874, all 5
+  # tier-C shards dead in ~40s). Plain execution is the historical default and
+  # is safe on these runners. Graceful-fallback fix for the slice helper is
+  # tracked separately; until then the RC gate must not depend on the slice.
+  GC_TEST_NO_SLICE: "1"
 
 jobs:
   # Reuse the shared CI graph so RC inherits new parity checks automatically.
@@ -170,7 +179,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         shard_index: [1, 2, 3, 4, 5]
     env:
@@ -206,7 +215,7 @@ jobs:
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 8
       matrix:
         include:
           - shard_name: packages-core-1-of-4
@@ -249,19 +258,19 @@ jobs:
             timeout_minutes: 20
             command: ./scripts/test-integration-shard packages-runtime-tmux-3-of-3
           - shard_name: review-formulas-basic-1-of-2
-            timeout_minutes: 20
+            timeout_minutes: 35
             command: ./scripts/test-integration-shard review-formulas-basic-1-of-2
           - shard_name: review-formulas-basic-2-of-2
-            timeout_minutes: 20
+            timeout_minutes: 35
             command: ./scripts/test-integration-shard review-formulas-basic-2-of-2
           - shard_name: review-formulas-retries-1-of-2
-            timeout_minutes: 20
+            timeout_minutes: 35
             command: ./scripts/test-integration-shard review-formulas-retries-1-of-2
           - shard_name: review-formulas-retries-2-of-2
-            timeout_minutes: 20
+            timeout_minutes: 35
             command: ./scripts/test-integration-shard review-formulas-retries-2-of-2
           - shard_name: review-formulas-recovery
-            timeout_minutes: 25
+            timeout_minutes: 35
             command: make test-integration-review-formulas-recovery
           - shard_name: bdstore
             timeout_minutes: 15
@@ -330,7 +339,7 @@ jobs:
     timeout-minutes: 110
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         shard_index: [1, 2, 3, 4, 5, 6]
     env:

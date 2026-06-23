@@ -31,7 +31,7 @@ func buildMemGraphWorkflowConfig(t *testing.T) *config.City {
 	t.Helper()
 	cfg := &config.City{
 		Daemon: config.DaemonConfig{
-			FormulaV2: true,
+			FormulaV2: boolPtr(true),
 		},
 		Workspace: config.Workspace{Name: "test-city"},
 		FormulaLayers: config.FormulaLayers{
@@ -41,10 +41,55 @@ func buildMemGraphWorkflowConfig(t *testing.T) *config.City {
 			{Name: "worker", MaxActiveSessions: intPtr(1)},
 		},
 	}
+	addTestControlDispatcherAgents(cfg, "")
 	applyFeatureFlags(cfg)
 	t.Cleanup(func() { applyFeatureFlags(&config.City{}) })
-	config.InjectImplicitAgents(cfg)
 	return cfg
+}
+
+func addTestControlDispatcherAgents(cfg *config.City, dirs ...string) {
+	if cfg == nil {
+		return
+	}
+	for _, dir := range dirs {
+		if hasTestControlDispatcherAgent(cfg, dir) {
+			continue
+		}
+		cfg.Agents = append(cfg.Agents, testControlDispatcherAgent(dir))
+	}
+}
+
+func hasTestControlDispatcherAgent(cfg *config.City, dir string) bool {
+	for _, agent := range cfg.Agents {
+		if agent.Name == config.ControlDispatcherAgentName && agent.Dir == dir {
+			return true
+		}
+	}
+	return false
+}
+
+func testControlDispatcherAgent(dir string) config.Agent {
+	return config.Agent{
+		Name:              config.ControlDispatcherAgentName,
+		Dir:               dir,
+		StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+		ProcessNames:      []string{"gc"},
+		MaxActiveSessions: intPtr(1),
+	}
+}
+
+func testControlDispatcherAgentTOML(dir string) string {
+	var b strings.Builder
+	b.WriteString("\n[[agent]]\n")
+	b.WriteString("name = \"control-dispatcher\"\n")
+	if dir != "" {
+		b.WriteString(fmt.Sprintf("dir = %q\n", dir))
+	}
+	b.WriteString("start_command = \"gc convoy control --serve --follow {{.Agent}}\"\n")
+	b.WriteString("prompt_mode = \"none\"\n")
+	b.WriteString("process_names = [\"gc\"]\n")
+	b.WriteString("max_active_sessions = 1\n")
+	return b.String()
 }
 
 func mustGetMemBead(t *testing.T, store beads.Store, id string) beads.Bead {
@@ -480,11 +525,11 @@ func TestGraphWorkflowInMemoryRouteUsesControlDispatcherForControlBeads(t *testi
 			continue
 		}
 		foundControl = true
-		if bead.Assignee != config.ControlDispatcherAgentName {
-			t.Fatalf("control bead %s assignee = %q, want %q", bead.ID, bead.Assignee, config.ControlDispatcherAgentName)
+		if bead.Assignee != "" {
+			t.Fatalf("control bead %s assignee = %q, want empty routed control-dispatcher queue", bead.ID, bead.Assignee)
 		}
-		if got := bead.Metadata["gc.routed_to"]; got != "" {
-			t.Fatalf("control bead %s gc.routed_to = %q, want empty direct dispatcher assignee", bead.ID, got)
+		if got := bead.Metadata["gc.routed_to"]; got != config.ControlDispatcherAgentName {
+			t.Fatalf("control bead %s gc.routed_to = %q, want %q", bead.ID, got, config.ControlDispatcherAgentName)
 		}
 	}
 	if !foundControl {

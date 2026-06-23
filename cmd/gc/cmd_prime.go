@@ -332,7 +332,7 @@ func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode boo
 		if a.PromptTemplate == "" {
 			promptFile := ""
 			if coreDir := cfg.PackDirByName("core"); coreDir != "" {
-				if cfg.Daemon.FormulaV2 {
+				if cfg.Daemon.FormulaV2Enabled() {
 					promptFile = filepath.Join(coreDir, "assets", "prompts", "graph-worker.md")
 				} else if a.SupportsInstanceExpansion() || isPoolInstance(cfg, a) {
 					promptFile = filepath.Join(coreDir, "assets", "prompts", "pool-worker.md")

@@ -1778,7 +1778,12 @@ max_active_sessions = 2
 	if err := os.MkdirAll(filepath.Dir(agentPath), 0o755); err != nil {
 		return err
 	}
-	prompt := "You are a pool worker for {{.City.Name}}. Work whatever is on your hook.\n"
+	promptPath := filepath.Join(helpers.FindModuleRoot(), "internal", "bootstrap", "packs", "core", "assets", "prompts", "pool-worker.md")
+	prompt, err := os.ReadFile(promptPath)
+	if err != nil {
+		return fmt.Errorf("reading canonical pool-worker prompt: %w", err)
+	}
+	prompt = append(prompt, []byte("\n## Worker Inference Fixture\n\nFor file-writing tasks in this live inference test, create or update the requested file before closing the work bead.\n")...)
 	if err := os.WriteFile(filepath.Join(filepath.Dir(agentPath), "prompt.template.md"), []byte(prompt), 0o644); err != nil {
 		return err
 	}
@@ -2733,7 +2738,7 @@ func runFreshInitSlingWorkForTarget(t *testing.T, provider, slingTarget, prompt,
 		"--delivery",
 		hookNudgeDelivery,
 		spawnedSession.SessionName,
-		"Check your hook for work assignments, complete the assigned work, and close the work bead.",
+		"Run gc hook --claim --drain-ack --json, complete the claimed work, close the work bead, and acknowledge drain.",
 	)
 	var lastWorkBead beadJSON
 	completed := false

@@ -14,6 +14,7 @@ REPORT_FILE="$GC_CITY/graph-workflow-steps.log"
 TRACE_FILE="$GC_CITY/graph-workflow-trace.log"
 ASSIGNEE="${GC_SESSION_NAME:-${GC_AGENT:-}}"
 HARNESS_STATE_DIR="$GC_CITY/.gc/test-harness"
+HOOK_TIMEOUT="${GC_GRAPH_HOOK_TIMEOUT:-35}"
 
 # Keep each worker/pool slot distinct at the beads actor layer.
 # `bd update --claim` claims "to you", so sharing one actor across sessions
@@ -217,6 +218,27 @@ ack_drain_if_idle() {
     exit 0
 }
 
+should_use_hook_fallback() {
+    if [ "${GC_GRAPH_HOOK_FALLBACK:-0}" = "1" ]; then
+        return 0
+    fi
+    if [ "${GC_SESSION_ORIGIN:-}" = "ephemeral" ]; then
+        return 0
+    fi
+    # Always-on named sessions also receive work that the deterministic control
+    # dispatcher assigned by SESSION BEAD ID -- e.g. ralph re-iterated
+    # run_target=<worker> steps land as assignee=<session bead id> with
+    # gc.routed_to cleared (internal/dispatch/control.go directSessionID route).
+    # The name-only `bd ready --assignee=$ASSIGNEE` fast path cannot match a
+    # bead-ID assignee, so a named session must fall back to `gc hook`, whose
+    # work query resolves by GC_SESSION_ID too. Omitting this stalls the worker
+    # (it name-polls into the void) and hangs the review workflow.
+    if [ "${GC_SESSION_ORIGIN:-}" = "named" ]; then
+        return 0
+    fi
+    [ -n "${GC_TEMPLATE:-}" ] && [ "${GC_TEMPLATE:-}" != "${GC_AGENT:-}" ]
+}
+
 trace "startup pid=$$ assignee=${ASSIGNEE:-}"
 trace_store
 cleanup() {
@@ -260,10 +282,21 @@ fetch_ready_queue() {
     if [ -z "$ASSIGNEE" ]; then
         return 1
     fi
-    # gc hook resolves the current session via GC_ALIAS/GC_AGENT and uses the
-    # session model work query tiers, so it can see both directly assigned work
-    # and generic routed work for controller-materialized sessions.
-    timeout 10 gc hook 2>/dev/null
+    # Graph workflow attempts are preassigned by the deterministic control
+    # dispatcher. Read that assigned queue directly so empty polls do not spend
+    # their budget in gc hook/native-store preflight. Keep the full hook path
+    # available for tests that explicitly need generic routed work.
+    if ready=$(timeout 10 bd ready --assignee="$ASSIGNEE" --json --limit=0 2>/dev/null); then
+        if printf '%s\n' "$ready" | json_payload | jq -e 'if type == "array" then length > 0 else . != null end' >/dev/null 2>&1; then
+            printf '%s\n' "$ready"
+            return 0
+        fi
+    fi
+    if should_use_hook_fallback; then
+        timeout "$HOOK_TIMEOUT" gc hook 2>/dev/null
+        return $?
+    fi
+    return 1
 }
 
 fetch_in_progress_queue() {

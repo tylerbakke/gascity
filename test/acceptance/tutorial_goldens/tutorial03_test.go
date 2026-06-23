@@ -318,12 +318,18 @@ func TestTutorial03Sessions(t *testing.T) {
 	}
 
 	t.Run("gc session logs mayor --tail 2", func(t *testing.T) {
-		out, err := ws.runShell("gc session logs mayor --tail 2", "")
-		if err != nil {
-			t.Fatalf("gc session logs mayor --tail 2: %v\n%s", err, out)
-		}
-		if strings.TrimSpace(out) == "" {
-			t.Fatal("session logs --tail 2 output is empty")
+		// Re-probe rather than assert once: the transcript tail can still be
+		// momentarily unwritten right after readiness. The render path itself
+		// is now guaranteed non-empty per tail slot (see cmd_session_logs.go),
+		// so this only absorbs write-timing, not the old render gap.
+		var lastOut string
+		ok := waitForCondition(t, 30*time.Second, 1*time.Second, func() bool {
+			out, err := ws.runShell("gc session logs mayor --tail 2", "")
+			lastOut = out
+			return err == nil && strings.TrimSpace(out) != ""
+		})
+		if !ok {
+			t.Fatalf("session logs --tail 2 stayed empty within 30s; last output:\n%s", lastOut)
 		}
 	})
 

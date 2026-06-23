@@ -112,12 +112,19 @@ func TestTutorial01Cities(t *testing.T) {
 			}
 			for _, want := range []string{
 				`provider = "claude"`,
-				`includes = [".gc/system/packs/core", ".gc/system/packs/bd"]`,
-				`formula_v2 = true`,
 			} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("city.toml missing %q:\n%s", want, out)
 				}
+			}
+			// formula_v2 is on by default and intentionally omitted from
+			// generated city.toml (a pinned default is confusing and risks
+			// writing formula_v2=false). It must not appear at all.
+			if strings.Contains(out, "formula_v2") {
+				t.Fatalf("city.toml should omit formula_v2 (default-on):\n%s", out)
+			}
+			if strings.Contains(out, `includes = [".gc/system/packs/core"`) {
+				t.Fatalf("city.toml should not carry legacy builtin includes:\n%s", out)
 			}
 		})
 
@@ -129,6 +136,9 @@ func TestTutorial01Cities(t *testing.T) {
 			for _, want := range []string{
 				`name = "my-city"`,
 				`schema = 2`,
+				`[imports.core]`,
+				`[imports.bd]`,
+				`[imports.gascity]`,
 				`[[named_session]]`,
 				`template = "mayor"`,
 				`mode = "always"`,
@@ -144,7 +154,7 @@ func TestTutorial01Cities(t *testing.T) {
 			if err != nil {
 				t.Fatalf("gc status: %v\n%s", err, out)
 			}
-			for _, want := range []string{"my-city", "Controller:", "Named sessions:", "mayor", "dolt.dog", "control-dispatcher"} {
+			for _, want := range []string{"my-city", "Controller:", "Named sessions:", "mayor", "bd.dog", "control-dispatcher"} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("gc status missing %q:\n%s", want, out)
 				}

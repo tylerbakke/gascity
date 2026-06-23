@@ -58,7 +58,7 @@ func startStandaloneBdDoltLikeProcess(t *testing.T, dataDir string) *exec.Cmd {
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatalf("Mkfifo(sql-server): %v", err)
 	}
-	cmd := exec.Command("bash", "-c", "exec -a dolt cat sql-server")
+	cmd := exec.Command("bash", "-c", `exec -a dolt cat sql-server -- --data-dir "$1"`, "fake-dolt", dataDir)
 	cmd.Dir = dataDir
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard

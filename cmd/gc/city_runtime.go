@@ -1783,14 +1783,18 @@ func (cr *CityRuntime) reloadConfigTraced(
 	nextDops := cr.dops
 	providerChanged := false
 
-	// Detect session provider change.
+	// Detect session provider change. A pack-declared runtime binds its
+	// command into the provider at construction time, so a changed (or
+	// added/removed) declaration behind an unchanged selection name also
+	// requires a rebuild — otherwise session ops keep forking the old
+	// executable until a controller restart.
 	newProviderName := nextCfg.Session.Provider
 	pendingProviderName := *lastProviderName
 	if v := os.Getenv("GC_SESSION"); v != "" {
 		newProviderName = v
 	}
-	if newProviderName != *lastProviderName {
-		newSp, spErr := newSessionProviderByName(newProviderName, nextCfg.Session, cr.cityName, cr.cityPath)
+	if newProviderName != *lastProviderName || packRuntimeDeclarationChanged(cr.cfg, nextCfg, newProviderName) {
+		newSp, spErr := newSessionProviderForCityByName(nextCfg, newProviderName, nextCfg.Session, cr.cityName, cr.cityPath)
 		if spErr != nil {
 			appendWarning(fmt.Sprintf("new session provider %q: %v (keeping old provider)", newProviderName, spErr))
 		} else {
@@ -1872,15 +1876,19 @@ func (cr *CityRuntime) reloadConfigTraced(
 				Warnings: warnings,
 			}
 		}
+		providerSwapSummary := fmt.Sprintf("%s → %s", displayProviderName(*lastProviderName), displayProviderName(pendingProviderName))
+		if pendingProviderName == *lastProviderName {
+			providerSwapSummary = fmt.Sprintf("%s runtime declaration changed", displayProviderName(pendingProviderName))
+		}
 		if len(running) > 0 {
-			fmt.Fprintf(cr.stdout, "Provider changed (%s → %s), stopping %d agent(s)...\n", //nolint:errcheck
-				displayProviderName(*lastProviderName), displayProviderName(pendingProviderName), len(running))
+			fmt.Fprintf(cr.stdout, "Provider changed (%s), stopping %d agent(s)...\n", //nolint:errcheck
+				providerSwapSummary, len(running))
 			gracefulStopAll(running, cr.sp, nextCfg.Daemon.ShutdownTimeoutDuration(), cr.rec, cr.cfg, cr.cityBeadStore(), cr.stdout, cr.stderr)
 		}
 		cr.rec.Record(events.Event{
 			Type:    events.ProviderSwapped,
 			Actor:   "gc",
-			Message: fmt.Sprintf("%s → %s", displayProviderName(*lastProviderName), displayProviderName(pendingProviderName)),
+			Message: providerSwapSummary,
 		})
 		fmt.Fprintf(cr.stdout, "Session provider swapped to %s.\n", displayProviderName(pendingProviderName)) //nolint:errcheck
 		*lastProviderName = pendingProviderName
@@ -2095,6 +2103,9 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		recordPhase(TraceSiteSessionSnapshot, "bead_reconcile.load_session_snapshot", phaseStart, traceSessionSnapshotFields(sessionBeads))
 		result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
 	}
+	// Emit any due compute usage facts by reusing the open-session snapshot this
+	// tick already loaded, rather than issuing a second redundant store scan.
+	cr.emitDueComputeFacts(ctx, sessionBeads.Open())
 	rigStores := cr.rigBeadStores()
 	assignedWorkBeads := result.AssignedWorkBeads
 	assignedWorkStoreRefs := result.AssignedWorkStoreRefs
@@ -2196,97 +2207,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// work_query here can block assigned-work resumes behind unrelated probes.
 	workSet := make(map[string]bool)
 	traceWorkRequested := traceWorkRequestedByTemplate(result.ScaleCheckCounts, result.NamedSessionDemand, workSet, cr.cfg)
-	if trace != nil {
-		phaseStart = time.Now()
-		templateNames := make(map[string]struct{})
-		openCounts := make(map[string]int)
-		desiredCounts := make(map[string]int)
-		for _, bead := range open {
-			template := normalizedSessionTemplate(bead, cr.cfg)
-			if template == "" {
-				continue
-			}
-			templateNames[template] = struct{}{}
-			openCounts[template]++
-			trace.RecordSessionBaseline(template, bead.Metadata["session_name"], map[string]any{
-				"state":        bead.Metadata["state"],
-				"sleep_reason": bead.Metadata["sleep_reason"],
-			})
-		}
-		for _, tp := range desiredState {
-			if tp.TemplateName == "" {
-				continue
-			}
-			templateNames[tp.TemplateName] = struct{}{}
-			desiredCounts[tp.TemplateName]++
-		}
-		for template := range poolDesired {
-			templateNames[template] = struct{}{}
-		}
-		for template := range workSet {
-			templateNames[template] = struct{}{}
-		}
-		for template := range traceWorkRequested {
-			templateNames[template] = struct{}{}
-		}
-		for _, template := range traceSetStrings(templateNames) {
-			status := TraceEvaluationEligible
-			reason := TraceReasonRetained
-			if desiredCounts[template] == 0 && poolDesired[template] == 0 && openCounts[template] == 0 {
-				status = TraceEvaluationSkipped
-				reason = TraceReasonNoDemand
-			}
-			trace.RecordTemplateSummary(template, "", status, reason, map[string]any{
-				"desired_count":  desiredCounts[template],
-				"open_count":     openCounts[template],
-				"pool_desired":   poolDesired[template],
-				"work_requested": traceWorkRequested[template],
-			})
-		}
-		trace.RecordCycleInputSnapshot(map[string]any{
-			"desired_session_count":               len(desiredState),
-			"open_session_count":                  len(open),
-			"scale_check_counts":                  result.ScaleCheckCounts,
-			"pool_desired":                        poolDesired,
-			"ready_wait_count":                    len(readyWaitSet),
-			"work_set_count":                      len(workSet),
-			"store_query_partial":                 result.StoreQueryPartial,
-			"scale_check_query_partial":           len(result.ScaleCheckPartialTemplates) > 0,
-			"scale_check_partial_templates":       sortedBoolMapKeys(result.ScaleCheckPartialTemplates),
-			"pool_scale_check_partial_templates":  sortedBoolMapKeys(result.PoolScaleCheckPartialTemplates),
-			"named_scale_check_partial_templates": sortedBoolMapKeys(result.NamedScaleCheckPartialTemplates),
-			"session_query_partial":               result.SessionQueryPartial,
-			"snapshot_query_partial":              result.snapshotQueryPartial(),
-		})
-		for _, agent := range cr.cfg.Agents {
-			template := agent.QualifiedName()
-			if !trace.detailEnabled(template) {
-				continue
-			}
-			trace.RecordTemplateConfigSnapshot(template, map[string]any{
-				"provider":            firstNonEmpty(agent.Provider, cr.cfg.Session.Provider),
-				"session":             agent.Session,
-				"work_dir":            agent.WorkDir,
-				"dir":                 agent.Dir,
-				"suspended":           agent.Suspended,
-				"start_command":       agent.StartCommand,
-				"lifecycle":           agent.Lifecycle,
-				"args":                append([]string(nil), agent.Args...),
-				"prompt_mode":         agent.PromptMode,
-				"prompt_flag":         agent.PromptFlag,
-				"depends_on":          append([]string(nil), agent.DependsOn...),
-				"min_active_sessions": agent.MinActiveSessions,
-				"max_active_sessions": agent.MaxActiveSessions,
-				"scale_check":         agent.ScaleCheck,
-				"work_query":          agent.WorkQuery,
-				"sling_query":         agent.SlingQuery,
-			})
-		}
-		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_input_summary", phaseStart, map[string]any{
-			"template_count": len(templateNames),
-			"open_count":     len(open),
-		})
-	}
+	cr.recordReconcileTraceInputs(trace, open, desiredState, poolDesired, workSet, traceWorkRequested, readyWaitSet, result, recordPhase)
 
 	phaseStart = time.Now()
 	awakeAssignedWorkBeads := filterAssignedWorkBeadsForSessionWake(cr.cfg, cr.cityPath, open, assignedWorkBeads, assignedWorkStoreRefs)
@@ -2319,22 +2240,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		"awake_assigned_work_bead_count": len(awakeAssignedWorkBeads),
 	})
 	cr.requestDeferredDrainFollowUpTick()
-	if trace != nil {
-		phaseStart = time.Now()
-		for _, bead := range open {
-			template := normalizedSessionTemplate(bead, cr.cfg)
-			if template == "" {
-				continue
-			}
-			trace.RecordSessionResult(template, bead.Metadata["session_name"], TraceOutcomeComplete, TraceCompletenessComplete, map[string]any{
-				"state":        bead.Metadata["state"],
-				"sleep_reason": bead.Metadata["sleep_reason"],
-			})
-		}
-		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_session_results", phaseStart, map[string]any{
-			"open_count": len(open),
-		})
-	}
+	cr.recordReconcileTraceResults(trace, open, recordPhase)
 	phaseStart = time.Now()
 	dispatchSessionBeads, err := loadSessionBeadSnapshot(store)
 	if err != nil {
@@ -2351,6 +2257,141 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_dispatch_tick", phaseStart, nil)
 
 	// Idle recovery: detect pool sessions stuck at the prompt after
+}
+
+// recordReconcileTraceInputs records the per-template baseline, the cycle input
+// snapshot, and per-template config snapshots for one reconcile tick. It is a
+// no-op when trace is nil. It is split out of beadReconcileTick so that the hot
+// reconcile path is not dominated by trace bookkeeping.
+func (cr *CityRuntime) recordReconcileTraceInputs(
+	trace *sessionReconcilerTraceCycle,
+	open []beads.Bead,
+	desiredState map[string]TemplateParams,
+	poolDesired map[string]int,
+	workSet map[string]bool,
+	traceWorkRequested map[string]bool,
+	readyWaitSet map[string]bool,
+	result DesiredStateResult,
+	recordPhase func(TraceSiteCode, string, time.Time, map[string]any),
+) {
+	if trace == nil {
+		return
+	}
+	phaseStart := time.Now()
+	templateNames := make(map[string]struct{})
+	openCounts := make(map[string]int)
+	desiredCounts := make(map[string]int)
+	for _, bead := range open {
+		template := normalizedSessionTemplate(bead, cr.cfg)
+		if template == "" {
+			continue
+		}
+		templateNames[template] = struct{}{}
+		openCounts[template]++
+		trace.RecordSessionBaseline(template, bead.Metadata["session_name"], map[string]any{
+			"state":        bead.Metadata["state"],
+			"sleep_reason": bead.Metadata["sleep_reason"],
+		})
+	}
+	for _, tp := range desiredState {
+		if tp.TemplateName == "" {
+			continue
+		}
+		templateNames[tp.TemplateName] = struct{}{}
+		desiredCounts[tp.TemplateName]++
+	}
+	for template := range poolDesired {
+		templateNames[template] = struct{}{}
+	}
+	for template := range workSet {
+		templateNames[template] = struct{}{}
+	}
+	for template := range traceWorkRequested {
+		templateNames[template] = struct{}{}
+	}
+	for _, template := range traceSetStrings(templateNames) {
+		status := TraceEvaluationEligible
+		reason := TraceReasonRetained
+		if desiredCounts[template] == 0 && poolDesired[template] == 0 && openCounts[template] == 0 {
+			status = TraceEvaluationSkipped
+			reason = TraceReasonNoDemand
+		}
+		trace.RecordTemplateSummary(template, "", status, reason, map[string]any{
+			"desired_count":  desiredCounts[template],
+			"open_count":     openCounts[template],
+			"pool_desired":   poolDesired[template],
+			"work_requested": traceWorkRequested[template],
+		})
+	}
+	trace.RecordCycleInputSnapshot(map[string]any{
+		"desired_session_count":               len(desiredState),
+		"open_session_count":                  len(open),
+		"scale_check_counts":                  result.ScaleCheckCounts,
+		"pool_desired":                        poolDesired,
+		"ready_wait_count":                    len(readyWaitSet),
+		"work_set_count":                      len(workSet),
+		"store_query_partial":                 result.StoreQueryPartial,
+		"scale_check_query_partial":           len(result.ScaleCheckPartialTemplates) > 0,
+		"scale_check_partial_templates":       sortedBoolMapKeys(result.ScaleCheckPartialTemplates),
+		"pool_scale_check_partial_templates":  sortedBoolMapKeys(result.PoolScaleCheckPartialTemplates),
+		"named_scale_check_partial_templates": sortedBoolMapKeys(result.NamedScaleCheckPartialTemplates),
+		"session_query_partial":               result.SessionQueryPartial,
+		"snapshot_query_partial":              result.snapshotQueryPartial(),
+	})
+	for _, agent := range cr.cfg.Agents {
+		template := agent.QualifiedName()
+		if !trace.detailEnabled(template) {
+			continue
+		}
+		trace.RecordTemplateConfigSnapshot(template, map[string]any{
+			"provider":            firstNonEmpty(agent.Provider, cr.cfg.Session.Provider),
+			"session":             agent.Session,
+			"work_dir":            agent.WorkDir,
+			"dir":                 agent.Dir,
+			"suspended":           agent.Suspended,
+			"start_command":       agent.StartCommand,
+			"lifecycle":           agent.Lifecycle,
+			"args":                append([]string(nil), agent.Args...),
+			"prompt_mode":         agent.PromptMode,
+			"prompt_flag":         agent.PromptFlag,
+			"depends_on":          append([]string(nil), agent.DependsOn...),
+			"min_active_sessions": agent.MinActiveSessions,
+			"max_active_sessions": agent.MaxActiveSessions,
+			"scale_check":         agent.ScaleCheck,
+			"work_query":          agent.WorkQuery,
+			"sling_query":         agent.SlingQuery,
+		})
+	}
+	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_input_summary", phaseStart, map[string]any{
+		"template_count": len(templateNames),
+		"open_count":     len(open),
+	})
+}
+
+// recordReconcileTraceResults records the per-session terminal result for one
+// reconcile tick. No-op when trace is nil.
+func (cr *CityRuntime) recordReconcileTraceResults(
+	trace *sessionReconcilerTraceCycle,
+	open []beads.Bead,
+	recordPhase func(TraceSiteCode, string, time.Time, map[string]any),
+) {
+	if trace == nil {
+		return
+	}
+	phaseStart := time.Now()
+	for _, bead := range open {
+		template := normalizedSessionTemplate(bead, cr.cfg)
+		if template == "" {
+			continue
+		}
+		trace.RecordSessionResult(template, bead.Metadata["session_name"], TraceOutcomeComplete, TraceCompletenessComplete, map[string]any{
+			"state":        bead.Metadata["state"],
+			"sleep_reason": bead.Metadata["sleep_reason"],
+		})
+	}
+	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_session_results", phaseStart, map[string]any{
+		"open_count": len(open),
+	})
 }
 
 func filterReleasedAssignedWorkBeads(assignedWorkBeads []beads.Bead, released []releasedPoolAssignment) []beads.Bead {

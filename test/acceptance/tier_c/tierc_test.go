@@ -33,6 +33,7 @@ import (
 	"github.com/gastownhall/gascity/internal/configedit"
 	"github.com/gastownhall/gascity/internal/fsys"
 	helpers "github.com/gastownhall/gascity/test/acceptance/helpers"
+	"github.com/gastownhall/gascity/test/dolttest"
 	"github.com/gastownhall/gascity/test/tmuxtest"
 )
 
@@ -66,7 +67,7 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("TMPDIR", tmpRoot); err != nil {
 		panic("acceptance-c: setting TMPDIR: " + err.Error())
 	}
-	tmpDir, err := os.MkdirTemp(tmpRoot, "gcac-*")
+	tmpDir, err := os.MkdirTemp(tmpRoot, fmt.Sprintf("gcac-%d-*", os.Getpid()))
 	if err != nil {
 		panic("acceptance-c: creating temp dir: " + err.Error())
 	}
@@ -166,9 +167,15 @@ func TestMain(m *testing.M) {
 		panic("acceptance-c: tmux not found")
 	}
 
+	// Reap dolt orphans left by prior crashed runs, then guard this run so an
+	// interrupt / timeout / OOM does not leak a dolt sql-server (issue #3640).
+	dolttest.SweepStale(tmpRoot, "gcac-")
+	stopGuard := dolttest.Guard(tmpDir)
+
 	code := m.Run()
 
 	helpers.RunGC(testEnvC, "", "supervisor", "stop", "--wait") //nolint:errcheck
+	stopGuard()
 	os.Exit(code)
 }
 
@@ -190,6 +197,8 @@ func TestSwarm_SlingWorkCoderCommits(t *testing.T) {
 	c := helpers.NewCity(t, testEnvC)
 	c.InitFrom(filepath.Join(helpers.ExamplesDir(), "swarm"))
 	applyTierCAcceptanceConfig(t, c)
+	unregisterOut, unregisterErr := c.GC("unregister", c.Dir)
+	require.NoError(t, unregisterErr, "gc unregister after init: %s", unregisterOut)
 
 	// Add the rig via gc rig add (initializes beads, hooks, routes).
 	c.RigAdd(rigDir, "packs/swarm")
@@ -203,7 +212,7 @@ func TestSwarm_SlingWorkCoderCommits(t *testing.T) {
 	time.Sleep(15 * time.Second)
 
 	// Sling work to the coder pool.
-	out, err := c.GC("sling", swarmRigAgent(rigName, "coder"), "Create a file called hello.txt with the text 'hello world'")
+	out, err := c.GC("sling", swarmRigAgent(rigName, "coder"), "Create a file named hello.txt in the current working directory (use a relative path, not an absolute path) with the text 'hello world'")
 	if err != nil {
 		t.Fatalf("gc sling: %v\n%s", err, out)
 	}
@@ -260,7 +269,7 @@ func TestGastown_PolecatImplementsRefineryMerges(t *testing.T) {
 	}, 2*time.Minute, 2*time.Second, "rig bead store did not become ready")
 
 	// Sling attached formula work while the pool is suspended.
-	out, err := c.GC("sling", gastownRigAgent(rigName, "polecat"), "Create a file called feature.txt containing 'new feature'", "--on", "mol-polecat-work")
+	out, err := c.GC("sling", gastownRigAgent(rigName, "polecat"), "Create a file named feature.txt in the current working directory (use a relative path, not an absolute path) containing 'new feature'", "--on", "mol-polecat-work")
 	if err != nil {
 		t.Fatalf("gc sling: %v\n%s", err, out)
 	}
@@ -303,10 +312,10 @@ func TestGastown_PolecatImplementsRefineryMerges(t *testing.T) {
 	c.StartForeground()
 
 	// Poll for outcome: refinery must eventually merge the work to origin/main.
-	// 18 minutes: Synthetic-backed workers can take longer to start and
+	// 25 minutes: Synthetic-backed workers can take longer to start and
 	// complete the polecat -> witness -> refinery chain than the original
 	// Anthropic-backed budget this test was written around.
-	deadline := 18 * time.Minute
+	deadline := 25 * time.Minute
 	merged := pollForCondition(t, deadline, 15*time.Second, func() bool {
 		_ = gitCmd(t, rigDir, "fetch", "origin")
 		content := gitCmd(t, rigDir, "show", "origin/main:feature.txt")

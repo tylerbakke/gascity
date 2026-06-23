@@ -34,6 +34,7 @@ gc [flags]
 | [gc config](#gc-config) | Inspect and validate city configuration |
 | [gc converge](#gc-converge) | Manage convergence loops (bounded iterative refinement) |
 | [gc convoy](#gc-convoy) | Manage convoys — graphs of related work |
+| [gc costs](#gc-costs) | Show per-run usage and estimated cost for this city |
 | [gc dashboard](#gc-dashboard) | Web dashboard for monitoring the supervisor and managed cities |
 | [gc doctor](#gc-doctor) | Check workspace health |
 | [gc dolt-cleanup](#gc-dolt-cleanup) | Find and remove orphaned Dolt databases (Go-side core) |
@@ -1095,6 +1096,30 @@ gc convoy target <convoy-id> <branch> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL result |
+
+## gc costs
+
+Aggregate recorded usage facts (model tokens and compute wall-seconds)
+by run for local cost insight.
+
+Reads .gc/usage.jsonl (the local usage sink) and groups facts by run id. This
+reflects facts only under the default "local" usage provider; with an "exec:"
+or "discard" provider the facts are forwarded out of process or dropped, so
+gc costs shows nothing local.
+
+Cost is a list-price estimate for decision support, not an authoritative
+charge; invocations with no pricing are flagged "unpriced" and excluded from
+the cost total.
+
+```
+gc costs
+```
+
+**Example:**
+
+```
+gc costs
+```
 
 ## gc dashboard
 
@@ -2787,7 +2812,7 @@ maps to a configured agent are NOT updated; normal orphan/suspended
 drain handles them on the next tick.
 
 ```
-gc reload [path] [flags]
+gc reload [path|name] [flags]
 ```
 
 | Flag | Type | Default | Description |
@@ -2806,7 +2831,7 @@ mode this unregisters the city, then re-registers it and triggers an
 immediate reconcile.
 
 ```
-gc restart [path] [flags]
+gc restart [path|name] [flags]
 ```
 
 | Flag | Type | Default | Description |
@@ -2824,7 +2849,7 @@ gc hook/prime will return work. Use "gc agent resume" to resume
 individual agents, or "gc rig resume" for rigs.
 
 ```
-gc resume [path] [flags]
+gc resume [path|name] [flags]
 ```
 
 | Flag | Type | Default | Description |
@@ -3051,17 +3076,77 @@ These commands read and write session metadata to coordinate lifecycle
 events (drain, restart) between agents and the controller. They are
 designed to be called from within running agent sessions, not by humans.
 
+The exception is "gc runtime check", which validates a Runtime Provider
+Protocol executable — run by humans and runtime-pack CIs.
+
 ```
 gc runtime
 ```
 
 | Subcommand | Description |
 |------------|-------------|
+| [gc runtime check](#gc-runtime-check) | Validate a runtime executable against the Runtime Provider Protocol |
+| [gc runtime conformance](#gc-runtime-conformance) | Run the golden RPP conformance suite against a runtime executable |
 | [gc runtime drain](#gc-runtime-drain) | Signal a session to drain (wind down gracefully) |
 | [gc runtime drain-ack](#gc-runtime-drain-ack) | Acknowledge drain — signal the controller to stop this session |
 | [gc runtime drain-check](#gc-runtime-drain-check) | Check if a session is draining (exit 0 = draining) |
 | [gc runtime request-restart](#gc-runtime-request-restart) | Request controller restart this session (waits to be killed) |
 | [gc runtime undrain](#gc-runtime-undrain) | Cancel drain on a session |
+
+## gc runtime check
+
+Validate a runtime executable against the Runtime Provider Protocol (RPP v0).
+
+Runs the protocol handshake, the required lifecycle round-trip
+(start, is-running, stop, idempotent stop), exercises every capability
+the handshake declares, and probes optional operations. Optional
+operations that are absent (exit 2) are reported but never fail the
+run; everything else that misbehaves does. Exits non-zero if any check
+fails, so a runtime pack's CI can gate on it directly.
+
+The argument is an executable (path or PATH name) or a pack-declared
+runtime name: when it names a [runtimes.&lt;name&gt;] entry from the current
+city's packs, the check runs against that pack's declared command.
+Arguments containing a path separator, or matching an existing file,
+are always treated as the executable itself.
+
+The protocol contract is docs/reference/exec-session-provider.md.
+
+```
+gc runtime check <name|executable> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--command` | string |  | session command sent in the start config (default "sleep 300") |
+| `--session-name` | string |  | session name for the conformance round-trip (default: generated unique name) |
+
+## gc runtime conformance
+
+Run the golden Runtime Provider Protocol conformance suite against an
+executable. Every requirement is requirement-coded (RPP-&lt;GROUP&gt;-NNN) and
+mirrors the in-tree provider contract (RunProviderTests); a run that passes
+every required requirement is guaranteed to behave like a gascity runtime.
+
+Unlike "gc runtime check" (a lighter smoke test), each requirement is
+proven to gate: the suite is kept honest by negative tests in which a
+broken reference fails exactly its requirement's check.
+
+The argument is an executable (path or PATH name) or a pack-declared
+runtime name from the current city's packs. Path-like or existing-file
+arguments are always the executable itself.
+
+Use --json for a machine-readable report (CI artifacts). Exits non-zero if
+any required requirement fails.
+
+```
+gc runtime conformance <name|executable> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--env` | bool |  | also run the environment-plane capability suite (env.* guarantees) |
+| `--json` | bool |  | emit a machine-readable JSON report |
 
 ## gc runtime drain
 
@@ -3725,7 +3810,7 @@ ensures the supervisor is running, and triggers immediate reconciliation.
 Use "gc supervisor run" for foreground operation.
 
 ```
-gc start [path] [flags]
+gc start [path|name] [flags]
 ```
 
 **Example:**
@@ -3750,7 +3835,7 @@ Shows a city-wide overview: controller state, suspension,
 all agents with running status, rigs, and a summary count.
 
 ```
-gc status [path] [flags]
+gc status [path|name] [flags]
 ```
 
 | Flag | Type | Default | Description |
@@ -3774,7 +3859,7 @@ cleanup pass. Use --force to skip the interrupt grace period and go
 straight to kill.
 
 ```
-gc stop [path] [flags]
+gc stop [path|name] [flags]
 ```
 
 | Flag | Type | Default | Description |
@@ -3970,7 +4055,7 @@ The reconciler won't spawn agents, gc hook/prime return empty.
 Use "gc resume" to restore.
 
 ```
-gc suspend [path] [flags]
+gc suspend [path|name] [flags]
 ```
 
 | Flag | Type | Default | Description |
@@ -4098,11 +4183,18 @@ gc trace tail [flags]
 
 Remove a city from the machine-wide supervisor registry.
 
-If no path is given, unregisters the current city (discovered from cwd).
-If the supervisor is running, it immediately stops managing the city.
+The argument may be a path to a city directory or a registered city name (as
+shown by 'gc cities'); a name is resolved against the supervisor registry. An
+existing local city directory of the same name takes precedence over a
+registration; if a local city directory and a different registration both
+exist, the name is reported as ambiguous.
+If no argument is given, unregisters the current city (discovered from cwd).
+If the supervisor is running, it immediately stops managing the city. Unlike
+'gc register' (which is idempotent), this errors when the resolved path is not
+a registered city, so it is not a silent no-op on an unknown target.
 
 ```
-gc unregister [path] [flags]
+gc unregister [path|name] [flags]
 ```
 
 | Flag | Type | Default | Description |

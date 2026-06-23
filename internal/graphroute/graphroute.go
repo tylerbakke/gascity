@@ -195,28 +195,19 @@ func ApplyGraphRouteBinding(step *formula.RecipeStep, binding GraphRouteBinding)
 	step.Assignee = binding.SessionName
 }
 
-// ApplyGraphControlRouteBinding routes control steps directly to the
-// control-dispatcher session when possible. gc.routed_to intentionally means
-// "work for this config queue"; using it for a named dispatcher would create
-// config-routed work instead of delivering to the known dispatcher session.
+// ApplyGraphControlRouteBinding routes control steps to the singleton
+// control-dispatcher config queue. Direct session assignment is reserved for
+// already-existing concrete session owners, not future on-demand sessions.
 func ApplyGraphControlRouteBinding(step *formula.RecipeStep, binding GraphRouteBinding) {
 	// Clear any prior session back-references so the metadata matches the
 	// current binding when a control step is re-decorated (#2843).
 	delete(step.Metadata, beadmeta.SessionNameMetadataKey)
 	delete(step.Metadata, beadmeta.SessionIDMetadataKey)
-	if binding.DirectSessionID != "" {
+	if binding.QualifiedName != "" {
+		step.Metadata[beadmeta.RoutedToMetadataKey] = binding.QualifiedName
+	} else {
 		delete(step.Metadata, beadmeta.RoutedToMetadataKey)
-		step.Metadata[beadmeta.SessionIDMetadataKey] = binding.DirectSessionID
-		step.Assignee = binding.DirectSessionID
-		return
 	}
-	if binding.SessionName != "" {
-		delete(step.Metadata, beadmeta.RoutedToMetadataKey)
-		step.Metadata[beadmeta.SessionNameMetadataKey] = binding.SessionName
-		step.Assignee = binding.SessionName
-		return
-	}
-	delete(step.Metadata, beadmeta.RoutedToMetadataKey)
 	step.Assignee = ""
 }
 
@@ -263,7 +254,7 @@ func WorkflowExecutionRoute(bead beads.Bead) string {
 
 // ControlDispatcherBinding resolves the graph routing binding for the
 // control dispatcher agent.
-func ControlDispatcherBinding(store beads.Store, cityName string, cfg *config.City, rigContext string, deps Deps) (GraphRouteBinding, error) {
+func ControlDispatcherBinding(_ beads.Store, _ string, cfg *config.City, rigContext string, deps Deps) (GraphRouteBinding, error) {
 	if cfg == nil {
 		return GraphRouteBinding{}, fmt.Errorf("control-dispatcher route requires config")
 	}
@@ -272,15 +263,25 @@ func ControlDispatcherBinding(store beads.Store, cityName string, cfg *config.Ci
 	}
 	agentCfg, ok := deps.Resolver.ResolveAgent(cfg, config.ControlDispatcherAgentName, rigContext)
 	if !ok {
+		agentCfg, ok = configuredControlDispatcherForScope(cfg, rigContext)
+	}
+	if !ok {
 		return GraphRouteBinding{}, fmt.Errorf("control-dispatcher agent %q not found", config.ControlDispatcherAgentName)
 	}
-	binding := GraphRouteBinding{QualifiedName: agentCfg.QualifiedName()}
-	sn := agentutil.LookupSessionName(store, cityName, agentCfg.QualifiedName(), cfg.Workspace.SessionTemplate)
-	if sn == "" {
-		return GraphRouteBinding{}, fmt.Errorf("could not resolve session name for %q", agentCfg.QualifiedName())
+	return GraphRouteBinding{QualifiedName: agentCfg.QualifiedName(), MetadataOnly: true}, nil
+}
+
+func configuredControlDispatcherForScope(cfg *config.City, rigContext string) (config.Agent, bool) {
+	rigContext = strings.TrimSpace(rigContext)
+	for _, a := range cfg.Agents {
+		if !config.IsDeterministicControlDispatcher(&a) {
+			continue
+		}
+		if strings.TrimSpace(a.Dir) == rigContext {
+			return a, true
+		}
 	}
-	binding.SessionName = sn
-	return binding, nil
+	return config.Agent{}, false
 }
 
 // ResolveGraphStepBinding resolves the routing binding for a graph step
@@ -396,7 +397,7 @@ func ResolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 		return GraphRouteBinding{}, fmt.Errorf("ResolveAgent not configured")
 	}
 	if target.fromAssignee {
-		if binding, ok, err := resolveGraphDirectSessionBinding(store, cityName, cfg, target.value, rigContext, deps); err != nil {
+		if binding, ok, err := ResolveGraphDirectSessionBinding(store, cityName, cfg, target.value, rigContext, deps); err != nil {
 			return GraphRouteBinding{}, fmt.Errorf("step %s: %w", stepID, err)
 		} else if ok {
 			cache[stepID] = binding
@@ -409,7 +410,7 @@ func ResolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 		return GraphRouteBinding{}, fmt.Errorf("step %s: unknown formulas v2 target %q", stepID, target.value)
 	}
 	binding := GraphRouteBinding{QualifiedName: agentCfg.QualifiedName()}
-	if agentutil.IsMultiSessionAgent(&agentCfg) {
+	if agentCfg.SupportsInstanceExpansion() {
 		binding.MetadataOnly = true
 		cache[stepID] = binding
 		return binding, nil
@@ -423,10 +424,24 @@ func ResolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 	return binding, nil
 }
 
-func resolveGraphDirectSessionBinding(store beads.Store, cityName string, cfg *config.City, target, rigContext string, deps Deps) (GraphRouteBinding, bool, error) {
+// ResolveGraphDirectSessionBinding resolves a direct-session route target to a
+// concrete session bead, returning ok=false when the target is not a
+// direct-session reference (so the caller can fall back to config-agent
+// routing). Exact session bead IDs win over config target names; config-named
+// sessions are materialized through deps.DirectSessionResolver. This is the
+// canonical implementation shared by the graphroute library path and the CLI
+// projection in cmd/gc.
+func ResolveGraphDirectSessionBinding(store beads.Store, cityName string, cfg *config.City, target, rigContext string, deps Deps) (GraphRouteBinding, bool, error) {
 	target = strings.TrimSpace(target)
 	if store == nil || target == "" {
 		return GraphRouteBinding{}, false, nil
+	}
+	// Exact session bead IDs are unambiguous and must win even when they
+	// collide with a config target name.
+	if id, err := session.ResolveSessionIDByExactID(store, target); err == nil {
+		if bead, getErr := store.Get(id); getErr == nil && session.IsSessionBeadOrRepairable(bead) && bead.Status != "closed" {
+			return GraphRouteBinding{DirectSessionID: bead.ID, RigContext: graphDirectSessionRigContext(target, rigContext, bead)}, true, nil
+		}
 	}
 	if deps.DirectSessionResolver != nil {
 		id, ok, err := deps.DirectSessionResolver(store, cityName, deps.CityPath, cfg, target, rigContext)
@@ -444,13 +459,6 @@ func resolveGraphDirectSessionBinding(store beads.Store, cityName string, cfg *c
 				}
 			}
 			return binding, true, nil
-		}
-	}
-	// Exact session bead IDs are unambiguous and must win even when they
-	// collide with a config target name.
-	if id, err := session.ResolveSessionIDByExactID(store, target); err == nil {
-		if bead, getErr := store.Get(id); getErr == nil && session.IsSessionBeadOrRepairable(bead) && bead.Status != "closed" {
-			return GraphRouteBinding{DirectSessionID: bead.ID, RigContext: graphDirectSessionRigContext(target, rigContext, bead)}, true, nil
 		}
 	}
 	if cfg != nil && deps.Resolver != nil {
@@ -607,7 +615,7 @@ func ApplyGraphRouting(recipe *formula.Recipe, a *config.Agent, routedTo string,
 	}
 
 	var sessionName string
-	if !agentutil.IsMultiSessionAgent(a) {
+	if !a.SupportsInstanceExpansion() {
 		sessionName = agentutil.LookupSessionName(store, cityName, a.QualifiedName(), cfg.Workspace.SessionTemplate)
 		if sessionName == "" {
 			return fmt.Errorf("could not resolve session name for %q", a.QualifiedName())

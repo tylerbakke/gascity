@@ -2783,9 +2783,6 @@ func TestDoInitWritesExpectedTOML(t *testing.T) {
 	got := string(f.Files[filepath.Join("/bright-lights", "city.toml")])
 	want := `[workspace]
 
-[daemon]
-formula_v2 = true
-
 # [mail]
 # retention_ttl controls how long read messages are retained before purge.
 # 0 disables retention; use "168h" for 7 days.
@@ -2798,7 +2795,9 @@ formula_v2 = true
 
 	// pack.toml keeps the portable pack metadata, the pinned builtin pack
 	// imports (core + bd for the default bd provider), and the named
-	// session; the fresh mayor scaffold comes from agents/<name>/ discovery.
+	// sessions; the fresh mayor scaffold comes from agents/<name>/ discovery,
+	// while the control dispatcher is an explicit city-owned alias for the
+	// core import's deterministic dispatcher template.
 	packGot := string(f.Files[filepath.Join("/bright-lights", "pack.toml")])
 	packWant := `[pack]
 name = "bright-lights"
@@ -3959,11 +3958,11 @@ scale_check = "echo 3"
 	if cfg.ResolvedWorkspaceName != "bright-lights" {
 		t.Errorf("ResolvedWorkspaceName = %q, want %q (should be overridden)", cfg.ResolvedWorkspaceName, "bright-lights")
 	}
-	// The builtin core pack ships no agents (the former maintenance
-	// fallback dog is gone), so only the two authored agents are explicit.
+	// The builtin core pack contributes the visible control-dispatcher agent;
+	// the former maintenance fallback dog remains gone.
 	explicit := explicitAgents(cfg.Agents)
-	if len(explicit) != 2 {
-		t.Fatalf("len(explicitAgents) = %d, want 2", len(explicit))
+	if len(explicit) != 3 {
+		t.Fatalf("len(explicitAgents) = %d, want 3", len(explicit))
 	}
 	explicitByName := make(map[string]config.Agent, len(explicit))
 	for _, agent := range explicit {
@@ -3976,6 +3975,9 @@ scale_check = "echo 3"
 	worker, ok := explicitByName["worker"]
 	if !ok {
 		t.Fatalf("explicitAgents missing worker: %+v", explicit)
+	}
+	if _, ok := explicitByName[config.ControlDispatcherAgentName]; !ok {
+		t.Fatalf("explicitAgents missing control-dispatcher: %+v", explicit)
 	}
 	if worker.MaxActiveSessions == nil {
 		t.Fatal("worker.MaxActiveSessions is nil, want non-nil")
