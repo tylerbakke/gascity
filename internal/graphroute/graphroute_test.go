@@ -875,3 +875,197 @@ func TestStampLegacyRecipeRouting_RespectsPerStepRunTarget(t *testing.T) {
 		t.Errorf("step 5 (whitespace target): gc.routed_to = %q, want reviewer-code (trimmed)", got)
 	}
 }
+
+// rigAwareDispatcherResolver mirrors resolveAgentIdentity's rig-context-first
+// resolution for the control-dispatcher fallback tests: a non-empty rigContext
+// prefers <rig>/control-dispatcher, an empty one resolves the city-level
+// (bare-name) dispatcher.
+type rigAwareDispatcherResolver struct{}
+
+func (rigAwareDispatcherResolver) ResolveAgent(cfg *config.City, name, rigContext string) (config.Agent, bool) {
+	if rigContext != "" {
+		for _, a := range cfg.Agents {
+			if a.QualifiedName() == rigContext+"/"+name {
+				return a, true
+			}
+		}
+	}
+	for _, a := range cfg.Agents {
+		if a.QualifiedName() == name {
+			return a, true
+		}
+	}
+	return config.Agent{}, false
+}
+
+func dispatcherFallbackCfg() *config.City {
+	return &config.City{Agents: []config.Agent{
+		{Name: "control-dispatcher"},
+		{Name: "control-dispatcher", Dir: "gc-contrib"},
+	}}
+}
+
+func TestControlDispatcherBinding_FallsBackToCityWhenRigRuntimeMissing(t *testing.T) {
+	deps := Deps{
+		Resolver: rigAwareDispatcherResolver{},
+		ControlDispatcherRuntimeMissing: func(q string) bool {
+			return q == "gc-contrib/control-dispatcher"
+		},
+	}
+	binding, err := ControlDispatcherBinding(nil, "test-city", dispatcherFallbackCfg(), "gc-contrib", deps)
+	if err != nil {
+		t.Fatalf("ControlDispatcherBinding: %v", err)
+	}
+	if binding.QualifiedName != "control-dispatcher" {
+		t.Fatalf("QualifiedName = %q, want city-level control-dispatcher", binding.QualifiedName)
+	}
+	if binding.ControlFallbackFrom != "gc-contrib/control-dispatcher" {
+		t.Fatalf("ControlFallbackFrom = %q, want gc-contrib/control-dispatcher", binding.ControlFallbackFrom)
+	}
+	// Control-dispatcher routes are metadata-only (routed by qualified name; the
+	// concrete session is bound when a pool slot claims the step), so the city
+	// fallback binding carries no SessionName.
+	if !binding.MetadataOnly {
+		t.Fatalf("MetadataOnly = false, want true for routed control-dispatcher queue")
+	}
+	if binding.SessionName != "" {
+		t.Fatalf("SessionName = %q, want empty for routed control-dispatcher queue", binding.SessionName)
+	}
+}
+
+func TestControlDispatcherBinding_NoFallbackWhenRigHealthy(t *testing.T) {
+	deps := Deps{
+		Resolver:                        rigAwareDispatcherResolver{},
+		ControlDispatcherRuntimeMissing: func(string) bool { return false },
+	}
+	binding, err := ControlDispatcherBinding(nil, "test-city", dispatcherFallbackCfg(), "gc-contrib", deps)
+	if err != nil {
+		t.Fatalf("ControlDispatcherBinding: %v", err)
+	}
+	if binding.QualifiedName != "gc-contrib/control-dispatcher" {
+		t.Fatalf("QualifiedName = %q, want rig-local dispatcher", binding.QualifiedName)
+	}
+	if binding.ControlFallbackFrom != "" {
+		t.Fatalf("ControlFallbackFrom = %q, want empty", binding.ControlFallbackFrom)
+	}
+}
+
+func TestControlDispatcherBinding_NoFallbackWhenCheckerNil(t *testing.T) {
+	deps := Deps{Resolver: rigAwareDispatcherResolver{}}
+	binding, err := ControlDispatcherBinding(nil, "test-city", dispatcherFallbackCfg(), "gc-contrib", deps)
+	if err != nil {
+		t.Fatalf("ControlDispatcherBinding: %v", err)
+	}
+	if binding.QualifiedName != "gc-contrib/control-dispatcher" || binding.ControlFallbackFrom != "" {
+		t.Fatalf("binding = %+v, want rig-local with no fallback", binding)
+	}
+}
+
+func TestControlDispatcherBinding_NoFallbackWhenNoDistinctCityDispatcher(t *testing.T) {
+	// Only a rig-local dispatcher exists: the empty-context resolution finds no
+	// distinct city dispatcher, so the original (rig-local) binding is kept.
+	cfg := &config.City{Agents: []config.Agent{{Name: "control-dispatcher", Dir: "gc-contrib"}}}
+	deps := Deps{
+		Resolver:                        rigAwareDispatcherResolver{},
+		ControlDispatcherRuntimeMissing: func(string) bool { return true },
+	}
+	binding, err := ControlDispatcherBinding(nil, "test-city", cfg, "gc-contrib", deps)
+	if err != nil {
+		t.Fatalf("ControlDispatcherBinding: %v", err)
+	}
+	if binding.QualifiedName != "gc-contrib/control-dispatcher" || binding.ControlFallbackFrom != "" {
+		t.Fatalf("binding = %+v, want rig-local with no fallback", binding)
+	}
+}
+
+func TestApplyGraphControlRouteBinding_StampsFallbackMetadata(t *testing.T) {
+	step := &formula.RecipeStep{Metadata: map[string]string{}}
+	binding := GraphRouteBinding{
+		QualifiedName:       "control-dispatcher",
+		SessionName:         "control-dispatcher",
+		ControlFallbackFrom: "gc-contrib/control-dispatcher",
+	}
+	ApplyGraphControlRouteBinding(step, binding)
+	got := step.Metadata["gc.control_dispatcher_fallback"]
+	if want := "gc-contrib/control-dispatcher->control-dispatcher"; got != want {
+		t.Fatalf("gc.control_dispatcher_fallback = %q, want %q", got, want)
+	}
+}
+
+func TestApplyGraphControlRouteBinding_ClearsStaleFallbackMetadata(t *testing.T) {
+	step := &formula.RecipeStep{Metadata: map[string]string{
+		"gc.control_dispatcher_fallback": "stale->value",
+	}}
+	binding := GraphRouteBinding{
+		QualifiedName: "gc-contrib/control-dispatcher",
+		SessionName:   "gc-contrib--control-dispatcher",
+	}
+	ApplyGraphControlRouteBinding(step, binding)
+	if got := step.Metadata["gc.control_dispatcher_fallback"]; got != "" {
+		t.Fatalf("gc.control_dispatcher_fallback = %q, want cleared on re-decoration", got)
+	}
+}
+
+func TestApplyGraphRouteBinding_PoolRouted_StampsContinuationGroup(t *testing.T) {
+	step := &formula.RecipeStep{
+		Metadata: map[string]string{},
+	}
+	binding := GraphRouteBinding{
+		QualifiedName: "gascity/polecat",
+		MetadataOnly:  true,
+	}
+	ApplyGraphRouteBinding(step, binding)
+
+	if got := step.Metadata["gc.continuation_group"]; got != "pool-workflow" {
+		t.Errorf("gc.continuation_group = %q, want pool-workflow", got)
+	}
+	if got := step.Metadata["gc.session_affinity"]; got != "require" {
+		t.Errorf("gc.session_affinity = %q, want require", got)
+	}
+	if got := step.Metadata["gc.routed_to"]; got != "gascity/polecat" {
+		t.Errorf("gc.routed_to = %q, want gascity/polecat", got)
+	}
+	if step.Assignee != "" {
+		t.Errorf("Assignee = %q, want empty (pool slots claim at runtime)", step.Assignee)
+	}
+}
+
+func TestApplyGraphRouteBinding_SingleSession_NoAffinityKeys(t *testing.T) {
+	step := &formula.RecipeStep{
+		Metadata: map[string]string{},
+	}
+	binding := GraphRouteBinding{
+		QualifiedName: "gascity/architect",
+		SessionName:   "gascity--architect",
+		MetadataOnly:  false,
+	}
+	ApplyGraphRouteBinding(step, binding)
+
+	if got := step.Metadata["gc.continuation_group"]; got != "" {
+		t.Errorf("gc.continuation_group = %q, want empty for single-session step", got)
+	}
+	if got := step.Metadata["gc.session_affinity"]; got != "" {
+		t.Errorf("gc.session_affinity = %q, want empty for single-session step", got)
+	}
+}
+
+func TestApplyGraphRouteBinding_PoolRouted_DoesNotSetSessionName(t *testing.T) {
+	step := &formula.RecipeStep{
+		Metadata: map[string]string{
+			"gc.session_name": "stale-session",
+			"gc.session_id":   "stale-id",
+		},
+	}
+	binding := GraphRouteBinding{
+		QualifiedName: "gascity/polecat",
+		MetadataOnly:  true,
+	}
+	ApplyGraphRouteBinding(step, binding)
+
+	if got := step.Metadata["gc.session_name"]; got != "" {
+		t.Errorf("gc.session_name = %q, want cleared for pool step", got)
+	}
+	if got := step.Metadata["gc.session_id"]; got != "" {
+		t.Errorf("gc.session_id = %q, want cleared for pool step", got)
+	}
+}

@@ -398,6 +398,12 @@ func (s *Step) UnmarshalTOML(data interface{}) error {
 		return fmt.Errorf("type mismatch for formula.Step: expected table but found %T", data)
 	}
 
+	if loopRaw, ok := raw["loop"].(map[string]interface{}); ok {
+		if _, isStr := loopRaw["count"].(string); isStr {
+			return fmt.Errorf("loop.count must be an integer literal (e.g. count = 3), not a quoted string; for variable-driven iteration use range = \"1..{n}\" with var = \"n\" (note: range expressions use single-brace {n}, not double-brace {{n}})")
+		}
+	}
+
 	encoded, err := json.Marshal(raw)
 	if err != nil {
 		return fmt.Errorf("encode formula.Step: %w", err)

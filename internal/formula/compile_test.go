@@ -2343,3 +2343,40 @@ type = "task"
 		t.Fatalf("metadata.gc.methodology.review_modes = %+v, want %+v", got.GC.Methodology.ReviewModes, want)
 	}
 }
+
+func TestCompile_LoopCountStringParseError(t *testing.T) {
+	dir := t.TempDir()
+	formulaContent := `
+formula = "loop-count-string"
+version = 1
+
+[vars.cups]
+description = "Cup count"
+required = true
+
+[[steps]]
+id = "brew"
+title = "Brew"
+
+[steps.loop]
+count = "{{cups}}"
+
+[[steps.loop.body]]
+id = "pour"
+title = "Pour"
+`
+	if err := os.WriteFile(filepath.Join(dir, "loop-count-string.toml"), []byte(formulaContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Compile(context.Background(), "loop-count-string", []string{dir}, nil)
+	if err == nil {
+		t.Fatal("Compile should reject string-valued loop.count")
+	}
+	if !strings.Contains(err.Error(), "integer") {
+		t.Errorf("error = %q, want to mention 'integer'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "range") {
+		t.Errorf("error = %q, want to mention 'range'", err.Error())
+	}
+}

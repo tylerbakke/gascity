@@ -4115,6 +4115,7 @@ export interface components {
             submission_capabilities?: components["schemas"]["SubmissionCapabilities"];
             template: string;
             title: string;
+            work_dir?: string;
         };
         SessionStrandedPayload: {
             /** @description Canonical session bead ID for the stranded pool session (also the envelope Subject). */

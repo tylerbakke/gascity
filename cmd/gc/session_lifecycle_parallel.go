@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
@@ -960,6 +961,9 @@ func buildPreparedStartWithWorkDirResolver(
 	if gcProvider := sessionProviderFamily(*session); gcProvider != "" {
 		agentCfg.Env = mergeEnv(agentCfg.Env, map[string]string{"GC_PROVIDER": gcProvider})
 	}
+	if triggerEnv := sessionTriggerBeadEnv(session); len(triggerEnv) > 0 {
+		agentCfg.Env = mergeEnv(agentCfg.Env, triggerEnv)
+	}
 	agentCfg = runtime.SyncWorkDirEnv(agentCfg)
 	return &preparedStart{
 		candidate:     candidate,
@@ -970,6 +974,25 @@ func buildPreparedStartWithWorkDirResolver(
 		provisionHash: provisionHash,
 		launchHash:    launchHash,
 	}, nil
+}
+
+func sessionTriggerBeadEnv(session *beads.Bead) map[string]string {
+	if session == nil {
+		return nil
+	}
+	triggerBeadID := strings.TrimSpace(session.Metadata[beadmeta.TriggerBeadIDMetadataKey])
+	if triggerBeadID == "" {
+		return nil
+	}
+	env := map[string]string{
+		"GC_TRIGGER_BEAD_ID":      triggerBeadID,
+		"GC_TRIGGER_WORK_BEAD_ID": triggerBeadID,
+	}
+	if storeRef := strings.TrimSpace(session.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey]); storeRef != "" {
+		env["GC_TRIGGER_BEAD_STORE_REF"] = storeRef
+		env["GC_TRIGGER_WORK_STORE_REF"] = storeRef
+	}
+	return env
 }
 
 func parseSessionTemplateOverridesForLaunch(session *beads.Bead) map[string]string {

@@ -20,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/graphroute"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
@@ -30,15 +31,42 @@ func cliGraphrouteDeps(cityPath string) graphroute.Deps {
 		CityPath:              cityPath,
 		Resolver:              cliAgentResolver{},
 		DirectSessionResolver: cliDirectSessionResolver,
+		ControlDispatcherRuntimeMissing: func(qualifiedName string) bool {
+			return controlDispatcherSessionRuntimeMissing(cityPath, qualifiedName)
+		},
 	}
 }
 
-// controlDispatcherBinding resolves the control-dispatcher route binding
-// with CLI dependencies. Only Resolver is supplied —
-// graphroute.ControlDispatcherBinding reads no other Deps fields, matching
-// the projection the retired sling alias layer forwarded.
-func controlDispatcherBinding(store beads.Store, cityName string, cfg *config.City, rigContext string) (graphroute.GraphRouteBinding, error) {
-	return graphroute.ControlDispatcherBinding(store, cityName, cfg, rigContext, graphroute.Deps{Resolver: cliAgentResolver{}})
+// controlDispatcherSessionRuntimeMissing reports whether the control-dispatcher
+// agent's session is asleep with reason runtime-missing. Session beads are
+// city-scoped, so it reads the city store directly (the rig-scoped routing
+// store cannot see them). It powers the rig→city control-dispatcher fallback
+// (#3454); any lookup failure returns false so routing falls back to the normal
+// rig-local binding rather than mis-routing on a transient store error.
+func controlDispatcherSessionRuntimeMissing(cityPath, qualifiedName string) bool {
+	if cityPath == "" || strings.TrimSpace(qualifiedName) == "" {
+		return false
+	}
+	// Only consult the city store for a real, initialized city. Mirrors the
+	// pool-nudge guard in doSling: a bare working dir (no city.toml) has no
+	// session beads to read, and opening a store there would needlessly
+	// spin up a managed Dolt backend on the routing hot path.
+	if _, err := os.Stat(filepath.Join(cityPath, "city.toml")); err != nil {
+		return false
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil || store == nil {
+		return false
+	}
+	return sessionRuntimeMissingInStore(store, qualifiedName)
+}
+
+// sessionRuntimeMissingInStore reports whether any open session bead for the
+// agent (selected by its agent:<qualified> label) projects the runtime-missing
+// lifecycle reason in the given store. The projection lives in internal/session
+// so the API sling path can share it without importing package main.
+func sessionRuntimeMissingInStore(store beads.Store, qualifiedName string) bool {
+	return sessionpkg.RuntimeMissingInStore(store, qualifiedName)
 }
 
 // applyGraphRouting delegates to graphroute.ApplyGraphRouting with CLI
@@ -60,7 +88,17 @@ var (
 	workflowServeIdlePollInterval  = 100 * time.Millisecond
 	workflowServeIdlePollAttempts  = 3
 	workflowServeWakeSweepInterval = 1 * time.Second
-	workflowServeMaxIdleSleep      = 30 * time.Second
+	// Cap the --follow idle backoff at 5s. A worker that closes a step bead
+	// with a raw bd write does not publish a city BeadClosed event, so the
+	// control-dispatcher only notices the next ready step on its idle re-poll.
+	// At the former 30s cap each graph hop could wait up to ~30s, so a
+	// multi-step workflow accumulated minutes of pure wake latency (the bulk of
+	// the TestGraphWorkflowSuccessPath flake). 5s keeps the loop responsive
+	// across hops while still backing off from the 1s base; the cost is one
+	// serve loop polling every 5s rather than 30s when a city is fully idle.
+	// (Complementary to the wake-debounce coalescing below, which only helps
+	// the event-arrival path; a raw-bd-write close publishes no event.)
+	workflowServeMaxIdleSleep = 5 * time.Second
 	// workflowServeWakeDebounce is the coalescing window opened once the first
 	// relevant event wakes the --follow loop. Additional buffered events that
 	// arrive during the window are drained and folded into the same wake so a
@@ -68,7 +106,7 @@ var (
 	// single work/ready re-scan instead of N heavy per-event Dolt scans. This is
 	// a fixed (max-wait) window, so a lone relevant wake also waits out the
 	// window before its drain; the delay is intentional and small relative to
-	// the 1–30s idle sleeps it replaces. Set it to 0 to disable coalescing and
+	// the 1–5s idle sleeps it replaces. Set it to 0 to disable coalescing and
 	// restore one-event-one-drain. Injectable so tests can shrink it. Fixes
 	// gastownhall/gascity#3206.
 	workflowServeWakeDebounce = 250 * time.Millisecond
