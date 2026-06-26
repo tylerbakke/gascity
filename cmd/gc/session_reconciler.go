@@ -1145,6 +1145,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		if _, _, pending := resetPendingCommittedAt(*session); !pending && dt != nil {
 			dt.clearResetStall(session.ID)
 		}
+		// #3630: the session is in the desired set this tick, so its spec is
+		// present — reset any suspend-drain confirmation window accrued during a
+		// transient spec-enumeration collapse.
+		if desired {
+			dt.clearSuspendDeferral(session.ID)
+		}
 
 		if reconcileDrainAckStopPending(cityPath, cfg, sp, store, rigStores, session, tp, desired, dops, dt, asyncStopTracker, clk, rec, stderr) {
 			continue
@@ -1196,6 +1202,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				}
 			}
 			preserveNamed := preserveConfiguredNamedSessionBead(*session, cfg, cityName)
+			// #3630: the configured spec is present this tick — reset any
+			// suspend-drain confirmation window so a later genuine removal still
+			// gets the full confirmation buffer.
+			if preserveNamed {
+				dt.clearSuspendDeferral(session.ID)
+			}
 			var (
 				preservedTP  TemplateParams
 				preserveErr  error
@@ -1314,6 +1326,28 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			default:
 				if dops != nil {
 					if acked, _ := dops.isDrainAcked(name); acked {
+						// gc-hz0nu: every drain-acked decision below depends on the
+						// store-derived desired-state / assigned-work view. During a
+						// partial store query (transient Dolt failure) that view is
+						// incomplete, so an ack minted from it cannot be trusted to
+						// mean "orphaned". Defer the whole decision until the store is
+						// healthy — the same protection the plain drain path applies
+						// just below. Stopping a live session here on degraded data is
+						// what killed coordinator sessions on 2026-06-09.
+						if storeQueryPartial {
+							fmt.Fprintf(stdout, "Skipping drain-ack stop for '%s': store query partial (transient failure)\n", name) //nolint:errcheck
+							if trace != nil {
+								template := normalizedSessionTemplate(*session, cfg)
+								if template == "" {
+									template = session.Metadata["template"]
+								}
+								trace.recordDecision("reconciler.session.drain_ack", template, name, "store_query_partial", "deferred", traceRecordPayload{
+									"store_query_partial": true,
+									"provider_alive":      providerAlive,
+								}, nil, "")
+							}
+							continue
+						}
 						ackReason := assignedWorkDrainCancelReason(*session, sp, dt, name)
 						hasAssignedWork, assignedErr := sessionHasAwakeAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, *session)
 						if assignedErr != nil {
@@ -1393,6 +1427,34 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						}
 						fmt.Fprintf(stdout, "Skipping drain for '%s': live assigned work found\n", name) //nolint:errcheck
 						continue
+					}
+					// #3630: a LIVE named session reaches this drain only because
+					// its configured spec is absent this tick (preserve did not fire
+					// above) and it has no live assigned work. A namedSessionSpecs
+					// enumeration collapse during boot can drop a spec for a single
+					// tick and restore it on the next; draining the live runtime
+					// respawns it fresh and loses in-session context. Suspend-class
+					// drains are revertible, so require namedSuspendConfirmTicks
+					// consecutive confirming ticks before draining. The counter is
+					// cleared above once the spec reappears. Scoped to live sessions:
+					// a dead bead with no spec still releases its alias immediately
+					// (ga-ue1r).
+					if isNamedSessionBead(*session) {
+						if n := dt.bumpSuspendDeferral(session.ID); n < namedSuspendConfirmTicks {
+							if trace != nil {
+								template := normalizedSessionTemplate(*session, cfg)
+								if template == "" {
+									template = session.Metadata["template"]
+								}
+								trace.recordDecision("reconciler.session.orphan_or_suspended", template, name, reason, "deferred_confirm", traceRecordPayload{
+									"confirm_ticks":    n,
+									"confirm_required": namedSuspendConfirmTicks,
+									"provider_alive":   providerAlive,
+								}, nil, "")
+							}
+							fmt.Fprintf(stdout, "Deferring drain for named session '%s': awaiting spec-absence confirmation (%d/%d) — transient enumeration-collapse guard (#3630)\n", name, n, namedSuspendConfirmTicks) //nolint:errcheck
+							continue
+						}
 					}
 					if beginSessionDrain(*session, sp, dt, reason, clk, defaultDrainTimeout) {
 						if trace != nil {
@@ -1497,6 +1559,23 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						continue
 					}
 					ackReason, reconcilerOwnedAck := reconcilerDrainAckMatchesSession(*session, sp, name)
+					// gc-kkgak: a reconciler-owned drain ack is minted from the
+					// desired-state / assigned-work view. During a partial store
+					// query that view is unreliable, so defer the reconciler-owned
+					// cancel/stop decision until the store is healthy — same
+					// rationale as gc-hz0nu's orphan branch. Agent-sourced handoff
+					// acks are not reconciler-owned and fall through to stop
+					// promptly: their intent is explicit, not derived from the store.
+					if reconcilerOwnedAck && storeQueryPartial {
+						fmt.Fprintf(stdout, "Skipping reconciler drain-ack stop for '%s': store query partial (transient failure)\n", name) //nolint:errcheck
+						if trace != nil {
+							trace.recordDecision("reconciler.session.drain_ack", tp.TemplateName, name, "store_query_partial", "deferred", traceRecordPayload{
+								"store_query_partial":  true,
+								"reconciler_owned_ack": true,
+							}, nil, "")
+						}
+						continue
+					}
 					if reconcilerOwnedAck && assignedWorkDrainReasonCancelable(ackReason) {
 						hasAssignedWork, assignedErr := sessionHasAwakeAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, *session)
 						if assignedErr != nil {
@@ -2445,6 +2524,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					"should_wake": shouldWake,
 				}, nil, "")
 			}
+			recordCurrentBeadIDOnWake(target.session, store, decision.AssignedWorkBeadID, stderr)
 			startCandidates = append(startCandidates, startCandidate{
 				session: target.session,
 				tp:      target.tp,
@@ -2453,6 +2533,24 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 
 		if shouldWake && target.alive {
+			// Bead-reassignment cycle: when an alive named session is
+			// reassigned to a different bead than the one it's currently
+			// processing, wake_mode=fresh requires a brand-new conversation
+			// on the new bead. ComputeAwakeSet signals this via
+			// RequiresFreshCycle; honor it by routing through the same
+			// restart-handoff machinery as `gc runtime request-restart`.
+			// See #1893 (controller: alive on_demand session ignores
+			// bd update --assignee).
+			if decision.RequiresFreshCycle && target.session.Metadata["wake_mode"] == "fresh" {
+				if cycleAliveSessionForFreshReassign(target.session, target.tp, sp, store, cfg, cb, name, decision.AssignedWorkBeadID, clk.Now(), stdout, stderr, trace) {
+					continue
+				}
+			}
+			// Stamp currently_processing_bead_id so the next divergence
+			// check has a baseline. Backfills legacy sessions that were
+			// already alive before this metadata existed and refreshes the
+			// record after the agent picks up its next bead in resume mode.
+			recordCurrentBeadIDOnWake(target.session, store, decision.AssignedWorkBeadID, stderr)
 			// Session is correctly awake. Cancel any non-drift drain
 			// (handles scale-back-up: agent returns to desired set while draining).
 			cancelSessionDrain(*target.session, sp, dt)

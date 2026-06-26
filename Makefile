@@ -354,6 +354,10 @@ update-bundled-gastown-pack:
 test-native-doltlite-beads:
 	$(TEST_ENV) CGO_ENABLED=0 go test -tags gascity_native_beads ./internal/beads -count=1
 
+## sync-bd-corpus: vendor the bd contract corpus from a beads release (BD_CORPUS_TAG=vX.Y.Z)
+sync-bd-corpus:
+	scripts/sync-bd-corpus.sh
+
 ## test-cmd-gc-process: run the full non-short cmd/gc suite, including the
 ## process-backed lifecycle coverage routed out of the default fast loop
 test-cmd-gc-process:

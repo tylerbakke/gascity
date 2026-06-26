@@ -1406,7 +1406,10 @@ func runSupervisor(stdout, stderr io.Writer) int {
 	// Redacted event export (opt-in via [events.export]). No-op unless an
 	// endpoint is configured.
 	if supCfg.Events.Export.Enabled() {
-		startEventExport(ctx, supCfg.Events.Export, apiMux.EventProviders, supervisor.DefaultHome(), stderr)
+		// The returned drain handle is intentionally discarded: the supervisor's
+		// home dir outlives the process, so there is nothing to wait for before
+		// teardown. Tests that own a transient home (t.TempDir) Wait on it.
+		_ = startEventExport(ctx, supCfg.Events.Export, apiMux.EventProviders, supervisor.DefaultHome(), stderr)
 	}
 
 	// Control socket — uses supervisor-specific path, not the per-city controller socket.

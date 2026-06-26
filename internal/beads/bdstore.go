@@ -792,13 +792,20 @@ func (b *bdIssue) normalizedDependencies() []Dep {
 }
 
 // isBdNotFound returns true if the error from bd CLI indicates a "not found" condition.
-// bd uses several phrasings: "no issue found", "issue not found", "not found".
+// bd uses several phrasings: "no issue found", "issue not found", "not found" on
+// stderr, and the plural "no issues found matching the provided IDs" in its
+// stdout --json error envelope. The plural form matters because
+// classifyBDExecResult falls back to the stdout envelope when stderr is empty,
+// which bd's --json error path increasingly is (see classifyBDExecResult); the
+// contract corpus pins this exact phrasing.
 func isBdNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "not found") || strings.Contains(msg, "no issue found")
+	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "no issue found") ||
+		strings.Contains(msg, "no issues found")
 }
 
 func isBdClaimConflictMessage(msg string) bool {
@@ -1519,6 +1526,14 @@ func (tx *bdStoreTx) item(id string) (*bdStoreTxItem, error) {
 	tx.items[id] = item
 	tx.order = append(tx.order, id)
 	return item, nil
+}
+
+// Create persists a bead immediately. The bd CLI has no multi-statement
+// transaction, so a create cannot be staged: subsequent staged writes in the
+// same Tx may reference the new bead's ID, which only exists after creation.
+// This matches the Store.Tx contract for stores without native transactions.
+func (tx *bdStoreTx) Create(b Bead) (Bead, error) {
+	return tx.store.Create(b)
 }
 
 func (tx *bdStoreTx) Update(id string, opts UpdateOpts) error {

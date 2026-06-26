@@ -958,7 +958,11 @@ func (m *Manager) clearWakeAndHoldOverrides(id string) error {
 }
 
 func (m *Manager) retireConfiguredNamedSessionIdentifiers(id string, b beads.Bead) error {
-	if strings.TrimSpace(b.Metadata["configured_named_session"]) != "true" {
+	// Recognize configured named sessions by flag OR identity so a
+	// partially-tagged bead (identity recorded, boolean flag absent) still
+	// releases its reserved runtime name on close instead of stranding the
+	// name and blocking respawn (ga-841).
+	if !wasConfiguredNamedSession(b) {
 		return nil
 	}
 	update := beads.UpdateOpts{
