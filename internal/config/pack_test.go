@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -107,6 +108,61 @@ CUSTOM_ORDER_FLAG = "enabled"
 
 	if err := ExpandPacks(cfg, fsys.OSFS{}, dir, nil); err != nil {
 		t.Fatalf("ExpandPacks: %v", err)
+	}
+}
+
+// TestExpandPacksRecordsOrdersOnlyPackDirWithoutFormulaLayer is a root-cause
+// regression guard for ga-ofgd (a re-file of ga-0vfs, fixed in #1609): the pack
+// loader must record an orders-only pack's directory in the rig pack-dir list
+// even though the pack ships no formulas/ directory. orderdiscovery.ScanAll
+// derives the `<packDir>/orders` scan root from RigPackDirs (and, at city scope,
+// PackDirs), so this membership is the sole mechanism that keeps an orders-only
+// pack's orders visible. The loader's pack-dir accumulation is deliberately NOT
+// gated on the formulas/ Stat check — only the formula-layer list is. If a
+// future change ever moves the pack-dir accumulation behind that gate,
+// orders-only packs would be silently skipped again. Mirrors the real
+// command-center `captain` pack ([imports.captain], orders only, no formulas/).
+func TestExpandPacksRecordsOrdersOnlyPackDirWithoutFormulaLayer(t *testing.T) {
+	dir := t.TempDir()
+	// Orders-only pack: orders/ present, NO formulas/ directory.
+	writeFile(t, dir, "packs/audit/pack.toml", `
+[pack]
+name = "audit"
+schema = 2
+`)
+	writeFile(t, dir, "packs/audit/orders/pr-audit.toml", `
+[order]
+formula = "mol-audit"
+trigger = "cooldown"
+interval = "1h"
+`)
+
+	cfg := &City{
+		Rigs: []Rig{
+			{Name: "demo", Path: "/work", Includes: []string{"packs/audit"}},
+		},
+	}
+
+	// A non-nil map captures any formula layers the loader records for the rig.
+	rigFormulaDirs := map[string][]string{}
+	if err := ExpandPacks(cfg, fsys.OSFS{}, dir, rigFormulaDirs); err != nil {
+		t.Fatalf("ExpandPacks: %v", err)
+	}
+
+	packDir := filepath.Join(dir, "packs", "audit")
+
+	// Root-cause invariant: the orders-only pack dir is recorded for the rig.
+	if !slices.Contains(cfg.RigPackDirs["demo"], packDir) {
+		t.Fatalf("RigPackDirs[demo] = %v, want it to contain orders-only pack dir %s",
+			cfg.RigPackDirs["demo"], packDir)
+	}
+
+	// Decoupling guard: with no formulas/ dir, the pack contributes no formula
+	// layer, so RigPackDirs membership is the ONLY thing keeping its orders
+	// discoverable. A non-empty layer set here would mean the test is no longer
+	// exercising the orders-only path it is meant to protect.
+	if layers := rigFormulaDirs["demo"]; len(layers) != 0 {
+		t.Fatalf("rigFormulaDirs[demo] = %v, want no formula layer for an orders-only pack", layers)
 	}
 }
 
