@@ -28,24 +28,6 @@ var DefaultPalette = []Theme{
 	{Name: "copper", BG: "#6d4c41", FG: "#f5f5dc"},   // Warm brown
 }
 
-// MayorTheme returns the special theme for the Mayor session.
-// Gold/dark to distinguish it from rig themes.
-func MayorTheme() Theme {
-	return Theme{Name: "mayor", BG: "#3d3200", FG: "#ffd700"}
-}
-
-// DeaconTheme returns the special theme for the Deacon session.
-// Purple/silver - ecclesiastical, distinct from Mayor's gold.
-func DeaconTheme() Theme {
-	return Theme{Name: "deacon", BG: "#2d1f3d", FG: "#c0b0d0"}
-}
-
-// DogTheme returns the theme for Dog sessions.
-// Brown/tan - earthy, loyal worker aesthetic.
-func DogTheme() Theme {
-	return Theme{Name: "dog", BG: "#3d2f1f", FG: "#d0c0a0"}
-}
-
 // GetThemeByName finds a theme by name from the default palette.
 // Returns nil if not found.
 func GetThemeByName(name string) *Theme {

@@ -89,18 +89,6 @@ func DefaultConfig() Config {
 // supportedShells lists shell binaries that can be detected in tmux panes.
 var supportedShells = []string{"bash", "zsh", "sh", "fish", "tcsh", "ksh"}
 
-// Role emoji mapping (used only by SetStatusFormat for status bar display).
-var roleEmoji = map[string]string{
-	"mayor":        "🎩",
-	"deacon":       "🐺",
-	"witness":      "🦉",
-	"refinery":     "🏭",
-	"crew":         "👷",
-	"polecat":      "😺",
-	"coordinator":  "🎩",
-	"health-check": "🐺",
-}
-
 // ---------------------------------------------------------------------------
 // Minimal types inlined from gastown/internal/config.
 // Only the fields actually used by tmux operations are included.
@@ -3039,17 +3027,11 @@ func (t *Tmux) ApplyTheme(session string, theme Theme) error {
 	return err
 }
 
-// roleIcons maps role names to display icons for the status bar.
-// Uses centralized emojis from constants package.
-// Includes legacy keys ("coordinator", "health-check") for backwards compatibility.
-var roleIcons = roleEmoji
-
 // SetStatusFormat configures the left side of the status bar.
-// Shows compact identity: icon + minimal context
-func (t *Tmux) SetStatusFormat(session, rig, worker, role string) error {
-	// Get icon for role (empty string if not found)
-	icon := roleIcons[role]
-
+// Shows compact identity: the caller-supplied icon plus minimal context.
+// The icon is supplied by the caller (config-driven); this package holds no
+// opinion about which glyph represents which agent role.
+func (t *Tmux) SetStatusFormat(session, rig, worker, icon string) error {
 	// Compact format - icon already identifies role
 	// Mayor: 🎩 Mayor
 	// Crew:  👷 gastown/crew/max (full path)
@@ -3094,11 +3076,11 @@ func (t *Tmux) SetDynamicStatus(session string) error {
 
 // ConfigureGasTownSession applies full Gas Town theming to a session.
 // This is a convenience method that applies theme, status format, and dynamic status.
-func (t *Tmux) ConfigureGasTownSession(session string, theme Theme, rig, worker, role string) error {
+func (t *Tmux) ConfigureGasTownSession(session string, theme Theme, rig, worker, icon string) error {
 	if err := t.ApplyTheme(session, theme); err != nil {
 		return fmt.Errorf("applying theme: %w", err)
 	}
-	if err := t.SetStatusFormat(session, rig, worker, role); err != nil {
+	if err := t.SetStatusFormat(session, rig, worker, icon); err != nil {
 		return fmt.Errorf("setting status format: %w", err)
 	}
 	if err := t.SetDynamicStatus(session); err != nil {

@@ -61,19 +61,6 @@ func TestThemeStyle(t *testing.T) {
 	}
 }
 
-func TestMayorTheme(t *testing.T) {
-	theme := MayorTheme()
-
-	if theme.Name != "mayor" {
-		t.Errorf("MayorTheme().Name = %q, want %q", theme.Name, "mayor")
-	}
-
-	// Mayor should have distinct gold/dark colors
-	if theme.BG == "" || theme.FG == "" {
-		t.Error("MayorTheme() has empty colors")
-	}
-}
-
 func TestListThemeNames(t *testing.T) {
 	names := ListThemeNames()
 
