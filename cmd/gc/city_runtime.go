@@ -2886,9 +2886,10 @@ func (cr *CityRuntime) cityBeadStore() beads.Store {
 
 func (cr *CityRuntime) rigBeadStores() map[string]beads.Store {
 	if cr.cs != nil {
-		stores := cr.cs.BeadStores()
-		delete(stores, cr.cityName)
-		return stores
+		// Use the rig-only accessor rather than BeadStores() minus the city
+		// name: the combined map keys the city store under cr.cityName, so a
+		// rig sharing the city's name would otherwise be deleted along with it.
+		return cr.cs.RigBeadStores()
 	}
 	return cr.standaloneRigStores
 }

@@ -985,6 +985,21 @@ func (cs *controllerState) BeadStores() map[string]beads.Store {
 	return m
 }
 
+// RigBeadStores returns a copy of just the rig bead stores, keyed by rig name,
+// excluding the city-level (HQ) store. The city store lives in a separate field
+// (cs.cityBeadStore), so a rig whose name matches the city name is preserved
+// here rather than being evicted by name-key collision. Callers that need the
+// city store fetch it separately via CityBeadStore.
+func (cs *controllerState) RigBeadStores() map[string]beads.Store {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	m := make(map[string]beads.Store, len(cs.beadStores))
+	for k, v := range cs.beadStores {
+		m[k] = v
+	}
+	return m
+}
+
 // MailProvider returns the city-level mail provider.
 // The rig parameter is accepted for interface compatibility but ignored —
 // all mail is city-scoped.
