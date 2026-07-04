@@ -1852,7 +1852,7 @@ func TestCollectAssignedWorkBeads_PreservesPartialInProgressSurvivors(t *testing
 		t.Fatalf("reload work bead: %v", err)
 	}
 
-	got, stores, storeRefs, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, nil)
+	got, stores, storeRefs, _, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, nil)
 	if !partial {
 		t.Fatal("partial = false, want true")
 	}
@@ -1883,7 +1883,7 @@ func TestCollectAssignedWorkBeads_PreservesPartialReadySurvivors(t *testing.T) {
 		t.Fatalf("create work bead: %v", err)
 	}
 
-	got, stores, storeRefs, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, nil)
+	got, stores, storeRefs, _, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, nil)
 	if !partial {
 		t.Fatal("partial = false, want true")
 	}
@@ -1930,7 +1930,7 @@ func TestCollectAssignedWorkBeads_SkipsReadyProbeForInProgressAssignee(t *testin
 	}
 	snapshot := newSessionBeadSnapshot([]beads.Bead{session})
 
-	got, _, _, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, snapshot)
+	got, _, _, _, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, snapshot)
 	if partial {
 		t.Fatal("collectAssignedWorkBeadsWithStores reported partial results")
 	}
@@ -1975,7 +1975,7 @@ func TestCollectAssignedWorkBeads_SkipsCityReadyProbeForRigInProgressAssignee(t 
 	}
 	snapshot := newSessionBeadSnapshot([]beads.Bead{session})
 
-	got, _, _, partial := collectAssignedWorkBeadsWithStores(
+	got, _, _, _, partial := collectAssignedWorkBeadsWithStores(
 		&config.City{Rigs: []config.Rig{{Name: "repo", Path: "repo"}}},
 		cityStore,
 		map[string]beads.Store{"repo": rigStore},
@@ -2047,7 +2047,7 @@ func TestCollectAssignedWorkBeads_ReadyProbeStillRunsForOtherAssignees(t *testin
 	}
 	snapshot := newSessionBeadSnapshot([]beads.Bead{activeSession, readySession})
 
-	got, _, _, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, snapshot)
+	got, _, _, _, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, snapshot)
 	if partial {
 		t.Fatal("collectAssignedWorkBeadsWithStores reported partial results")
 	}
@@ -2111,7 +2111,7 @@ func TestCollectAssignedWorkBeads_ReadyProbeIncludesActiveSessionAssignees(t *te
 	}
 	snapshot := newSessionBeadSnapshot([]beads.Bead{activeSession, sleepySession})
 
-	got, _, _, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, snapshot)
+	got, _, _, _, partial := collectAssignedWorkBeadsWithStores(&config.City{}, store, nil, nil, snapshot)
 	if partial {
 		t.Fatal("collectAssignedWorkBeadsWithStores reported partial results")
 	}
@@ -2181,7 +2181,7 @@ func TestCollectAssignedWorkBeads_ReadyProbeExcludesFutureNamedSessionRuntimeAss
 		t.Fatalf("create ready work bead: %v", err)
 	}
 
-	got, stores, storeRefs, partial := collectAssignedWorkBeadsWithStores(
+	got, stores, storeRefs, _, partial := collectAssignedWorkBeadsWithStores(
 		cfg,
 		cityStore,
 		map[string]beads.Store{"repo": rigStore},
@@ -2232,7 +2232,7 @@ func TestCollectAssignedWorkBeadsWithStores_TracksRigStore(t *testing.T) {
 		t.Fatalf("reload rig work bead: %v", err)
 	}
 
-	got, stores, storeRefs, partial := collectAssignedWorkBeadsWithStores(
+	got, stores, storeRefs, _, partial := collectAssignedWorkBeadsWithStores(
 		&config.City{Rigs: []config.Rig{{Name: "repo", Path: "/repo"}}},
 		cityStore,
 		map[string]beads.Store{"repo": rigStore},
@@ -2292,7 +2292,7 @@ func TestCollectAssignedWorkBeadsWithStores_PreservesCrossStoreIDCollisions(t *t
 		t.Fatalf("test setup expected overlapping city/rig IDs, got city %q rig %q", cityWork.ID, rigWork.ID)
 	}
 
-	got, stores, storeRefs, partial := collectAssignedWorkBeadsWithStores(
+	got, stores, storeRefs, _, partial := collectAssignedWorkBeadsWithStores(
 		&config.City{Rigs: []config.Rig{{Name: "repo", Path: "/repo"}}},
 		cityStore,
 		map[string]beads.Store{"repo": rigStore},
@@ -2322,6 +2322,179 @@ func TestCollectAssignedWorkBeadsWithStores_PreservesCrossStoreIDCollisions(t *t
 	}
 	if storeRefs[1] != "repo" {
 		t.Fatalf("second store ref = %q, want repo", storeRefs[1])
+	}
+}
+
+// TestCollectAssignedWorkBeadsWithStores_ReadinessIsStoreScoped pins the
+// producer side of the cross-store readiness fix: a ready city bead and a
+// blocked open rig bead share the same ID, and ReadyAssigned must mark only the
+// city copy ready. Keying readiness by bead ID alone would leak the city copy's
+// readiness onto the blocked rig copy and reintroduce the awake-demand hang.
+func TestCollectAssignedWorkBeadsWithStores_ReadinessIsStoreScoped(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+
+	// Decoy bumps the city sequence so cityWork shares rigWork's generated ID;
+	// closed, it is never collected.
+	decoy, err := cityStore.Create(beads.Bead{Title: "decoy", Type: "task"})
+	if err != nil {
+		t.Fatalf("create city decoy: %v", err)
+	}
+	closed := "closed"
+	if err := cityStore.Update(decoy.ID, beads.UpdateOpts{Status: &closed}); err != nil {
+		t.Fatalf("close city decoy: %v", err)
+	}
+	cityWork, err := cityStore.Create(beads.Bead{
+		Title:    "ready city work",
+		Type:     "task",
+		Assignee: "worker-city",
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("create city work: %v", err)
+	}
+	if err := cityStore.Update(cityWork.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("set city work in_progress: %v", err)
+	}
+
+	// Blocker keeps rigWork un-ready; rigWork shares cityWork's generated ID and
+	// is admitted only by the open-routed orphan-release pass (no readiness gate).
+	blocker, err := rigStore.Create(beads.Bead{Title: "blocker", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("create rig blocker: %v", err)
+	}
+	rigWork, err := rigStore.Create(beads.Bead{
+		Title:    "blocked rig work",
+		Type:     "task",
+		Assignee: "worker-rig",
+		Needs:    []string{blocker.ID},
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("create rig work: %v", err)
+	}
+	if cityWork.ID != rigWork.ID {
+		t.Fatalf("test setup expected overlapping city/rig IDs, got city %q rig %q", cityWork.ID, rigWork.ID)
+	}
+
+	got, _, _, readyAssigned, partial := collectAssignedWorkBeadsWithStores(
+		&config.City{Rigs: []config.Rig{{Name: "repo", Path: "/repo"}}},
+		cityStore,
+		map[string]beads.Store{"repo": rigStore},
+		nil,
+		nil,
+	)
+	if partial {
+		t.Fatal("partial = true, want false")
+	}
+	if len(got) != 2 {
+		t.Fatalf("collected %d beads, want 2 (city ready + rig blocked): %#v", len(got), got)
+	}
+	if !readyAssigned[storeScopedBeadKey{StoreRef: "", ID: cityWork.ID}] {
+		t.Fatalf("city copy %q must be store-scoped ready; ReadyAssigned=%#v", cityWork.ID, readyAssigned)
+	}
+	if readyAssigned[storeScopedBeadKey{StoreRef: "repo", ID: rigWork.ID}] {
+		t.Fatalf("blocked rig copy %q must NOT be ready despite the same-ID city bead; ReadyAssigned=%#v", rigWork.ID, readyAssigned)
+	}
+}
+
+// TestCollectAssignedWorkBeadsWithStores_SkipSetIsStoreScopedAcrossSameID pins
+// the assignee Ready-probe skip set to store scope. A ready city bead and a
+// blocked rig bead can share a generated ID; the rig assignee also owns a
+// separate, genuinely-ready bead reachable only via the Ready probe. The
+// same-ID city bead must not collapse the skip set by bare ID and suppress the
+// rig assignee's probe, or that separate ready work is silently dropped and the
+// rig session stays asleep.
+func TestCollectAssignedWorkBeadsWithStores_SkipSetIsStoreScopedAcrossSameID(t *testing.T) {
+	cityStore := &readyQueryRecordingStore{MemStore: beads.NewMemStore()}
+	rigStore := &readyQueryRecordingStore{MemStore: beads.NewMemStore()}
+
+	// Decoy bumps the city sequence so cityWork shares rigWork's generated ID;
+	// closed, it is never collected.
+	decoy, err := cityStore.Create(beads.Bead{Title: "decoy", Type: "task"})
+	if err != nil {
+		t.Fatalf("create city decoy: %v", err)
+	}
+	if err := cityStore.Update(decoy.ID, beads.UpdateOpts{Status: stringPtr("closed")}); err != nil {
+		t.Fatalf("close city decoy: %v", err)
+	}
+	// Ready city work for worker-city, captured by the in-progress pass.
+	cityWork, err := cityStore.Create(beads.Bead{
+		Title:    "ready city work",
+		Type:     "task",
+		Assignee: "worker-city",
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("create city work: %v", err)
+	}
+	if err := cityStore.Update(cityWork.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("set city work in_progress: %v", err)
+	}
+
+	// Blocker keeps rigWork un-ready; rigWork shares cityWork's generated ID and
+	// is admitted only by the open-routed orphan-release pass (no readiness gate).
+	blocker, err := rigStore.Create(beads.Bead{Title: "blocker", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("create rig blocker: %v", err)
+	}
+	rigWork, err := rigStore.Create(beads.Bead{
+		Title:    "blocked rig work",
+		Type:     "task",
+		Assignee: "worker-rig",
+		Needs:    []string{blocker.ID},
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("create rig work: %v", err)
+	}
+	if cityWork.ID != rigWork.ID {
+		t.Fatalf("test setup expected overlapping city/rig IDs, got city %q rig %q", cityWork.ID, rigWork.ID)
+	}
+	// worker-rig's genuinely-ready bead, discoverable ONLY by the assignee Ready
+	// probe: not in_progress, not a molecule root, not pool-routed, no blocker.
+	rigReadyWork, err := rigStore.Create(beads.Bead{
+		Title:    "separate ready rig work",
+		Type:     "task",
+		Status:   "open",
+		Assignee: "worker-rig",
+	})
+	if err != nil {
+		t.Fatalf("create rig ready work: %v", err)
+	}
+
+	snapshot := newSessionBeadSnapshot([]beads.Bead{
+		{ID: "sess-city", Type: sessionBeadType, Status: "open", Metadata: map[string]string{"session_name": "worker-city", "template": "worker", "state": "asleep"}},
+		{ID: "sess-rig", Type: sessionBeadType, Status: "open", Metadata: map[string]string{"session_name": "worker-rig", "template": "worker", "state": "asleep"}},
+	})
+
+	got, _, _, _, partial := collectAssignedWorkBeadsWithStores(
+		&config.City{Rigs: []config.Rig{{Name: "repo", Path: "/repo"}}},
+		cityStore,
+		map[string]beads.Store{"repo": rigStore},
+		nil,
+		snapshot,
+	)
+	if partial {
+		t.Fatal("partial = true, want false")
+	}
+
+	gotIDs := make(map[string]bool)
+	for _, bead := range got {
+		gotIDs[bead.ID] = true
+	}
+	if !gotIDs[rigReadyWork.ID] {
+		t.Fatalf("worker-rig ready bead %q was dropped: the same-ID city ready bead collapsed the skip set and suppressed worker-rig's store-scoped Ready probe; collected=%#v", rigReadyWork.ID, gotIDs)
+	}
+
+	rigProbedForRigAssignee := false
+	for _, query := range rigStore.readyQueries {
+		if query.Assignee == "worker-rig" {
+			rigProbedForRigAssignee = true
+		}
+	}
+	if !rigProbedForRigAssignee {
+		t.Fatalf("rig Ready queries = %#v, want a probe for worker-rig despite the same-ID city ready bead", rigStore.readyQueries)
 	}
 }
 
@@ -4641,7 +4814,7 @@ func TestProductionOrderDeferredSingletonAliasReclaimsOnSecondTick(t *testing.T)
 	var firstSyncStderr bytes.Buffer
 	_, updated := syncSessionBeadsWithSnapshotAndRigStores(
 		cityPath,
-		store,
+		beads.SessionStore{Store: store},
 		nil,
 		firstTick.State,
 		sp,
@@ -5470,7 +5643,7 @@ func TestBuildDesiredState_GH1654PoolReadyWorkGrowsPastMinActiveSessions(t *test
 	existingSessionNames := make(map[string]bool)
 	for slot := 1; slot <= 3; slot++ {
 		_, qualifiedInstance := poolInstanceIdentity(cfgAgent, slot, io.Discard)
-		session, err := createPoolSessionBead(store, cfgAgent.QualifiedName(), time.Now().UTC(), poolSessionCreateIdentity{
+		session, err := createPoolSessionBead(sessionFrontDoor(store), cfgAgent.QualifiedName(), time.Now().UTC(), poolSessionCreateIdentity{
 			AgentName: qualifiedInstance,
 			Alias:     qualifiedInstance,
 			Slot:      slot,
@@ -11487,5 +11660,73 @@ func TestBuildDesiredState_AsleepNamedAliasHolderStaysSingle(t *testing.T) {
 	// pool standby (alias empty because it lost the alias-acquisition race).
 	if mayorEntries[0].ConfiguredNamedIdentity != "gastown.mayor" {
 		t.Fatalf("retained entry is not the named alias-holder: %+v", mayorEntries[0])
+	}
+}
+
+// TestBuildDesiredStateRecordsDemandSubPhases verifies the sub-phase operation
+// records emitted inside buildDesiredStateWithSessionBeads (sr-5rz /
+// gastownhall/gascity#2463): the aggregate load_demand_snapshot tick phase
+// regularly dominates the controller cycle, and these records are what make
+// its internal split (collection reads vs demand probes vs scale_check execs)
+// attributable from a trace instead of requiring an instrumented rebuild.
+func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
+	// The non-tick path passes no trace; the recorder must be nil-safe.
+	recordDemandSubPhase(nil, "demand_snapshot.collect_open_session_beads", time.Now(), nil)
+
+	cityDir := t.TempDir()
+	tracer := newSessionReconcilerTracer(cityDir, "trace-town", io.Discard)
+	if !tracer.Enabled() {
+		t.Fatal("tracer should be enabled")
+	}
+	cycle := tracer.BeginCycle(TraceTickTriggerPatrol, "", time.Now().UTC(), &config.City{})
+	if cycle == nil {
+		t.Fatal("BeginCycle returned nil")
+	}
+
+	store := beads.NewMemStore()
+	sessionSnapshot, err := loadSessionBeadSnapshot(store)
+	if err != nil {
+		t.Fatalf("load session snapshot: %v", err)
+	}
+	var stderr strings.Builder
+	buildDesiredStateWithSessionBeads(
+		"trace-town", cityDir, time.Now().UTC(), &config.City{}, runtime.NewFake(),
+		store, nil, sessionSnapshot, cycle, &stderr,
+	)
+
+	if err := cycle.End(TraceCompletionCompleted, map[string]any{}); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	if err := tracer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	records, err := ReadTraceRecords(traceCityRuntimeDir(cityDir), TraceFilter{})
+	if err != nil {
+		t.Fatalf("ReadTraceRecords: %v", err)
+	}
+	// Sub-phases that must fire on every store-backed build, even with an
+	// empty config (the scale/named demand probes only fire with matching
+	// agents, so they are intentionally not asserted here).
+	want := map[string]bool{
+		"demand_snapshot.collect_open_session_beads": false,
+		"demand_snapshot.collect_assigned_work":      false,
+		"demand_snapshot.collect_unassigned_routed":  false,
+		"demand_snapshot.evaluate_pending_pools":     false,
+	}
+	for i := range records {
+		r := &records[i]
+		if r.RecordType != TraceRecordOperation || r.SiteCode != TraceSiteDemandSnapshot {
+			continue
+		}
+		name, _ := r.Fields["operation_name"].(string)
+		if _, tracked := want[name]; tracked {
+			want[name] = true
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("missing demand sub-phase operation record %q", name)
+		}
 	}
 }

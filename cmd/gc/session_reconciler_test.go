@@ -1311,7 +1311,7 @@ func TestFinalizeDrainAckStopPendingSessionsClosesStoppedPoolBeforeAllocation(t 
 	session.Metadata = patch.Apply(session.Metadata)
 
 	finalized := finalizeDrainAckStopPendingSessions(
-		"", env.cfg, env.sp, env.store, nil, []beads.Bead{session},
+		"", env.cfg, env.sp, beads.SessionStore{Store: env.store}, nil, []beads.Bead{session},
 		newFakeDrainOps(), env.dt, nil, env.clk, env.rec, &env.stderr,
 	)
 	if finalized != 1 {
@@ -5883,7 +5883,7 @@ func TestReconcileAndWake_RestartRequestBumpsContinuationEpoch(t *testing.T) {
 	}
 
 	// Phase 2: preWakeCommit consumes continuation_reset_pending → bumps epoch.
-	if _, _, err := preWakeCommit(&got, env.store, env.clk); err != nil {
+	if _, _, err := preWakeCommit(&got, sessionFrontDoor(env.store), env.clk); err != nil {
 		t.Fatalf("preWakeCommit: %v", err)
 	}
 	woke, _ := env.store.Get(session.ID)
@@ -8784,7 +8784,7 @@ func TestReconcileSessionBeads_ZombieDetectedCrashRecordedAndSessionNotAlive(t *
 
 	// Simulate zombie: tmux session exists but process is dead.
 	env.sp.Zombies["worker"] = true
-	env.sp.SetPeekOutput("worker", "Error: quota exceeded")
+	env.sp.SetPeekOutput("worker", "panic: worker process exited unexpectedly")
 
 	env.reconcile([]beads.Bead{session})
 
@@ -8816,6 +8816,44 @@ func TestReconcileSessionBeads_ZombieDetectedCrashRecordedAndSessionNotAlive(t *
 	}
 	if got.Metadata["wake_attempts"] == "" || got.Metadata["wake_attempts"] == "0" {
 		t.Error("expected wake_attempts > 0 (rapid exit recorded for zombie)")
+	}
+}
+
+func TestReconcileSessionBeads_ZombieTerminalProviderErrorMarkedUnhealthy(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+
+	tp := TemplateParams{
+		Command:      "test-cmd",
+		SessionName:  "worker",
+		TemplateName: "worker",
+		Hints:        agent.StartupHints{ProcessNames: []string{"test-cmd"}},
+	}
+	env.desiredState["worker"] = tp
+	_ = env.sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"})
+
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	env.sp.Zombies["worker"] = true
+	env.sp.SetPeekOutput("worker", "model_not_found: gpt-5.3-codex-spark")
+
+	env.reconcile([]beads.Bead{session})
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get(session): %v", err)
+	}
+	if got.Metadata[sessionHealthStateMetadataKey] != "unhealthy" {
+		t.Fatalf("session health = %q, want unhealthy", got.Metadata[sessionHealthStateMetadataKey])
+	}
+	if got.Metadata[sessionHealthReasonMetadataKey] != "model_not_found" {
+		t.Fatalf("health reason = %q, want model_not_found", got.Metadata[sessionHealthReasonMetadataKey])
+	}
+	if got.Metadata[sessionDrainableMetadataKey] != boolMetadata(true) {
+		t.Fatalf("drainable = %q, want true", got.Metadata[sessionDrainableMetadataKey])
+	}
+	if got.Metadata[sessionProviderTerminalErrorMetadataKey] != "model_not_found" {
+		t.Fatalf("provider terminal error = %q, want model_not_found", got.Metadata[sessionProviderTerminalErrorMetadataKey])
 	}
 }
 
@@ -9715,7 +9753,7 @@ func TestResolveSessionCommand(t *testing.T) {
 	}
 
 	t.Run("first start uses --session-id", func(t *testing.T) {
-		got := resolveSessionCommand("claude --dangerously-skip-permissions", "abc-123", claude, true, false)
+		got := resolveSessionCommand("claude --dangerously-skip-permissions", "abc-123", "", claude, true, false)
 		want := "claude --dangerously-skip-permissions --session-id abc-123"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
@@ -9723,7 +9761,7 @@ func TestResolveSessionCommand(t *testing.T) {
 	})
 
 	t.Run("resume uses --resume", func(t *testing.T) {
-		got := resolveSessionCommand("claude --dangerously-skip-permissions", "abc-123", claude, false, false)
+		got := resolveSessionCommand("claude --dangerously-skip-permissions", "abc-123", "", claude, false, false)
 		want := "claude --dangerously-skip-permissions --resume abc-123"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
@@ -9731,7 +9769,7 @@ func TestResolveSessionCommand(t *testing.T) {
 	})
 
 	t.Run("fresh wake uses --session-id", func(t *testing.T) {
-		got := resolveSessionCommand("claude --dangerously-skip-permissions", "abc-123", claude, false, true)
+		got := resolveSessionCommand("claude --dangerously-skip-permissions", "abc-123", "", claude, false, true)
 		want := "claude --dangerously-skip-permissions --session-id abc-123"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
@@ -9740,7 +9778,7 @@ func TestResolveSessionCommand(t *testing.T) {
 
 	t.Run("first start without SessionIDFlag falls back to resume", func(t *testing.T) {
 		noSessionID := &config.ResolvedProvider{ResumeFlag: "--resume"}
-		got := resolveSessionCommand("agent run", "key-1", noSessionID, true, false)
+		got := resolveSessionCommand("agent run", "key-1", "", noSessionID, true, false)
 		want := "agent run --resume key-1"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)

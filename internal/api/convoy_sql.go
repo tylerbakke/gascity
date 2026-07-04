@@ -108,7 +108,7 @@ func workflowSQLQueryWorkflowBeads(db *sql.DB, tableSets []workflowSQLTableSet, 
 				i.metadata
 			FROM `+tables.beads+` i
 			WHERE i.id = ?
-			   OR JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$."gc.root_bead_id"')) = ?
+			   OR JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '`+beadmeta.JSONPath(beadmeta.RootBeadIDMetadataKey)+`')) = ?
 			ORDER BY i.created_at
 		`, rootID, rootID)
 		if err != nil {
@@ -341,7 +341,7 @@ func workflowSQLWorkflowIDsSubquery(tableSets []workflowSQLTableSet) string {
 	for _, tables := range tableSets {
 		parts = append(parts, `
 			SELECT i.id FROM `+tables.beads+` i
-			WHERE i.id = ? OR JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$."gc.root_bead_id"')) = ?
+			WHERE i.id = ? OR JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '`+beadmeta.JSONPath(beadmeta.RootBeadIDMetadataKey)+`')) = ?
 		`)
 	}
 	return strings.Join(parts, " UNION ")
@@ -611,11 +611,18 @@ func workflowSQLRouteCandidate(state State, prefix string) (workflowSQLStoreCand
 }
 
 func workflowStorePath(state State, info workflowStoreInfo) (string, bool) {
+	// The dedicated graph store lives at its own legacy .gc/ location (or a gcg
+	// Postgres schema), not at a rig/city path derivable here, so it has no
+	// rig-path-derived SQL fast-path candidate. Skip it; the slow store-scan in
+	// buildWorkflowSnapshot consults the graph store directly.
+	if strings.HasPrefix(strings.TrimSpace(info.ref), workflowGraphStoreRefPrefix+":") {
+		return "", false
+	}
 	switch strings.TrimSpace(info.scopeKind) {
-	case "city":
+	case beadmeta.ScopeKindCity:
 		cityPath := strings.TrimSpace(state.CityPath())
 		return cityPath, cityPath != ""
-	case "rig":
+	case beadmeta.ScopeKindRig:
 		cfg := state.Config()
 		if cfg == nil {
 			return "", false
@@ -699,8 +706,8 @@ func workflowSQLFindRootByWorkflowID(db *sql.DB, tableSets []workflowSQLTableSet
 				i.description, i.created_at, i.updated_at,
 				i.metadata
 			FROM `+tables.beads+` i
-			WHERE JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$."gc.kind"')) = 'workflow'
-			  AND JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$."gc.workflow_id"')) = ?
+			WHERE JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '`+beadmeta.JSONPath(beadmeta.KindMetadataKey)+`')) = '`+beadmeta.KindWorkflow+`'
+			  AND JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '`+beadmeta.JSONPath(beadmeta.WorkflowIDMetadataKey)+`')) = ?
 			ORDER BY i.created_at
 			LIMIT 1
 		`, workflowID)

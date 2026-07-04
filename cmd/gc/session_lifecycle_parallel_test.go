@@ -820,7 +820,7 @@ func TestPrepareStartCandidate_UsesAssignedWorkSnapshotForTaskWorkDir(t *testing
 		Agents: []config.Agent{
 			{Name: "worker", Dir: "frontend", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(2)},
 		},
-	}, nil, store, &clock.Fake{Time: time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)}, nil, newAssignedTaskWorkDirResolver([]beads.Bead{task}))
+	}, nil, store, &clock.Fake{Time: time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)}, nil, newAssignedTaskWorkDirResolver("", []beads.Bead{task}))
 	if err != nil {
 		t.Fatalf("prepareStartCandidateForCity: %v", err)
 	}
@@ -3683,7 +3683,7 @@ func TestCommitStartResult_SessionInitializingClearsInFlightLease(t *testing.T) 
 		rollbackPending: true,
 	}
 
-	if commitStartResult(result, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}) {
+	if commitStartResult(result, sessionFrontDoor(store), clk, events.Discard, 0, ioDiscard{}, ioDiscard{}) {
 		t.Fatal("session_initializing result should not count as committed")
 	}
 	updated, err := store.Get(session.ID)
@@ -3739,7 +3739,7 @@ func TestCommitStartResult_RollbackPendingErrorClearsInFlightLeaseWhenCloseFails
 		rollbackPending: true,
 	}
 
-	if commitStartResult(result, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}) {
+	if commitStartResult(result, sessionFrontDoor(store), clk, events.Discard, 0, ioDiscard{}, ioDiscard{}) {
 		t.Fatal("rollback-pending error should not count as committed")
 	}
 	updated, err := store.Get(session.ID)
@@ -3801,7 +3801,7 @@ func TestCommitStartResult_AtomicBatchFailureLeavesClaimIntact(t *testing.T) {
 		finished: time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC),
 	}
 
-	ok := commitStartResult(result, store, &clock.Fake{Time: time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC)}, events.Discard, 0, ioDiscard{}, ioDiscard{})
+	ok := commitStartResult(result, sessionFrontDoor(store), &clock.Fake{Time: time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC)}, events.Discard, 0, ioDiscard{}, ioDiscard{})
 	if ok {
 		t.Fatal("commitStartResult returned true, want false when metadata batch fails (state transition lost)")
 	}
@@ -3868,7 +3868,7 @@ func TestCommitStartResult_SessionWokeEmittedOnlyAfterDurableCommit(t *testing.T
 			t.Fatal(err)
 		}
 		rec := events.NewFake()
-		if commitStartResult(successResult(&session), store, clk, rec, 0, ioDiscard{}, ioDiscard{}) {
+		if commitStartResult(successResult(&session), sessionFrontDoor(store), clk, rec, 0, ioDiscard{}, ioDiscard{}) {
 			t.Fatal("commitStartResult returned true, want false when metadata batch fails")
 		}
 		woke, err := rec.List(events.Filter{Type: events.SessionWoke})
@@ -3892,7 +3892,7 @@ func TestCommitStartResult_SessionWokeEmittedOnlyAfterDurableCommit(t *testing.T
 			t.Fatal(err)
 		}
 		rec := events.NewFake()
-		if !commitStartResult(successResult(&session), store, clk, rec, 0, ioDiscard{}, ioDiscard{}) {
+		if !commitStartResult(successResult(&session), sessionFrontDoor(store), clk, rec, 0, ioDiscard{}, ioDiscard{}) {
 			t.Fatal("commitStartResult returned false for successful start")
 		}
 		woke, err := rec.List(events.Filter{Type: events.SessionWoke})
@@ -4140,7 +4140,7 @@ func TestCommitStartResult_AtomicBatchLandsStateAndClaimClearTogether(t *testing
 	}
 
 	clkTime := time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC)
-	ok := commitStartResult(result, store, &clock.Fake{Time: clkTime}, events.Discard, 0, ioDiscard{}, ioDiscard{})
+	ok := commitStartResult(result, sessionFrontDoor(store), &clock.Fake{Time: clkTime}, events.Discard, 0, ioDiscard{}, ioDiscard{})
 	if !ok {
 		t.Fatal("commitStartResult returned false for successful start")
 	}
@@ -4489,7 +4489,7 @@ func TestGracefulStopAll_UsesLogicalSubjectForGracefulExit(t *testing.T) {
 	cfg := &config.City{Agents: []config.Agent{{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(1)}}}
 	var stdout, stderr bytes.Buffer
 
-	gracefulStopAll([]string{"custom-worker"}, sp, 50*time.Millisecond, rec, cfg, store, &stdout, &stderr)
+	gracefulStopAll([]string{"custom-worker"}, sp, 50*time.Millisecond, rec, cfg, beads.SessionStore{Store: store}, &stdout, &stderr)
 
 	if len(rec.Events) != 1 {
 		t.Fatalf("got %d events, want 1", len(rec.Events))
@@ -4521,7 +4521,7 @@ func TestGracefulStopAll_ReconstructsPoolSubjectFromLegacyBead(t *testing.T) {
 	cfg := &config.City{Agents: []config.Agent{{Name: "worker", Dir: "frontend", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(3)}}}
 	var stdout, stderr bytes.Buffer
 
-	gracefulStopAll([]string{"custom-worker-2"}, sp, 50*time.Millisecond, rec, cfg, store, &stdout, &stderr)
+	gracefulStopAll([]string{"custom-worker-2"}, sp, 50*time.Millisecond, rec, cfg, beads.SessionStore{Store: store}, &stdout, &stderr)
 
 	if len(rec.Events) != 1 {
 		t.Fatalf("got %d events, want 1", len(rec.Events))
@@ -4553,7 +4553,7 @@ func TestGracefulStopAll_UsesLegacyAgentLabelForPoolSubject(t *testing.T) {
 	cfg := &config.City{Agents: []config.Agent{{Name: "worker", Dir: "frontend", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(5)}}}
 	var stdout, stderr bytes.Buffer
 
-	gracefulStopAll([]string{"custom-worker-4"}, sp, 50*time.Millisecond, rec, cfg, store, &stdout, &stderr)
+	gracefulStopAll([]string{"custom-worker-4"}, sp, 50*time.Millisecond, rec, cfg, beads.SessionStore{Store: store}, &stdout, &stderr)
 
 	if len(rec.Events) != 1 {
 		t.Fatalf("got %d events, want 1", len(rec.Events))
@@ -4572,7 +4572,7 @@ func TestGracefulStopAll_UsesListRunningToStopLingeringSessions(t *testing.T) {
 	rec := events.NewFake()
 	var stdout, stderr bytes.Buffer
 
-	gracefulStopAll([]string{"custom-worker"}, sp, 20*time.Millisecond, rec, nil, nil, &stdout, &stderr)
+	gracefulStopAll([]string{"custom-worker"}, sp, 20*time.Millisecond, rec, nil, beads.SessionStore{}, &stdout, &stderr)
 
 	var stopCalls int
 	for _, call := range sp.Calls {
@@ -4597,7 +4597,7 @@ func TestGracefulStopAll_CleansExitedRuntimeArtifact(t *testing.T) {
 	rec := events.NewFake()
 	var stdout, stderr bytes.Buffer
 
-	gracefulStopAll([]string{"custom-worker"}, sp, 20*time.Millisecond, rec, nil, nil, &stdout, &stderr)
+	gracefulStopAll([]string{"custom-worker"}, sp, 20*time.Millisecond, rec, nil, beads.SessionStore{}, &stdout, &stderr)
 
 	if sp.stopCalls["custom-worker"] == 0 {
 		t.Fatalf("expected gracefulStopAll to cleanup exited runtime artifact, calls=%+v", sp.Calls)
@@ -4619,7 +4619,7 @@ func TestGracefulStopAll_CleansExitedRuntimeArtifactAlongsideLiveSurvivor(t *tes
 	rec := events.NewFake()
 	var stdout, stderr bytes.Buffer
 
-	gracefulStopAll([]string{"corpse-worker", "live-worker"}, sp, 20*time.Millisecond, rec, nil, nil, &stdout, &stderr)
+	gracefulStopAll([]string{"corpse-worker", "live-worker"}, sp, 20*time.Millisecond, rec, nil, beads.SessionStore{}, &stdout, &stderr)
 
 	if sp.stopCalls["corpse-worker"] == 0 {
 		t.Fatalf("expected cleanup Stop for exited runtime artifact, calls=%+v", sp.Calls)
@@ -4857,7 +4857,7 @@ func TestCommitStartResult_LogsSuccessOutcome(t *testing.T) {
 	}
 	rec := events.NewFake()
 	var stdout, stderr bytes.Buffer
-	ok := commitStartResult(result, store, &clock.Fake{Time: time.Unix(3, 0)}, rec, 0, &stdout, &stderr)
+	ok := commitStartResult(result, sessionFrontDoor(store), &clock.Fake{Time: time.Unix(3, 0)}, rec, 0, &stdout, &stderr)
 	if !ok {
 		t.Fatal("commitStartResult returned false for success")
 	}
@@ -4882,7 +4882,7 @@ func TestCommitStartResult_SanitizesMultilineError(t *testing.T) {
 		outcome:  "panic_recovered",
 	}
 	var stderr bytes.Buffer
-	ok := commitStartResult(result, store, &clock.Fake{Time: time.Unix(3, 0)}, events.NewFake(), 0, ioDiscard{}, &stderr)
+	ok := commitStartResult(result, sessionFrontDoor(store), &clock.Fake{Time: time.Unix(3, 0)}, events.NewFake(), 0, ioDiscard{}, &stderr)
 	if ok {
 		t.Fatal("commitStartResult returned true for error result")
 	}
@@ -4892,6 +4892,45 @@ func TestCommitStartResult_SanitizesMultilineError(t *testing.T) {
 	}
 	if !strings.Contains(got, "boom\\nstack line") {
 		t.Fatalf("stderr = %q, want escaped multiline error", got)
+	}
+}
+
+func TestCommitStartResult_TerminalProviderErrorMarksUnhealthy(t *testing.T) {
+	store := newTestStore()
+	session := makeBead("b1", map[string]string{
+		"template":     "worker",
+		"session_name": "worker",
+		"state":        "active",
+		"last_woke_at": "2026-05-27T12:00:00Z",
+	})
+	session.Type = sessionBeadType
+	session.Labels = []string{sessionBeadLabel}
+	session.Title = "worker"
+	candidate := startCandidate{
+		session: &session,
+		tp:      TemplateParams{TemplateName: "worker", InstanceName: "worker"},
+	}
+	result := startResult{
+		prepared: preparedStart{candidate: candidate},
+		err:      fmt.Errorf("model_not_found: gpt-5.3-codex-spark"),
+		outcome:  "provider_error",
+	}
+
+	if commitStartResult(result, sessionFrontDoor(store), &clock.Fake{Time: time.Unix(3, 0)}, events.NewFake(), 0, ioDiscard{}, ioDiscard{}) {
+		t.Fatal("commitStartResult returned true for terminal provider error")
+	}
+	got := store.metadata[session.ID]
+	if got[sessionHealthStateMetadataKey] != "unhealthy" {
+		t.Fatalf("session health = %q, want unhealthy", got[sessionHealthStateMetadataKey])
+	}
+	if got[sessionHealthReasonMetadataKey] != "model_not_found" {
+		t.Fatalf("health reason = %q, want model_not_found", got[sessionHealthReasonMetadataKey])
+	}
+	if got[sessionDrainableMetadataKey] != boolMetadata(true) {
+		t.Fatalf("drainable = %q, want true", got[sessionDrainableMetadataKey])
+	}
+	if got["last_woke_at"] != "" {
+		t.Fatalf("last_woke_at = %q, want cleared", got["last_woke_at"])
 	}
 }
 
@@ -5990,7 +6029,7 @@ func TestExecutePreparedStartWave_RateLimitStartupDeathQuarantinesWithoutWakeFai
 		t.Fatal("expected startup-death error")
 	}
 
-	if commitStartResult(results[0], store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}) {
+	if commitStartResult(results[0], sessionFrontDoor(store), clk, events.Discard, 0, ioDiscard{}, ioDiscard{}) {
 		t.Fatal("startup rate-limit hold should not count as a committed wake")
 	}
 	got, err := store.Get(session.ID)
@@ -6085,7 +6124,7 @@ func TestExecutePreparedStartWave_RateLimitPendingCreateDeathClearsClaim(t *test
 		t.Fatal("pending-create startup death should still classify provider rate-limit screen")
 	}
 
-	if commitStartResult(results[0], store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}) {
+	if commitStartResult(results[0], sessionFrontDoor(store), clk, events.Discard, 0, ioDiscard{}, ioDiscard{}) {
 		t.Fatal("startup rate-limit hold should not count as a committed wake")
 	}
 	got, err := store.Get(session.ID)
@@ -6490,7 +6529,7 @@ func TestCommitStartResult_TransitionsCreatingToActive(t *testing.T) {
 		finished: time.Unix(101, 0),
 	}
 	rec := events.NewFake()
-	ok := commitStartResult(result, store, &clock.Fake{Time: time.Unix(102, 0)}, rec, 0, ioDiscard{}, ioDiscard{})
+	ok := commitStartResult(result, sessionFrontDoor(store), &clock.Fake{Time: time.Unix(102, 0)}, rec, 0, ioDiscard{}, ioDiscard{})
 	if !ok {
 		t.Fatal("commitStartResult returned false for successful start")
 	}
@@ -6564,7 +6603,7 @@ func TestCommitStartResult_PersistsMCPIdentityForACPStart(t *testing.T) {
 		finished: time.Unix(101, 0),
 	}
 	rec := events.NewFake()
-	ok := commitStartResult(result, store, &clock.Fake{Time: time.Unix(102, 0)}, rec, 0, ioDiscard{}, ioDiscard{})
+	ok := commitStartResult(result, sessionFrontDoor(store), &clock.Fake{Time: time.Unix(102, 0)}, rec, 0, ioDiscard{}, ioDiscard{})
 	if !ok {
 		t.Fatal("commitStartResult returned false for successful start")
 	}
@@ -6651,7 +6690,7 @@ func TestClearStaleResumeKeyMetadata(t *testing.T) {
 		t.Fatalf("seed metadata: %v", err)
 	}
 
-	clearStaleResumeKeyMetadata(bead, store)
+	clearStaleResumeKeyMetadata(bead, sessionFrontDoor(store))
 
 	if got := bead.Metadata["session_key"]; got != "" {
 		t.Fatalf("in-memory session_key = %q, want empty", got)

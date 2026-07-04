@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
+	"github.com/gastownhall/gascity/internal/storeref"
 )
 
 const (
@@ -45,11 +47,11 @@ type drainManifestRow struct {
 
 func processDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (ControlResult, error) {
 	switch strings.TrimSpace(bead.Metadata[beadmeta.DrainStateMetadataKey]) {
-	case "", "pending", "expanding":
+	case "", beadmeta.DrainStatePending, beadmeta.DrainStateExpanding:
 		return expandDrain(store, bead, opts)
-	case "expanded", "completing":
+	case beadmeta.DrainStateExpanded, beadmeta.DrainStateCompleting:
 		return completeDrain(store, bead, opts)
-	case "succeeded", "failed":
+	case beadmeta.DrainStateSucceeded, beadmeta.DrainStateFailed:
 		return ControlResult{}, nil
 	default:
 		return ControlResult{}, fmt.Errorf("%s: unsupported gc.drain_state %q", bead.ID, bead.Metadata[beadmeta.DrainStateMetadataKey])
@@ -80,24 +82,39 @@ func expandDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Contr
 	if itemFormula == "" {
 		return ControlResult{}, fmt.Errorf("%s: missing gc.drain_formula", bead.ID)
 	}
-	manifest, members, err := loadOrBuildDrainManifest(store, bead, parentConvoyID, itemFormula)
+	manifest, members, err := loadOrBuildDrainManifest(store, bead, parentConvoyID, itemFormula, opts)
 	if err != nil {
 		if errors.Is(err, errDrainLimitExceeded) {
-			return ControlResult{Processed: true, Action: "drain-limit-exceeded"}, nil
+			scopeResult, scopeErr := reconcileClosedDrainScope(store, bead.ID, opts)
+			if scopeErr != nil {
+				return ControlResult{}, scopeErr
+			}
+			return ControlResult{Processed: true, Action: "drain-limit-exceeded", Skipped: scopeResult.Skipped}, nil
 		}
 		if errors.Is(err, errDrainUnresolvedMember) {
-			return ControlResult{Processed: true, Action: "drain-unresolved-member"}, nil
+			scopeResult, scopeErr := reconcileClosedDrainScope(store, bead.ID, opts)
+			if scopeErr != nil {
+				return ControlResult{}, scopeErr
+			}
+			return ControlResult{Processed: true, Action: "drain-unresolved-member", Skipped: scopeResult.Skipped}, nil
+		}
+		// Validation failures above may have closed the control before
+		// erroring; reconcile the scope best-effort so a closed scoped drain
+		// does not strand its scope (mirrors markControllerSpawnError's tolerant
+		// reconcile).
+		if closed, getErr := store.Get(bead.ID); getErr == nil && closed.Status == "closed" {
+			_, _ = reconcileTerminalScopedMemberWithOptions(store, closed, opts)
 		}
 		return ControlResult{}, err
 	}
-	if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{beadmeta.DrainStateMetadataKey: "expanding"}); err != nil {
+	if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{beadmeta.DrainStateMetadataKey: beadmeta.DrainStateExpanding}); err != nil {
 		return ControlResult{}, fmt.Errorf("%s: recording drain manifest: %w", bead.ID, err)
 	}
-	if manifest.Context == "shared" {
+	if manifest.Context == beadmeta.DrainContextShared {
 		return advanceSharedDrain(store, bead, manifest, members, itemFormula, parentVars, opts)
 	}
-	if err := reserveDrainMembers(store, bead, members); err != nil {
-		return closeDrainReservationFailure(store, bead, manifest, err)
+	if err := reserveDrainMembers(store, bead, members, opts); err != nil {
+		return closeDrainReservationFailure(store, bead, manifest, err, opts)
 	}
 
 	totalCreated := 0
@@ -133,7 +150,7 @@ func expandDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Contr
 			rootID, created, err := ensureDrainItemRoot(store, bead, unit, member, len(members), row, itemFormula, parentVars, blockerIDs, opts)
 			if err != nil {
 				if errors.Is(err, errDrainInvalidItemFormula) {
-					return closeDrainItemFormulaFailure(store, bead, manifest, err)
+					return closeDrainItemFormulaFailure(store, bead, manifest, err, opts)
 				}
 				return ControlResult{}, err
 			}
@@ -156,7 +173,7 @@ func expandDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Contr
 			return ControlResult{}, fmt.Errorf("%s: projecting drain dependencies for member %s: %w", bead.ID, member.ID, err)
 		}
 		row.Status = "wired"
-		if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{beadmeta.DrainStateMetadataKey: "expanding"}); err != nil {
+		if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{beadmeta.DrainStateMetadataKey: beadmeta.DrainStateExpanding}); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: recording drain progress: %w", bead.ID, err)
 		}
 	}
@@ -167,7 +184,7 @@ func expandDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Contr
 		return ControlResult{}, fmt.Errorf("%s: projecting drain dependencies: %w", bead.ID, err)
 	}
 	if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{
-		beadmeta.DrainStateMetadataKey:          "expanded",
+		beadmeta.DrainStateMetadataKey:          beadmeta.DrainStateExpanded,
 		beadmeta.DrainParentConvoyIDMetadataKey: parentConvoyID,
 		beadmeta.DrainCountMetadataKey:          strconv.Itoa(len(manifest.Rows)),
 	}); err != nil {
@@ -179,19 +196,19 @@ func expandDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Contr
 	return ControlResult{Processed: true, Action: "drain-expanded", Created: totalCreated}, nil
 }
 
-func loadOrBuildDrainManifest(store beads.Store, bead beads.Bead, parentConvoyID, itemFormula string) (drainManifest, []beads.Bead, error) {
+func loadOrBuildDrainManifest(store beads.Store, bead beads.Bead, parentConvoyID, itemFormula string, opts ProcessOptions) (drainManifest, []beads.Bead, error) {
 	if strings.TrimSpace(bead.Metadata[drainManifestMetadataKey]) != "" {
 		manifest, err := parseDrainManifest(bead.Metadata[drainManifestMetadataKey])
 		if err != nil {
 			return drainManifest{}, nil, fmt.Errorf("%s: parsing persisted drain manifest: %w", bead.ID, err)
 		}
-		members, err := loadDrainManifestMembers(store, bead.ID, manifest)
+		members, err := loadDrainManifestMembers(store, bead.ID, manifest, opts)
 		if err != nil {
 			return drainManifest{}, nil, err
 		}
 		return manifest, members, nil
 	}
-	members, err := convoycore.Members(store, parentConvoyID, false)
+	members, err := convoycore.Members(store, parentConvoyID, false, opts.MemberStores...)
 	if err != nil {
 		return drainManifest{}, nil, fmt.Errorf("%s: loading convoy members for %s: %w", bead.ID, parentConvoyID, err)
 	}
@@ -199,9 +216,9 @@ func loadOrBuildDrainManifest(store beads.Store, bead beads.Bead, parentConvoyID
 		var unresolved drainUnresolvedMemberError
 		if errors.As(err, &unresolved) {
 			closeMetadata := map[string]string{
-				beadmeta.DrainStateMetadataKey:     "failed",
-				beadmeta.OutcomeMetadataKey:        "fail",
-				beadmeta.FailureClassMetadataKey:   "hard",
+				beadmeta.DrainStateMetadataKey:     beadmeta.DrainStateFailed,
+				beadmeta.OutcomeMetadataKey:        beadmeta.OutcomeFail,
+				beadmeta.FailureClassMetadataKey:   beadmeta.FailureClassHard,
 				beadmeta.FailureReasonMetadataKey:  "unresolved_member",
 				beadmeta.FailureSubjectMetadataKey: unresolved.MemberID,
 			}
@@ -214,9 +231,9 @@ func loadOrBuildDrainManifest(store beads.Store, bead beads.Bead, parentConvoyID
 	maxUnits, err := drainMaxUnits(bead)
 	if err != nil {
 		closeMetadata := map[string]string{
-			beadmeta.DrainStateMetadataKey:    "failed",
-			beadmeta.OutcomeMetadataKey:       "fail",
-			beadmeta.FailureClassMetadataKey:  "hard",
+			beadmeta.DrainStateMetadataKey:    beadmeta.DrainStateFailed,
+			beadmeta.OutcomeMetadataKey:       beadmeta.OutcomeFail,
+			beadmeta.FailureClassMetadataKey:  beadmeta.FailureClassHard,
 			beadmeta.FailureReasonMetadataKey: "drain_max_units_invalid",
 		}
 		if closeErr := updateMetadataAndClose(store, bead.ID, closeMetadata); closeErr != nil {
@@ -226,9 +243,9 @@ func loadOrBuildDrainManifest(store beads.Store, bead beads.Bead, parentConvoyID
 	}
 	if len(members) > maxUnits {
 		closeMetadata := map[string]string{
-			beadmeta.DrainStateMetadataKey:    "failed",
-			beadmeta.OutcomeMetadataKey:       "fail",
-			beadmeta.FailureClassMetadataKey:  "hard",
+			beadmeta.DrainStateMetadataKey:    beadmeta.DrainStateFailed,
+			beadmeta.OutcomeMetadataKey:       beadmeta.OutcomeFail,
+			beadmeta.FailureClassMetadataKey:  beadmeta.FailureClassHard,
 			beadmeta.FailureReasonMetadataKey: "limit_exceeded",
 		}
 		if err := updateMetadataAndClose(store, bead.ID, closeMetadata); err != nil {
@@ -263,10 +280,51 @@ func (e drainUnresolvedMemberError) Unwrap() error {
 	return errDrainUnresolvedMember
 }
 
-func loadDrainManifestMembers(store beads.Store, controlID string, manifest drainManifest) ([]beads.Bead, error) {
+// drainMemberProbeSet returns the ordered store set used to resolve a drain
+// member bead: the primary graph store first, then the work-class member store
+// tail from opts.MemberStores. A drain control and its item-root molecules live
+// in the graph store, but the convoy members a drain reserves and reloads are
+// work beads that may live in a different per-class store. Resolving through this
+// set keeps member access consistent with the fresh convoycore.Members build
+// (which already threads opts.MemberStores). Empty MemberStores (single-store
+// callers) collapses the probe to the primary store, matching the pre-seam
+// store.Get behavior exactly.
+func drainMemberProbeSet(store beads.Store, opts ProcessOptions) []beads.Store {
+	probe := make([]beads.Store, 0, 1+len(opts.MemberStores))
+	probe = append(probe, store)
+	probe = append(probe, opts.MemberStores...)
+	return probe
+}
+
+// drainMemberOwningStore returns the store that owns memberID, probing the
+// primary graph store then the work-class member tail and returning the first
+// store whose Get succeeds. Because ids are prefix-disjoint across stores the
+// member lives in exactly one, so the first hit is authoritative. A store's
+// not-found probe is skipped; any other error is returned. When no probed store
+// has the member (every probe a clean not-found), it falls back to the primary
+// store so reservation reads/writes preserve their pre-seam not-found handling
+// (reserveDrainMember/releaseDrainReservations treat ErrNotFound as a no-op).
+func drainMemberOwningStore(store beads.Store, memberID string, opts ProcessOptions) (beads.Store, error) {
+	for _, probe := range drainMemberProbeSet(store, opts) {
+		if probe == nil {
+			continue
+		}
+		if _, err := probe.Get(memberID); err != nil {
+			if errors.Is(err, beads.ErrNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		return probe, nil
+	}
+	return store, nil
+}
+
+func loadDrainManifestMembers(store beads.Store, controlID string, manifest drainManifest, opts ProcessOptions) ([]beads.Bead, error) {
+	probe := drainMemberProbeSet(store, opts)
 	members := make([]beads.Bead, 0, len(manifest.Rows))
 	for _, row := range manifest.Rows {
-		member, err := store.Get(row.MemberID)
+		member, err := storeref.Resolve(row.MemberID, probe)
 		if err != nil {
 			if errors.Is(err, beads.ErrNotFound) && strings.TrimSpace(row.MemberID) != "" {
 				members = append(members, beads.Bead{ID: row.MemberID, Title: row.MemberID, Type: "task", Status: "unknown"})
@@ -293,7 +351,7 @@ func completeDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 	if err != nil {
 		return ControlResult{}, fmt.Errorf("%s: parsing drain manifest: %w", bead.ID, err)
 	}
-	if manifest.Context == "shared" {
+	if manifest.Context == beadmeta.DrainContextShared {
 		rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 		if rootID == "" {
 			return ControlResult{}, fmt.Errorf("%s: missing gc.root_bead_id", bead.ID)
@@ -306,7 +364,7 @@ func completeDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 		if err != nil {
 			return ControlResult{}, fmt.Errorf("%s: parsing formulas v2 runtime vars on root %s: %w", bead.ID, rootID, err)
 		}
-		members, err := loadDrainManifestMembers(store, bead.ID, manifest)
+		members, err := loadDrainManifestMembers(store, bead.ID, manifest, opts)
 		if err != nil {
 			return ControlResult{}, err
 		}
@@ -321,8 +379,8 @@ func completeDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 		}
 		return ControlResult{}, fmt.Errorf("%s: repairing drain dependency projection: %w", bead.ID, err)
 	}
-	if strings.TrimSpace(bead.Metadata[beadmeta.DrainStateMetadataKey]) != "completing" {
-		if err := store.SetMetadata(bead.ID, beadmeta.DrainStateMetadataKey, "completing"); err != nil {
+	if strings.TrimSpace(bead.Metadata[beadmeta.DrainStateMetadataKey]) != beadmeta.DrainStateCompleting {
+		if err := store.SetMetadata(bead.ID, beadmeta.DrainStateMetadataKey, beadmeta.DrainStateCompleting); err != nil {
 			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
 				return ControlResult{}, ErrControlPending
 			}
@@ -343,7 +401,7 @@ func completeDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 			return ControlResult{}, ErrControlPending
 		}
 		outcome := strings.TrimSpace(root.Metadata[beadmeta.OutcomeMetadataKey])
-		if outcome == "pass" {
+		if outcome == beadmeta.OutcomePass {
 			row.Status = "succeeded"
 		} else {
 			failed++
@@ -363,11 +421,11 @@ func completeDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 		row.OutcomeKind = outcome
 	}
 	closeState := "succeeded"
-	outcome := "pass"
+	outcome := beadmeta.OutcomePass
 	action := "drain-succeeded"
 	if failed > 0 {
 		closeState = "failed"
-		outcome = "fail"
+		outcome = beadmeta.OutcomeFail
 		action = "drain-failed"
 	}
 	metadata := map[string]string{
@@ -379,18 +437,22 @@ func completeDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 		return ControlResult{}, err
 	}
 	metadata[drainManifestMetadataKey] = string(data)
-	if err := releaseDrainReservations(store, bead.ID, manifest); err != nil {
+	if err := releaseDrainReservations(store, bead.ID, manifest, opts); err != nil {
 		return ControlResult{}, err
 	}
 	if err := updateMetadataAndClose(store, bead.ID, metadata); err != nil {
 		return ControlResult{}, fmt.Errorf("%s: closing drain: %w", bead.ID, err)
 	}
-	return ControlResult{Processed: true, Action: action}, nil
+	scopeResult, err := reconcileClosedDrainScope(store, bead.ID, opts)
+	if err != nil {
+		return ControlResult{}, err
+	}
+	return ControlResult{Processed: true, Action: action, Skipped: scopeResult.Skipped}, nil
 }
 
 func advanceSharedDrain(store beads.Store, bead beads.Bead, manifest drainManifest, members []beads.Bead, itemFormula string, parentVars map[string]string, opts ProcessOptions) (ControlResult, error) {
 	if len(manifest.Rows) == 0 {
-		return closeDrainWithManifest(store, bead.ID, manifest, "succeeded", "pass", "drain-succeeded")
+		return closeDrainWithManifest(store, bead.ID, manifest, "succeeded", beadmeta.OutcomePass, "drain-succeeded", opts)
 	}
 	// Repair materialized rows before waiting on them: a row wired to a
 	// source member by an earlier build never closes (drains do not close
@@ -411,15 +473,15 @@ func advanceSharedDrain(store beads.Store, bead beads.Bead, manifest drainManife
 				return ControlResult{}, fmt.Errorf("%s: loading shared item root %s: %w", bead.ID, row.ItemRootID, err)
 			}
 			if root.Status != "closed" {
-				if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{beadmeta.DrainStateMetadataKey: "expanded"}); err != nil {
+				if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{beadmeta.DrainStateMetadataKey: beadmeta.DrainStateExpanded}); err != nil {
 					return ControlResult{}, fmt.Errorf("%s: recording shared drain wait: %w", bead.ID, err)
 				}
 				return ControlResult{}, ErrControlPending
 			}
 			if !recordDrainRowOutcome(row, root) {
-				if onItemFailure == "skip_remaining" {
+				if onItemFailure == beadmeta.DrainOnItemFailureSkipRemaining {
 					markRemainingSharedRowsSkipped(&manifest, i+1)
-					return closeDrainWithManifest(store, bead.ID, manifest, "failed", "fail", "drain-failed")
+					return closeDrainWithManifest(store, bead.ID, manifest, "failed", beadmeta.OutcomeFail, "drain-failed", opts)
 				}
 			}
 			continue
@@ -428,13 +490,13 @@ func advanceSharedDrain(store beads.Store, bead beads.Bead, manifest drainManife
 			return ControlResult{}, fmt.Errorf("%s: shared drain manifest/member length mismatch", bead.ID)
 		}
 		member := members[i]
-		if err := reserveDrainMember(store, bead, member); err != nil {
-			return closeDrainReservationFailure(store, bead, manifest, err)
+		if err := reserveDrainMember(store, bead, member, opts); err != nil {
+			return closeDrainReservationFailure(store, bead, manifest, err, opts)
 		}
 		created, err := materializeDrainRow(store, bead, manifest, members, row, member, itemFormula, parentVars, opts)
 		if err != nil {
 			if errors.Is(err, errDrainInvalidItemFormula) {
-				return closeDrainItemFormulaFailure(store, bead, manifest, err)
+				return closeDrainItemFormulaFailure(store, bead, manifest, err, opts)
 			}
 			return ControlResult{}, err
 		}
@@ -445,7 +507,7 @@ func advanceSharedDrain(store beads.Store, bead beads.Bead, manifest drainManife
 			return ControlResult{}, fmt.Errorf("%s: projecting shared drain dependencies: %w", bead.ID, err)
 		}
 		if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{
-			beadmeta.DrainStateMetadataKey:          "expanded",
+			beadmeta.DrainStateMetadataKey:          beadmeta.DrainStateExpanded,
 			beadmeta.DrainParentConvoyIDMetadataKey: manifest.ParentConvoyID,
 			beadmeta.DrainCountMetadataKey:          strconv.Itoa(len(manifest.Rows)),
 		}); err != nil {
@@ -454,9 +516,9 @@ func advanceSharedDrain(store beads.Store, bead beads.Bead, manifest drainManife
 		return ControlResult{Processed: true, Action: "drain-shared-advanced", Created: created}, nil
 	}
 	if drainManifestHasFailedRows(manifest) {
-		return closeDrainWithManifest(store, bead.ID, manifest, "failed", "fail", "drain-failed")
+		return closeDrainWithManifest(store, bead.ID, manifest, "failed", beadmeta.OutcomeFail, "drain-failed", opts)
 	}
-	return closeDrainWithManifest(store, bead.ID, manifest, "succeeded", "pass", "drain-succeeded")
+	return closeDrainWithManifest(store, bead.ID, manifest, "succeeded", beadmeta.OutcomePass, "drain-succeeded", opts)
 }
 
 func materializeDrainRow(store beads.Store, control beads.Bead, manifest drainManifest, members []beads.Bead, row *drainManifestRow, member beads.Bead, itemFormula string, parentVars map[string]string, opts ProcessOptions) (int, error) {
@@ -670,7 +732,7 @@ func recordDrainRowOutcome(row *drainManifestRow, root beads.Bead) bool {
 		row.OutcomeBead = root.ID
 	}
 	row.OutcomeKind = outcome
-	if outcome == "pass" {
+	if outcome == beadmeta.OutcomePass {
 		row.Status = "succeeded"
 		row.Failure = ""
 		return true
@@ -692,7 +754,7 @@ func drainManifestHasFailedRows(manifest drainManifest) bool {
 			return true
 		}
 		outcome := strings.TrimSpace(row.OutcomeKind)
-		if outcome != "" && outcome != "pass" {
+		if outcome != "" && outcome != beadmeta.OutcomePass {
 			return true
 		}
 	}
@@ -709,12 +771,22 @@ func markRemainingSharedRowsSkipped(manifest *drainManifest, start int) {
 			continue
 		}
 		row.Status = "skipped"
-		row.OutcomeKind = "skipped"
+		row.OutcomeKind = beadmeta.OutcomeSkipped
 		row.Failure = "previous_item_failed"
 	}
 }
 
-func closeDrainWithManifest(store beads.Store, beadID string, manifest drainManifest, closeState, outcome, action string) (ControlResult, error) {
+// reconcileClosedDrainScope mirrors the fanout/retry/ralph terminal-close
+// behavior for drain controls: after a drain control closes, reconcile its
+// enclosing scope so a drain that was the scope's last open member finalizes
+// the scope (or aborts it on fail) instead of relying on another control's
+// close-time backstop. Returns the scope reconciliation result for Skipped
+// propagation; no-op for scope-less drains.
+func reconcileClosedDrainScope(store beads.Store, beadID string, opts ProcessOptions) (ControlResult, error) {
+	return reconcileClosedScopeMemberWithOptions(store, beadID, opts)
+}
+
+func closeDrainWithManifest(store beads.Store, beadID string, manifest drainManifest, closeState, outcome, action string, opts ProcessOptions) (ControlResult, error) {
 	metadata := map[string]string{
 		beadmeta.DrainStateMetadataKey: closeState,
 		beadmeta.OutcomeMetadataKey:    outcome,
@@ -724,19 +796,23 @@ func closeDrainWithManifest(store beads.Store, beadID string, manifest drainMani
 		return ControlResult{}, err
 	}
 	metadata[drainManifestMetadataKey] = string(data)
-	if err := releaseDrainReservations(store, beadID, manifest); err != nil {
+	if err := releaseDrainReservations(store, beadID, manifest, opts); err != nil {
 		return ControlResult{}, err
 	}
 	if err := updateMetadataAndClose(store, beadID, metadata); err != nil {
 		return ControlResult{}, fmt.Errorf("%s: closing drain: %w", beadID, err)
 	}
-	return ControlResult{Processed: true, Action: action}, nil
+	scopeResult, err := reconcileClosedDrainScope(store, beadID, opts)
+	if err != nil {
+		return ControlResult{}, err
+	}
+	return ControlResult{Processed: true, Action: action, Skipped: scopeResult.Skipped}, nil
 }
 
 func buildDrainManifest(bead beads.Bead, parentConvoyID, itemFormula string, members []beads.Bead) drainManifest {
 	context := strings.TrimSpace(bead.Metadata[beadmeta.DrainContextMetadataKey])
 	if context == "" {
-		context = "separate"
+		context = beadmeta.DrainContextSeparate
 	}
 	rows := make([]drainManifestRow, 0, len(members))
 	for i, member := range members {
@@ -1028,7 +1104,7 @@ func isGraphV2WorkflowRecipe(recipe *formula.Recipe) bool {
 		return false
 	}
 	root := recipe.RootStep()
-	return root != nil && root.Metadata[beadmeta.KindMetadataKey] == "workflow" && root.Metadata[beadmeta.FormulaContractMetadataKey] == "graph.v2"
+	return root != nil && root.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflow && root.Metadata[beadmeta.FormulaContractMetadataKey] == beadmeta.FormulaContractGraphV2
 }
 
 func stampDrainItemRecipe(recipe *formula.Recipe, control, unit, member beads.Bead, count int, row *drainManifestRow, itemFormula string, vars map[string]string) {
@@ -1050,7 +1126,7 @@ func stampDrainItemRecipe(recipe *formula.Recipe, control, unit, member beads.Be
 	if metadata := graphv2.RuntimeVarsMetadata(vars); metadata != "" {
 		root.Metadata[graphv2.RuntimeVarsMetadataKey] = metadata
 	}
-	if strings.TrimSpace(control.Metadata[beadmeta.DrainContextMetadataKey]) == "shared" {
+	if strings.TrimSpace(control.Metadata[beadmeta.DrainContextMetadataKey]) == beadmeta.DrainContextShared {
 		group := sharedDrainContinuationGroup(control)
 		for i := range recipe.Steps {
 			step := &recipe.Steps[i]
@@ -1066,6 +1142,13 @@ func stampDrainItemRecipe(recipe *formula.Recipe, control, unit, member beads.Be
 	}
 }
 
+// isSharedDrainExecutableStep reports whether a drain item recipe step is
+// worker-executable work that should carry shared-drain continuation
+// metadata (gc.continuation_group, gc.session_affinity). Control-dispatcher
+// steps (beadmeta.ControlKinds) and workflow-topology anchors
+// (beadmeta.WorkflowTopologyKinds) are infrastructure the control dispatcher
+// or graph routing owns, never session-affine worker work, so they are
+// excluded.
 func isSharedDrainExecutableStep(step *formula.RecipeStep) bool {
 	if step == nil {
 		return false
@@ -1074,12 +1157,7 @@ func isSharedDrainExecutableStep(step *formula.RecipeStep) bool {
 	if step.Metadata != nil {
 		kind = strings.TrimSpace(step.Metadata[beadmeta.KindMetadataKey])
 	}
-	switch kind {
-	case "workflow", "workflow-finalize", "scope", "spec", "drain", "check", "fanout", "retry-eval", "scope-check", "retry", "ralph":
-		return false
-	default:
-		return true
-	}
+	return !beadmeta.IsControlKind(kind) && !slices.Contains(beadmeta.WorkflowTopologyKinds, kind)
 }
 
 func sharedDrainContinuationGroup(control beads.Bead) string {
@@ -1100,11 +1178,21 @@ func (e drainReservationError) Error() string {
 	return fmt.Sprintf("%s: member %s already reserved by drain %s", e.ControlID, e.MemberID, e.Owner)
 }
 
-func reserveDrainMember(store beads.Store, control, member beads.Bead) error {
-	if drainMemberAccess(control) != "exclusive" {
+// reserveDrainMember claims a member for exclusive drain access by stamping the
+// reservation metadata on the member bead. The member is a work bead that may
+// live in the work-class store rather than the primary graph store, so both the
+// reservation read and write route to the member's owning store
+// (drainMemberOwningStore). On origin/main the owning store is the single store,
+// matching the pre-seam store.Get/store.SetMetadata behavior exactly.
+func reserveDrainMember(store beads.Store, control, member beads.Bead, opts ProcessOptions) error {
+	if drainMemberAccess(control) != beadmeta.DrainMemberAccessExclusive {
 		return nil
 	}
-	current, err := store.Get(member.ID)
+	memberStore, err := drainMemberOwningStore(store, member.ID, opts)
+	if err != nil {
+		return fmt.Errorf("%s: resolving exclusive drain member store for %s: %w", control.ID, member.ID, err)
+	}
+	current, err := memberStore.Get(member.ID)
 	if err != nil {
 		if errors.Is(err, beads.ErrNotFound) {
 			return nil
@@ -1118,19 +1206,19 @@ func reserveDrainMember(store beads.Store, control, member beads.Bead) error {
 	if owner == control.ID {
 		return nil
 	}
-	return store.SetMetadata(member.ID, beadmeta.ExclusiveDrainReservationMetadataKey, control.ID)
+	return memberStore.SetMetadata(member.ID, beadmeta.ExclusiveDrainReservationMetadataKey, control.ID)
 }
 
-func reserveDrainMembers(store beads.Store, control beads.Bead, members []beads.Bead) error {
+func reserveDrainMembers(store beads.Store, control beads.Bead, members []beads.Bead, opts ProcessOptions) error {
 	for _, member := range members {
-		if err := reserveDrainMember(store, control, member); err != nil {
+		if err := reserveDrainMember(store, control, member, opts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func releaseDrainReservations(store beads.Store, controlID string, manifest drainManifest) error {
+func releaseDrainReservations(store beads.Store, controlID string, manifest drainManifest, opts ProcessOptions) error {
 	controlID = strings.TrimSpace(controlID)
 	if store == nil || controlID == "" {
 		return nil
@@ -1142,7 +1230,11 @@ func releaseDrainReservations(store beads.Store, controlID string, manifest drai
 			continue
 		}
 		seen[memberID] = true
-		member, err := store.Get(memberID)
+		memberStore, err := drainMemberOwningStore(store, memberID, opts)
+		if err != nil {
+			return fmt.Errorf("%s: resolving drain member store for %s: %w", controlID, memberID, err)
+		}
+		member, err := memberStore.Get(memberID)
 		if err != nil {
 			if errors.Is(err, beads.ErrNotFound) {
 				continue
@@ -1152,20 +1244,20 @@ func releaseDrainReservations(store beads.Store, controlID string, manifest drai
 		if strings.TrimSpace(member.Metadata[beadmeta.ExclusiveDrainReservationMetadataKey]) != controlID {
 			continue
 		}
-		if err := store.SetMetadata(memberID, beadmeta.ExclusiveDrainReservationMetadataKey, ""); err != nil {
+		if err := memberStore.SetMetadata(memberID, beadmeta.ExclusiveDrainReservationMetadataKey, ""); err != nil {
 			return fmt.Errorf("%s: releasing drain reservation on %s: %w", controlID, memberID, err)
 		}
 	}
 	return nil
 }
 
-func closeDrainReservationFailure(store beads.Store, bead beads.Bead, manifest drainManifest, err error) (ControlResult, error) {
+func closeDrainReservationFailure(store beads.Store, bead beads.Bead, manifest drainManifest, err error, opts ProcessOptions) (ControlResult, error) {
 	var reservationErr drainReservationError
 	failureReason := "exclusive_reservation_failed"
 	metadata := map[string]string{
-		beadmeta.DrainStateMetadataKey:    "failed",
-		beadmeta.OutcomeMetadataKey:       "fail",
-		beadmeta.FailureClassMetadataKey:  "hard",
+		beadmeta.DrainStateMetadataKey:    beadmeta.DrainStateFailed,
+		beadmeta.OutcomeMetadataKey:       beadmeta.OutcomeFail,
+		beadmeta.FailureClassMetadataKey:  beadmeta.FailureClassHard,
 		beadmeta.FailureReasonMetadataKey: failureReason,
 	}
 	if errors.As(err, &reservationErr) {
@@ -1182,16 +1274,20 @@ func closeDrainReservationFailure(store beads.Store, bead beads.Bead, manifest d
 		return ControlResult{}, marshalErr
 	}
 	metadata[drainManifestMetadataKey] = string(data)
-	if releaseErr := releaseDrainReservations(store, bead.ID, manifest); releaseErr != nil {
+	if releaseErr := releaseDrainReservations(store, bead.ID, manifest, opts); releaseErr != nil {
 		return ControlResult{}, fmt.Errorf("%s: releasing reservations after %w: %w", bead.ID, err, releaseErr)
 	}
 	if closeErr := updateMetadataAndClose(store, bead.ID, metadata); closeErr != nil {
 		return ControlResult{}, fmt.Errorf("%s: closing reservation-failed drain after %w: %w", bead.ID, err, closeErr)
 	}
-	return ControlResult{Processed: true, Action: "drain-reservation-failed"}, nil
+	scopeResult, scopeErr := reconcileClosedDrainScope(store, bead.ID, opts)
+	if scopeErr != nil {
+		return ControlResult{}, scopeErr
+	}
+	return ControlResult{Processed: true, Action: "drain-reservation-failed", Skipped: scopeResult.Skipped}, nil
 }
 
-func closeDrainItemFormulaFailure(store beads.Store, bead beads.Bead, manifest drainManifest, err error) (ControlResult, error) {
+func closeDrainItemFormulaFailure(store beads.Store, bead beads.Bead, manifest drainManifest, err error, opts ProcessOptions) (ControlResult, error) {
 	const failureReason = "invalid_drain_item_formula"
 	if closeErr := closeOpenDrainItemRoots(store, &manifest, failureReason); closeErr != nil {
 		return ControlResult{}, fmt.Errorf("%s: closing partial drain item roots after %w: %w", bead.ID, err, closeErr)
@@ -1202,22 +1298,26 @@ func closeDrainItemFormulaFailure(store beads.Store, bead beads.Bead, manifest d
 		return ControlResult{}, marshalErr
 	}
 	metadata := map[string]string{
-		beadmeta.DrainStateMetadataKey:    "failed",
-		beadmeta.OutcomeMetadataKey:       "fail",
-		beadmeta.FailureClassMetadataKey:  "hard",
+		beadmeta.DrainStateMetadataKey:    beadmeta.DrainStateFailed,
+		beadmeta.OutcomeMetadataKey:       beadmeta.OutcomeFail,
+		beadmeta.FailureClassMetadataKey:  beadmeta.FailureClassHard,
 		beadmeta.FailureReasonMetadataKey: failureReason,
 		drainManifestMetadataKey:          string(data),
 	}
 	if manifest.Formula != "" {
 		metadata[beadmeta.FailureSubjectMetadataKey] = manifest.Formula
 	}
-	if releaseErr := releaseDrainReservations(store, bead.ID, manifest); releaseErr != nil {
+	if releaseErr := releaseDrainReservations(store, bead.ID, manifest, opts); releaseErr != nil {
 		return ControlResult{}, fmt.Errorf("%s: releasing reservations after %w: %w", bead.ID, err, releaseErr)
 	}
 	if closeErr := updateMetadataAndClose(store, bead.ID, metadata); closeErr != nil {
 		return ControlResult{}, fmt.Errorf("%s: closing invalid-item-formula drain after %w: %w", bead.ID, err, closeErr)
 	}
-	return ControlResult{Processed: true, Action: "drain-failed"}, nil
+	scopeResult, scopeErr := reconcileClosedDrainScope(store, bead.ID, opts)
+	if scopeErr != nil {
+		return ControlResult{}, scopeErr
+	}
+	return ControlResult{Processed: true, Action: "drain-failed", Skipped: scopeResult.Skipped}, nil
 }
 
 func markIncompleteDrainRowsFailed(manifest *drainManifest, failureReason string) {
@@ -1226,12 +1326,12 @@ func markIncompleteDrainRowsFailed(manifest *drainManifest, failureReason string
 	}
 	for i := range manifest.Rows {
 		row := &manifest.Rows[i]
-		if row.Status == "succeeded" || row.OutcomeKind == "pass" {
+		if row.Status == "succeeded" || row.OutcomeKind == beadmeta.OutcomePass {
 			continue
 		}
 		row.Status = "failed"
 		if row.OutcomeKind == "" {
-			row.OutcomeKind = "fail"
+			row.OutcomeKind = beadmeta.OutcomeFail
 		}
 		if row.Failure == "" {
 			row.Failure = failureReason
@@ -1261,14 +1361,14 @@ func closeOpenDrainItemRoots(store beads.Store, manifest *drainManifest, failure
 			continue
 		}
 		row.OutcomeBead = rootID
-		row.OutcomeKind = "fail"
+		row.OutcomeKind = beadmeta.OutcomeFail
 		row.Failure = failureReason
 		if _, err := sourceworkflow.CloseWorkflowSubtree(store, rootID); err != nil {
 			return fmt.Errorf("closing drain item workflow subtree %s: %w", rootID, err)
 		}
 		if err := store.SetMetadataBatch(rootID, map[string]string{
-			beadmeta.OutcomeMetadataKey:       "fail",
-			beadmeta.FailureClassMetadataKey:  "hard",
+			beadmeta.OutcomeMetadataKey:       beadmeta.OutcomeFail,
+			beadmeta.FailureClassMetadataKey:  beadmeta.FailureClassHard,
 			beadmeta.FailureReasonMetadataKey: failureReason,
 		}); err != nil {
 			return fmt.Errorf("marking drain item root %s failed: %w", rootID, err)
@@ -1326,10 +1426,10 @@ func drainOnItemFailure(bead beads.Bead) string {
 	if policy != "" {
 		return policy
 	}
-	if strings.TrimSpace(bead.Metadata[beadmeta.DrainContextMetadataKey]) == "shared" {
-		return "skip_remaining"
+	if strings.TrimSpace(bead.Metadata[beadmeta.DrainContextMetadataKey]) == beadmeta.DrainContextShared {
+		return beadmeta.DrainOnItemFailureSkipRemaining
 	}
-	return "continue"
+	return beadmeta.DrainOnItemFailureContinue
 }
 
 func mustReloadDrain(store beads.Store, bead beads.Bead) beads.Bead {

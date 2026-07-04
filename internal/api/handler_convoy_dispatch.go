@@ -31,6 +31,12 @@ func logWorkflowSQLFallback(workflowID string, err error) {
 // canonical home. This file contains only the dispatch helpers that
 // populate them from the bead store.
 
+// workflowGraphStoreRefPrefix tags the dedicated graph store's workflowStoreInfo
+// ref so the store-scan dedup keeps it distinct from the city store when graph is
+// relocated. It is not a scope kind (graph roots carry city/rig scope metadata of
+// their own) — only a store-identity tag for the snapshot scan and ref round-trip.
+const workflowGraphStoreRefPrefix = "graph"
+
 type workflowStoreInfo struct {
 	ref       string
 	scopeKind string
@@ -126,7 +132,7 @@ func (s *Server) buildWorkflowSnapshot(workflowID, fallbackScopeKind, fallbackSc
 			}
 			roots, err := info.store.List(beads.ListQuery{
 				Metadata: map[string]string{
-					beadmeta.KindMetadataKey:       "workflow",
+					beadmeta.KindMetadataKey:       beadmeta.KindWorkflow,
 					beadmeta.WorkflowIDMetadataKey: workflowID,
 				},
 				IncludeClosed: true,
@@ -264,7 +270,7 @@ func (s *Server) snapshotFromStore(info workflowStoreInfo, root beads.Bead, fall
 }
 
 func isWorkflowRoot(bead beads.Bead) bool {
-	return strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey]) == "workflow"
+	return strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey]) == beadmeta.KindWorkflow
 }
 
 // isGraphConvoyBead reports whether a bead is a formula-compiled graph
@@ -338,8 +344,8 @@ func workflowEventScope(info workflowStoreInfo, root beads.Bead, cityScopeRef st
 	// event scopes aligned with the snapshot API's preserved city-scope reads
 	// for those legacy workflows, while root_store_ref still exposes the
 	// physical store for callers that need it.
-	if info.scopeKind == "rig" {
-		return "city", workflowCityScopeRef(cityScopeRef)
+	if info.scopeKind == beadmeta.ScopeKindRig {
+		return beadmeta.ScopeKindCity, workflowCityScopeRef(cityScopeRef)
 	}
 	return info.scopeKind, info.scopeRef
 }
@@ -378,7 +384,7 @@ func parseWorkflowRequestScope(rawScopeKind, rawScopeRef string) (string, string
 		return "", "", "scope_kind and scope_ref must be provided together"
 	}
 	switch scopeKind {
-	case "city", "rig":
+	case beadmeta.ScopeKindCity, beadmeta.ScopeKindRig:
 		return scopeKind, scopeRef, ""
 	default:
 		return "", "", "scope_kind must be 'city' or 'rig'"
@@ -551,9 +557,9 @@ func workflowStatus(bead beads.Bead) string {
 	switch strings.TrimSpace(bead.Status) {
 	case "closed":
 		switch outcome {
-		case "fail":
+		case beadmeta.OutcomeFail:
 			return "failed"
-		case "skipped":
+		case beadmeta.OutcomeSkipped:
 			return "skipped"
 		}
 		return "completed"
@@ -566,9 +572,9 @@ func workflowStatus(bead beads.Bead) string {
 		return "pending"
 	default:
 		switch outcome {
-		case "fail":
+		case beadmeta.OutcomeFail:
 			return "failed"
-		case "skipped":
+		case beadmeta.OutcomeSkipped:
 			return "skipped"
 		}
 		return strings.TrimSpace(bead.Status)
@@ -577,13 +583,31 @@ func workflowStatus(bead beads.Bead) string {
 
 func workflowStores(state State) []workflowStoreInfo {
 	beadStores := state.BeadStores()
-	stores := make([]workflowStoreInfo, 0, len(beadStores)+1)
+	stores := make([]workflowStoreInfo, 0, len(beadStores)+2)
 	cityName := workflowCityScopeRef(state.CityName())
+	cityStore := state.CityBeadStore()
 
-	if cityStore := state.CityBeadStore(); cityStore != nil {
+	// Graph-first: when [beads.classes.graph] relocates graph beads to a dedicated
+	// store, workflow roots/steps/wisps live there, NOT on the work store, so the
+	// snapshot scan must consult it. Lead with it (graph-first) so a graph-resident
+	// root is found on the first probe. Skip it on a default (non-relocated) city —
+	// where GraphBeadStore() == CityBeadStore() — so the scan stays byte-identical
+	// there. It carries the city scope as its fallback (graph roots stamp their own
+	// scope metadata, which workflowSnapshotScope prefers) but a distinct ref so the
+	// store-scan dedup never conflates it with the city store.
+	if graphStore := state.GraphBeadStore().Store; graphStore != nil && graphStore != cityStore {
+		stores = append(stores, workflowStoreInfo{
+			ref:       workflowGraphStoreRefPrefix + ":" + cityName,
+			scopeKind: beadmeta.ScopeKindCity,
+			scopeRef:  cityName,
+			store:     graphStore,
+		})
+	}
+
+	if cityStore != nil {
 		stores = append(stores, workflowStoreInfo{
 			ref:       "city:" + cityName,
-			scopeKind: "city",
+			scopeKind: beadmeta.ScopeKindCity,
 			scopeRef:  cityName,
 			store:     cityStore,
 		})
@@ -599,7 +623,7 @@ func workflowStores(state State) []workflowStoreInfo {
 		}
 		stores = append(stores, workflowStoreInfo{
 			ref:       "rig:" + rigName,
-			scopeKind: "rig",
+			scopeKind: beadmeta.ScopeKindRig,
 			scopeRef:  rigName,
 			store:     store,
 		})
@@ -624,7 +648,7 @@ func workflowStoreByRef(state State, ref string) (workflowStoreInfo, bool) {
 	}
 
 	switch strings.TrimSpace(kind) {
-	case "city":
+	case beadmeta.ScopeKindCity:
 		cityStore := state.CityBeadStore()
 		cityName := workflowCityScopeRef(state.CityName())
 		if cityStore == nil || scopeRef != cityName {
@@ -632,18 +656,33 @@ func workflowStoreByRef(state State, ref string) (workflowStoreInfo, bool) {
 		}
 		return workflowStoreInfo{
 			ref:       "city:" + cityName,
-			scopeKind: "city",
+			scopeKind: beadmeta.ScopeKindCity,
 			scopeRef:  cityName,
 			store:     cityStore,
 		}, true
-	case "rig":
+	case workflowGraphStoreRefPrefix:
+		// Round-trip the graph-store ref minted by workflowStores when graph is
+		// relocated. On a default city (graph == city) there is no graph entry, so
+		// this resolves nothing and callers fall back to the store scan.
+		graphStore := state.GraphBeadStore().Store
+		cityName := workflowCityScopeRef(state.CityName())
+		if graphStore == nil || graphStore == state.CityBeadStore() || scopeRef != cityName {
+			return workflowStoreInfo{}, false
+		}
+		return workflowStoreInfo{
+			ref:       workflowGraphStoreRefPrefix + ":" + cityName,
+			scopeKind: beadmeta.ScopeKindCity,
+			scopeRef:  cityName,
+			store:     graphStore,
+		}, true
+	case beadmeta.ScopeKindRig:
 		store := state.BeadStore(scopeRef)
 		if store == nil {
 			return workflowStoreInfo{}, false
 		}
 		return workflowStoreInfo{
 			ref:       "rig:" + scopeRef,
-			scopeKind: "rig",
+			scopeKind: beadmeta.ScopeKindRig,
 			scopeRef:  scopeRef,
 			store:     store,
 		}, true

@@ -1513,7 +1513,7 @@ func TestNextWaitDeliveryAttempt_IncrementsAfterTerminalNudge(t *testing.T) {
 		t.Fatalf("close nudge bead: %v", err)
 	}
 
-	next, err := nextWaitDeliveryAttempt(store, wait)
+	next, err := nextWaitDeliveryAttempt(nudgeFrontDoor(beads.NudgesStore{Store: store}), wait)
 	if err != nil {
 		t.Fatalf("nextWaitDeliveryAttempt: %v", err)
 	}
@@ -2211,7 +2211,7 @@ func TestWithdrawQueuedWaitNudges_RemovesQueuedNudge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openCityStoreAt: %v", err)
 	}
-	nudge, ok, err := findAnyQueuedNudgeBead(store, item.ID)
+	nudge, ok, err := findAnyQueuedNudgeBead(beads.NudgesStore{Store: store}, item.ID)
 	if err != nil {
 		t.Fatalf("findAnyQueuedNudgeBead: %v", err)
 	}

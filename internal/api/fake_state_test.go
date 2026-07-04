@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,25 +34,28 @@ func newPostRequest(url string, body io.Reader) *http.Request {
 
 // fakeState implements State for testing.
 type fakeState struct {
-	cfg           *config.City
-	rawCfg        *config.City // optional: raw config for provenance detection
-	sp            *runtime.Fake
-	stores        map[string]beads.Store
-	cityBeadStore beads.Store // city-level store for session beads
-	cityBeadsDiag *beads.BeadsDiagnostic
-	cityMailProv  mail.Provider // city-level mail provider (all mail is city-scoped)
-	eventProv     events.Provider
-	cityName      string
-	cityPath      string
-	startedAt     time.Time
-	quarantined   map[string]bool
-	autos         []orders.Order
-	allOrders     []orders.Order
-	services      workspacesvc.Registry
-	pokeCount     int
-	extmsgSvc     *extmsg.Services
-	adapterReg    *extmsg.AdapterRegistry
-	maintenance   MaintenanceProvider
+	cfg               *config.City
+	rawCfg            *config.City // optional: raw config for provenance detection
+	sp                *runtime.Fake
+	stores            map[string]beads.Store
+	cityBeadStore     beads.Store // city-level store for session beads
+	nudgesBeadStore   beads.Store // relocated nudges store; nil falls back to cityBeadStore (default backend)
+	sessionsBeadStore beads.Store // relocated sessions store; nil falls back to cityBeadStore (default backend)
+	graphBeadStore    beads.Store // relocated graph store; nil falls back to cityBeadStore (default backend)
+	cityBeadsDiag     *beads.BeadsDiagnostic
+	cityMailProv      mail.Provider // city-level mail provider (all mail is city-scoped)
+	eventProv         events.Provider
+	cityName          string
+	cityPath          string
+	startedAt         time.Time
+	quarantined       map[string]bool
+	autos             []orders.Order
+	allOrders         []orders.Order
+	services          workspacesvc.Registry
+	pokeCount         int
+	extmsgSvc         *extmsg.Services
+	adapterReg        *extmsg.AdapterRegistry
+	maintenance       MaintenanceProvider
 }
 
 func newFakeState(t testing.TB) *fakeState {
@@ -103,6 +108,27 @@ func (f *fakeState) StartedAt() time.Time                  { return f.startedAt 
 func (f *fakeState) IsQuarantined(sessionName string) bool { return f.quarantined[sessionName] }
 func (f *fakeState) ClearCrashHistory(sessionName string)  { delete(f.quarantined, sessionName) }
 func (f *fakeState) CityBeadStore() beads.Store            { return f.cityBeadStore }
+func (f *fakeState) NudgesBeadStore() beads.NudgesStore {
+	if f.nudgesBeadStore != nil {
+		return beads.NudgesStore{Store: f.nudgesBeadStore}
+	}
+	return beads.NudgesStore{Store: f.cityBeadStore}
+}
+
+func (f *fakeState) SessionsBeadStore() beads.SessionStore {
+	if f.sessionsBeadStore != nil {
+		return beads.SessionStore{Store: f.sessionsBeadStore}
+	}
+	return beads.SessionStore{Store: f.cityBeadStore}
+}
+
+func (f *fakeState) GraphBeadStore() beads.GraphStore {
+	if f.graphBeadStore != nil {
+		return beads.GraphStore{Store: f.graphBeadStore}
+	}
+	return beads.GraphStore{Store: f.cityBeadStore}
+}
+
 func (f *fakeState) CityBeadsDiagnostic() *beads.BeadsDiagnostic {
 	if f.cityBeadsDiag == nil {
 		return nil
@@ -134,6 +160,12 @@ func (f *fakeState) RawConfig() *config.City {
 type fakeMutatorState struct {
 	*fakeState
 	suspended map[string]bool
+
+	// serializeMu + serializeCalls make fakeMutatorState a ConfigWriteSerializer
+	// so pack handler tests exercise the real per-city write-lock seam and can
+	// assert mutations route through it.
+	serializeMu    sync.Mutex
+	serializeCalls atomic.Int32
 }
 
 func newFakeMutatorState(t *testing.T) *fakeMutatorState {
@@ -142,6 +174,15 @@ func newFakeMutatorState(t *testing.T) *fakeMutatorState {
 		fakeState: newFakeState(t),
 		suspended: make(map[string]bool),
 	}
+}
+
+// SerializeConfigWrite runs fn under a real lock and counts the call, mirroring
+// the production controllerState seam that shares the configedit.Editor lock.
+func (f *fakeMutatorState) SerializeConfigWrite(fn func() error) error {
+	f.serializeMu.Lock()
+	defer f.serializeMu.Unlock()
+	f.serializeCalls.Add(1)
+	return fn()
 }
 
 func (f *fakeMutatorState) SuspendAgent(name string) error { f.suspended[name] = true; return nil }
@@ -364,6 +405,14 @@ func (f *fakeMutatorState) UpdateProvider(name string, patch ProviderUpdate) err
 	}
 	if patch.OptionsSchema != nil {
 		spec.OptionsSchema = append([]config.ProviderOption(nil), patch.OptionsSchema...)
+	}
+	if len(patch.OptionDefaults) > 0 {
+		if spec.OptionDefaults == nil {
+			spec.OptionDefaults = make(map[string]string, len(patch.OptionDefaults))
+		}
+		for k, v := range patch.OptionDefaults {
+			spec.OptionDefaults[k] = v
+		}
 	}
 	f.cfg.Providers[name] = spec
 	return nil

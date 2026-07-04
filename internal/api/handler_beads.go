@@ -49,16 +49,41 @@ func (s *Server) beadListAssigneeTerms(ctx context.Context, assignee string) []s
 	if assignee == "" {
 		return []string{""}
 	}
-	terms := []string{assignee}
 	store := s.state.CityBeadStore()
 	if store == nil {
-		return terms
+		return []string{assignee}
 	}
 	id, err := s.resolveSessionTargetIDWithContext(ctx, store, assignee, apiSessionResolveOptions{})
-	if err != nil || id == "" || id == assignee {
-		return terms
+	if err != nil || id == "" {
+		return []string{assignee}
 	}
-	return []string{id, assignee}
+	// A work bead's stored assignee may be ANY of the resolved session's
+	// identity forms — the bead ID, session_name, alias, configured named
+	// identity, or a prior alias — so match against all of them (mirrors
+	// sessionBeadAssigneeIdentities used by the reconciler). Without this the
+	// session-name form written by assign/update (and the claim path) would be
+	// invisible to ?assignee=<alias|id> list filters.
+	seen := map[string]bool{}
+	var terms []string
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		terms = append(terms, v)
+	}
+	add(assignee)
+	add(id)
+	if b, getErr := store.Get(id); getErr == nil {
+		add(b.Metadata["session_name"])
+		add(b.Metadata["alias"])
+		add(b.Metadata[session.NamedSessionIdentityMetadata])
+		for _, prior := range session.AliasHistory(b.Metadata) {
+			add(prior)
+		}
+	}
+	return terms
 }
 
 func (s *Server) normalizeRawBeadAssignee(ctx context.Context, assignee string) (string, error) {
@@ -88,7 +113,26 @@ func (s *Server) normalizeRawBeadAssignee(ctx context.Context, assignee string) 
 		return "", fmt.Errorf("assignee must resolve to a concrete open session bead ID: %q", assignee)
 	}
 	session.RepairEmptyType(store, &b)
-	return b.ID, nil
+	return sessionBeadAssigneeIdentifier(b), nil
+}
+
+// sessionBeadAssigneeIdentifier returns the durable agent-facing identity form
+// of a session bead — its session_name, else alias, else configured named
+// identity — falling back to the bead ID when no name metadata is present so a
+// resolved assignment is never silently cleared. This is the form the agent
+// claims and verifies work with (BEADS_ACTOR / GC_SESSION_NAME), so stamping it
+// keeps assign/update consistent with the claim path (which already stores the
+// raw session-name) and with the form-agnostic session matching in the
+// reconciler (sessionBeadAssigneeIdentities). Stamping the bare bead ID here
+// instead made template-routed continuation work unclaimable by name-matching
+// agents.
+func sessionBeadAssigneeIdentifier(b beads.Bead) string {
+	for _, key := range []string{"session_name", "alias", session.NamedSessionIdentityMetadata} {
+		if v := strings.TrimSpace(b.Metadata[key]); v != "" {
+			return v
+		}
+	}
+	return b.ID
 }
 
 // findStore returns the bead store for the given rig. If rig is empty, returns
@@ -112,6 +156,12 @@ func (s *Server) findStore(rig string) beads.Store {
 // beadStoresForID resolves the authoritative store for a bead ID using its
 // prefix/routes mapping when possible. If there is no routed match, it falls
 // back to the legacy store scan order.
+//
+// The result is the per-class by-id candidate set: a successful prefix/route
+// match returns the single store that owns the ID's namespace (which is already
+// the bead's class+rig store), and the unrouted fallback leads with the
+// city/HQ store ahead of the per-rig work stores. A graph-relocated city adds a
+// class-prefix arm so graph-class ids reach the dedicated graph store.
 func (s *Server) beadStoresForID(id string) []beads.Store {
 	id = strings.TrimSpace(id)
 	if store := s.resolveStoreByConfiguredIDPrefix(id); store != nil {
@@ -120,6 +170,26 @@ func (s *Server) beadStoresForID(id string) []beads.Store {
 	if prefix := beadPrefix(id); prefix != "" {
 		if store := s.resolveStoreByPrefix(prefix); store != nil {
 			return []beads.Store{store}
+		}
+	}
+
+	// Class-prefix arm: a graph-relocated city keeps graph-class beads (reserved
+	// id-prefix "gcg") in a dedicated graph store that is NOT reachable via a
+	// rig/HQ prefix or a routes.jsonl entry, so a graph-class id would otherwise
+	// fall through to the candidate scan and miss. Return [graph, work] —
+	// graph-first (prefix-owner first) — so the per-store Get-then-mutate loop in
+	// the by-id handlers federates the graph store ahead of work and pins it on
+	// the first probe. Skipped for a default (non-relocated) city, where
+	// GraphBeadStore() == CityBeadStore(): the arm never fires and this path stays
+	// byte-identical.
+	if graph := s.state.GraphBeadStore().Store; graph != nil {
+		if city := s.state.CityBeadStore(); graph != city {
+			if prefix, ok := config.ReservedClassPrefix(config.BeadClassGraph); ok && beadIDHasConfiguredPrefix(id, prefix) {
+				if city != nil {
+					return []beads.Store{graph, city}
+				}
+				return []beads.Store{graph}
+			}
 		}
 	}
 
@@ -144,6 +214,15 @@ func (s *Server) resolveStoreByConfiguredIDPrefix(id string) beads.Store {
 		return nil
 	}
 
+	// Only stores that are actually loaded are candidates: a configured prefix
+	// whose store is missing must not win the slot, so a shorter loaded prefix
+	// can still own the id (and otherwise the id is left to the legacy scan).
+	//
+	// This caller routes on the configured (rig/HQ) prefixes with a
+	// longest-prefix, exact-or-hyphen match (beadIDHasConfiguredPrefix). It
+	// resolves against the configured prefixes (not each store's own IDPrefix)
+	// and requires the longest configured prefix to win, so it keeps the scan
+	// inline rather than using the namespace-only, first-match by-id resolver.
 	var bestStore beads.Store
 	bestLen := -1
 	if prefix := strings.TrimSpace(config.EffectiveHQPrefix(cfg)); beadIDHasConfiguredPrefix(id, prefix) {
@@ -167,6 +246,9 @@ func (s *Server) resolveStoreByConfiguredIDPrefix(id string) beads.Store {
 	return bestStore
 }
 
+// beadIDHasConfiguredPrefix reports whether id falls under prefix, matching a
+// bare id == prefix exactly or the "prefix-" namespace. This is the
+// exact-or-hyphen match the configured-prefix resolver uses.
 func beadIDHasConfiguredPrefix(id, prefix string) bool {
 	if prefix == "" {
 		return false
@@ -356,23 +438,44 @@ func collectBeadGraph(store beads.Store, root beads.Bead) ([]beads.Bead, []workf
 		parentEdges = append(parentEdges, edge)
 	}
 
-	for i := 0; i < len(graphBeads); i++ {
-		parent := graphBeads[i]
+	// Discover parent-linked descendants and their parent-child edges by walking
+	// the tree one BFS level at a time, fetching each level's children with a
+	// single batched store.List(ParentIDs=...) call. This replaces the former
+	// per-bead store.List(ParentID=...) fan-out — an N+1 (one round-trip per bead)
+	// that serialized on a single read connection and dominated graph-read latency
+	// under load. The returned beads are filtered in memory against the level's
+	// parent set, so the result is correct even on a backend that does not honor
+	// ParentIDs (such a backend returns a superset, which the filter narrows).
+	frontier := make([]string, 0, len(graphBeads))
+	for _, b := range graphBeads {
+		frontier = append(frontier, b.ID)
+	}
+	for len(frontier) > 0 {
+		frontierSet := make(map[string]bool, len(frontier))
+		for _, id := range frontier {
+			frontierSet[id] = true
+		}
 		children, err := store.List(beads.ListQuery{
-			ParentID:      parent.ID,
+			ParentIDs:     frontier,
 			IncludeClosed: true,
+			AllowScan:     true,
 			Sort:          beads.SortCreatedAsc,
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("listing child beads for bead %q: %w", parent.ID, err)
+			return nil, nil, fmt.Errorf("listing child beads for graph %q: %w", root.ID, err)
 		}
+		var next []string
 		for _, child := range children {
-			if child.ParentID == "" {
-				child.ParentID = parent.ID
+			if !frontierSet[child.ParentID] {
+				continue
 			}
-			addParentEdge(parent.ID, child.ID)
-			upsert(child)
+			addParentEdge(child.ParentID, child.ID)
+			if _, seen := beadIndex[child.ID]; !seen {
+				upsert(child)
+				next = append(next, child.ID)
+			}
 		}
+		frontier = next
 	}
 
 	return graphBeads, parentEdges, nil

@@ -234,9 +234,13 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	// Formulas.
 	cityGet(sm, "/formulas", (*Server).humaHandleFormulaList)
 	cityGet(sm, "/formulas/{name}/runs", (*Server).humaHandleFormulaRuns)
+	cityGet(sm, "/formulas/{name}/source", (*Server).humaHandleFormulaSource)
 	cityGet(sm, "/formulas/{name}", (*Server).humaHandleFormulaDetail)
 	cityGet(sm, "/formula/{name}", (*Server).humaHandleFormulaDetail)
 	cityPost(sm, "/formulas/{name}/preview", (*Server).humaHandleFormulaPreview)
+	cityPost(sm, "/formulas/{name}/validate", (*Server).humaHandleFormulaValidate, withMaxFormulaBody)
+	cityPut(sm, "/formulas/{name}", (*Server).humaHandleFormulaUpsert, withMaxFormulaBody)
+	cityDelete(sm, "/formulas/{name}", (*Server).humaHandleFormulaDelete)
 	cityGet(sm, "/formulas/feed", (*Server).humaHandleFormulaFeed)
 	// Backwards-compatible workflow aliases.
 	cityGet(sm, "/workflow/{workflow_id}", (*Server).humaHandleWorkflowGet)
@@ -244,6 +248,15 @@ func (sm *SupervisorMux) registerCityRoutes() {
 
 	// Packs.
 	cityGet(sm, "/packs", (*Server).humaHandlePackList)
+	cityRegister(sm, huma.Operation{
+		OperationID:   "add-pack",
+		Method:        http.MethodPost,
+		Path:          "/packs",
+		Summary:       "Add a pack",
+		Description:   "Imports a pack into the city by source (a remote git URL or registry ref), resolving + installing it so its templates compose into the city.",
+		DefaultStatus: http.StatusCreated,
+	}, (*Server).humaHandlePackAdd)
+	cityDelete(sm, "/packs/{name}", (*Server).humaHandlePackRemove)
 
 	// Sling.
 	cityPost(sm, "/sling", (*Server).humaHandleSling)

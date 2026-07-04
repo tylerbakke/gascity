@@ -150,7 +150,7 @@ func (s *rollbackCloseFailStore) Close(string) error {
 }
 
 func TestMarkQueuedNudgeTerminalFallsBackWhenStoredBeadIDEmpty(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	item := queuedNudge{
 		ID:        "nudge-empty-bead",
 		Agent:     "wendy.wendy",
@@ -186,7 +186,7 @@ func TestMarkQueuedNudgeTerminalFallsBackWhenStoredBeadIDEmpty(t *testing.T) {
 }
 
 func TestMarkQueuedNudgeTerminalFallsBackFromMissingStoredBeadID(t *testing.T) {
-	store := &missingNudgeBeadStore{MemStore: beads.NewMemStore(), missingID: "gc-458"}
+	store := beads.NudgesStore{Store: &missingNudgeBeadStore{MemStore: beads.NewMemStore(), missingID: "gc-458"}}
 	item := queuedNudge{
 		ID:        "nudge-stale",
 		Agent:     "wendy.wendy",
@@ -235,14 +235,14 @@ func TestMarkQueuedNudgeTerminalReturnsUnrelatedNotFoundErrors(t *testing.T) {
 		Message:   "follow up",
 		CreatedAt: time.Now().Add(-time.Minute).UTC(),
 	}
-	createdID, _, err := ensureQueuedNudgeBead(store, item)
+	createdID, _, err := ensureQueuedNudgeBead(beads.NudgesStore{Store: store}, item)
 	if err != nil {
 		t.Fatalf("ensureQueuedNudgeBead: %v", err)
 	}
 	store.errorID = createdID
 	item.BeadID = createdID
 
-	err = markQueuedNudgeTerminal(store, item, "expired", "expired", "", time.Now().UTC())
+	err = markQueuedNudgeTerminal(beads.NudgesStore{Store: store}, item, "expired", "expired", "", time.Now().UTC())
 	if err == nil {
 		t.Fatal("markQueuedNudgeTerminal returned nil, want unrelated not found error")
 	}
@@ -252,7 +252,7 @@ func TestMarkQueuedNudgeTerminalReturnsUnrelatedNotFoundErrors(t *testing.T) {
 }
 
 func TestPruneExpiredQueuedNudgesIgnoresMissingTerminalBead(t *testing.T) {
-	store := &missingNudgeBeadStore{MemStore: beads.NewMemStore(), missingID: "gc-458"}
+	store := beads.NudgesStore{Store: &missingNudgeBeadStore{MemStore: beads.NewMemStore(), missingID: "gc-458"}}
 	now := time.Now().UTC()
 	state := &nudgeQueueState{
 		Pending: []queuedNudge{
@@ -270,7 +270,7 @@ func TestPruneExpiredQueuedNudgesIgnoresMissingTerminalBead(t *testing.T) {
 		},
 	}
 
-	if err := pruneExpiredQueuedNudges(state, store, now); err != nil {
+	if err := pruneExpiredQueuedNudges(state, nudgeFrontDoor(store), now, noMaintenanceDeadline()); err != nil {
 		t.Fatalf("pruneExpiredQueuedNudges: %v", err)
 	}
 	if len(state.Pending) != 0 {
@@ -305,7 +305,7 @@ func TestPruneDeadQueuedNudgesRepairsMissingTerminalBeadRecord(t *testing.T) {
 	item.DeadAt = now.Add(-30 * time.Minute)
 
 	state := &nudgeQueueState{Dead: []queuedNudge{item}}
-	if err := pruneDeadQueuedNudges(state, store, now); err != nil {
+	if err := pruneDeadQueuedNudges(state, nudgeFrontDoor(store), now, noMaintenanceDeadline()); err != nil {
 		t.Fatalf("pruneDeadQueuedNudges: %v", err)
 	}
 	if len(state.Dead) != 1 {
@@ -328,7 +328,7 @@ func TestPruneDeadQueuedNudgesRepairsMissingTerminalBeadRecord(t *testing.T) {
 }
 
 func TestMarkQueuedNudgeTerminalHandlesAmbiguousBeadID(t *testing.T) {
-	store := &ambiguousNudgeBeadStore{MemStore: beads.NewMemStore(), ambiguousID: "gc-17"}
+	store := beads.NudgesStore{Store: &ambiguousNudgeBeadStore{MemStore: beads.NewMemStore(), ambiguousID: "gc-17"}}
 	item := queuedNudge{
 		ID:        "nudge-ambiguous",
 		Agent:     "wendy.wendy",
@@ -367,7 +367,7 @@ func TestMarkQueuedNudgeTerminalHandlesAmbiguousBeadID(t *testing.T) {
 func TestPruneExpiredQueuedNudgesWithAmbiguousBeadIDContinues(t *testing.T) {
 	// Regression: stale entries with short bead IDs (e.g. "gc-17") that match many
 	// beads in a large store used to abort the entire nudge processing loop.
-	store := &ambiguousNudgeBeadStore{MemStore: beads.NewMemStore(), ambiguousID: "gc-17"}
+	store := beads.NudgesStore{Store: &ambiguousNudgeBeadStore{MemStore: beads.NewMemStore(), ambiguousID: "gc-17"}}
 	now := time.Now().UTC()
 	state := &nudgeQueueState{
 		Pending: []queuedNudge{
@@ -385,7 +385,7 @@ func TestPruneExpiredQueuedNudgesWithAmbiguousBeadIDContinues(t *testing.T) {
 		},
 	}
 
-	if err := pruneExpiredQueuedNudges(state, store, now); err != nil {
+	if err := pruneExpiredQueuedNudges(state, nudgeFrontDoor(store), now, noMaintenanceDeadline()); err != nil {
 		t.Fatalf("pruneExpiredQueuedNudges: %v", err)
 	}
 	if len(state.Pending) != 0 {
@@ -393,6 +393,70 @@ func TestPruneExpiredQueuedNudgesWithAmbiguousBeadIDContinues(t *testing.T) {
 	}
 	if len(state.Dead) != 1 {
 		t.Fatalf("dead = %d, want 1", len(state.Dead))
+	}
+}
+
+// TestExpiredNudgeCleanupSurvivesNilFrontDoor is a regression test for the
+// nil-pointer panic that hit the expired-nudge cleanup when the shadow bead store
+// was unavailable. openNudgeBeadStore returns a zero NudgesStore (Store == nil) on
+// any open error, so claimDueQueuedNudgesMatching/listQueuedNudges build a nil
+// *nudgequeue.Store front and then run recoverExpiredInFlightNudges +
+// pruneExpiredQueuedNudges over the flock'd state.json, which remains the queue
+// authority. With a nil front the unguarded front.Terminalize calls dereferenced a
+// nil receiver and crashed the command — and because the panic aborted the state
+// transaction before the flush, the expired item stayed Pending and the next poll
+// re-panicked in a loop. Both helpers must instead complete and move the expired
+// pending and in-flight items to Dead even with no shadow store.
+func TestExpiredNudgeCleanupSurvivesNilFrontDoor(t *testing.T) {
+	var front *nudgequeue.Store // nil: shadow bead store failed to open
+	now := time.Now().UTC()
+	state := &nudgeQueueState{
+		Pending: []queuedNudge{{
+			ID:           "nudge-pending-expired",
+			BeadID:       "gc-700",
+			Agent:        "worker",
+			SessionID:    "sess-1",
+			Source:       "session",
+			Message:      "follow up",
+			CreatedAt:    now.Add(-2 * time.Hour),
+			DeliverAfter: now.Add(-2 * time.Hour),
+			ExpiresAt:    now.Add(-time.Hour),
+		}},
+		InFlight: []queuedNudge{{
+			ID:           "nudge-inflight-expired",
+			BeadID:       "gc-701",
+			Agent:        "worker",
+			SessionID:    "sess-1",
+			Source:       "session",
+			Message:      "follow up",
+			CreatedAt:    now.Add(-2 * time.Hour),
+			DeliverAfter: now.Add(-2 * time.Hour),
+			ExpiresAt:    now.Add(-time.Hour),
+			ClaimedAt:    now.Add(-90 * time.Minute),
+			LeaseUntil:   now.Add(-80 * time.Minute),
+		}},
+	}
+
+	if err := recoverExpiredInFlightNudges(state, front, now, noMaintenanceDeadline()); err != nil {
+		t.Fatalf("recoverExpiredInFlightNudges with nil front: %v", err)
+	}
+	if err := pruneExpiredQueuedNudges(state, front, now, noMaintenanceDeadline()); err != nil {
+		t.Fatalf("pruneExpiredQueuedNudges with nil front: %v", err)
+	}
+
+	if len(state.Pending) != 0 {
+		t.Fatalf("pending = %d, want 0", len(state.Pending))
+	}
+	if len(state.InFlight) != 0 {
+		t.Fatalf("inFlight = %d, want 0", len(state.InFlight))
+	}
+	if len(state.Dead) != 2 {
+		t.Fatalf("dead = %d, want 2 (both expired items moved to dead)", len(state.Dead))
+	}
+	for _, d := range state.Dead {
+		if d.LastError != "expired" {
+			t.Errorf("dead item %q LastError = %q, want expired", d.ID, d.LastError)
+		}
 	}
 }
 
@@ -2608,7 +2672,7 @@ func TestTryDeliverQueuedNudgesByPollerLeavesACPDeliveryUnwrapped(t *testing.T) 
 	}
 	obs := worker.LiveObservation{Running: true, LastActivity: &idleSince}
 
-	delivered, err := tryDeliverQueuedNudgesByPoller(target, openNudgeBeadStore(dir), fake, 3*time.Second, obs)
+	delivered, err := tryDeliverQueuedNudgesByPoller(target, openNudgeBeadStore(dir).Store, fake, 3*time.Second, obs)
 	if err != nil {
 		t.Fatalf("tryDeliverQueuedNudgesByPoller: %v", err)
 	}
@@ -2658,7 +2722,7 @@ func TestTryDeliverQueuedNudgesByPollerKeepsACPProviderMissRecoverable(t *testin
 	obs := worker.LiveObservation{Running: true, LastActivity: &idleSince}
 
 	for i := 0; i < defaultQueuedNudgeMaxAttempts; i++ {
-		delivered, err := tryDeliverQueuedNudgesByPoller(target, openNudgeBeadStore(dir), fake, 3*time.Second, obs)
+		delivered, err := tryDeliverQueuedNudgesByPoller(target, openNudgeBeadStore(dir).Store, fake, 3*time.Second, obs)
 		if err != nil {
 			t.Fatalf("tryDeliverQueuedNudgesByPoller tick %d: %v", i+1, err)
 		}
@@ -2780,17 +2844,17 @@ func TestTryDeliverQueuedNudgesByPollerDeliversDespiteStaleFenceBeadMarkFailure(
 		SessionID:         info.ID,
 		ContinuationEpoch: "1",
 	})
-	if err := enqueueQueuedNudgeWithStore(dir, store, stale); err != nil {
+	if err := enqueueQueuedNudgeWithStore(dir, beads.NudgesStore{Store: store}, stale); err != nil {
 		t.Fatalf("enqueueQueuedNudgeWithStore(stale): %v", err)
 	}
 	fresh := newQueuedNudgeWithOptions("worker", "wake up and resume your wisp", "session", now, queuedNudgeOptions{
 		SessionID:         info.ID,
 		ContinuationEpoch: "2",
 	})
-	if err := enqueueQueuedNudgeWithStore(dir, store, fresh); err != nil {
+	if err := enqueueQueuedNudgeWithStore(dir, beads.NudgesStore{Store: store}, fresh); err != nil {
 		t.Fatalf("enqueueQueuedNudgeWithStore(fresh): %v", err)
 	}
-	staleBead, ok, err := findQueuedNudgeBead(store, stale.ID)
+	staleBead, ok, err := findQueuedNudgeBead(beads.NudgesStore{Store: store}, stale.ID)
 	if err != nil || !ok {
 		t.Fatalf("findQueuedNudgeBead(stale) = %v, ok=%v", err, ok)
 	}
@@ -2863,10 +2927,10 @@ func TestRecordQueuedNudgeFailureDeadLettersWhenTerminalBeadMarkFails(t *testing
 		SessionID:         "sess-1",
 		ContinuationEpoch: "1",
 	})
-	if err := enqueueQueuedNudgeWithStore(dir, store, item); err != nil {
+	if err := enqueueQueuedNudgeWithStore(dir, beads.NudgesStore{Store: store}, item); err != nil {
 		t.Fatalf("enqueueQueuedNudgeWithStore: %v", err)
 	}
-	itemBead, ok, err := findQueuedNudgeBead(store, item.ID)
+	itemBead, ok, err := findQueuedNudgeBead(beads.NudgesStore{Store: store}, item.ID)
 	if err != nil || !ok {
 		t.Fatalf("findQueuedNudgeBead = %v, ok=%v", err, ok)
 	}
@@ -2885,7 +2949,7 @@ func TestRecordQueuedNudgeFailureDeadLettersWhenTerminalBeadMarkFails(t *testing
 	nudgeWarningWriter = &warnings
 	defer func() { nudgeWarningWriter = origWarn }()
 
-	if err := recordQueuedNudgeFailureWithStore(dir, store, []string{item.ID}, errNudgeSessionFenceMismatch, time.Now()); err != nil {
+	if err := recordQueuedNudgeFailureWithStore(dir, beads.NudgesStore{Store: store}, []string{item.ID}, errNudgeSessionFenceMismatch, time.Now()); err != nil {
 		t.Fatalf("recordQueuedNudgeFailureWithStore: %v (queue transition must commit despite bead-mark failure)", err)
 	}
 
@@ -2942,7 +3006,7 @@ func TestCmdNudgePollSurvivesTransientObserveErrors(t *testing.T) {
 	item := newQueuedNudgeWithOptions("worker", "resume your patrol wisp", "session", time.Now().Add(-time.Minute), queuedNudgeOptions{
 		SessionID: created.ID,
 	})
-	if err := enqueueQueuedNudgeWithStore(cityDir, store, item); err != nil {
+	if err := enqueueQueuedNudgeWithStore(cityDir, beads.NudgesStore{Store: store}, item); err != nil {
 		t.Fatalf("enqueueQueuedNudgeWithStore: %v", err)
 	}
 
@@ -3011,7 +3075,7 @@ func TestCmdNudgeDrainStampsLastNudgeDeliveredAt(t *testing.T) {
 			item := newQueuedNudgeWithOptions("worker", "check hook output", "session", time.Now().Add(-time.Minute), queuedNudgeOptions{
 				SessionID: created.ID,
 			})
-			if err := enqueueQueuedNudgeWithStore(cityDir, store, item); err != nil {
+			if err := enqueueQueuedNudgeWithStore(cityDir, beads.NudgesStore{Store: store}, item); err != nil {
 				t.Fatalf("enqueueQueuedNudgeWithStore: %v", err)
 			}
 
@@ -3774,7 +3838,7 @@ func TestSplitQueuedNudgesForTarget_RejectsFencedNudgesWithoutResolvedSession(t 
 }
 
 func TestSplitQueuedNudgesForDelivery_BlocksCanceledWaitNudge(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	wait, err := store.Create(beads.Bead{
 		Type:   waitBeadType,
 		Labels: []string{waitBeadLabel},
@@ -3804,7 +3868,7 @@ func TestSplitQueuedNudgesForDelivery_BlocksCanceledWaitNudge(t *testing.T) {
 }
 
 func TestSplitQueuedNudgesForDelivery_AllowsReadyLegacyWaitNudge(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	wait, err := store.Create(beads.Bead{
 		Type:   session.LegacyWaitBeadType,
 		Labels: []string{waitBeadLabel},
@@ -3835,7 +3899,7 @@ func TestSplitQueuedNudgesForDelivery_AllowsReadyLegacyWaitNudge(t *testing.T) {
 }
 
 func TestWithNudgeTargetFence_FillsSessionMetadata(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	sessionBead, err := store.Create(beads.Bead{
 		Type:   sessionBeadType,
 		Labels: []string{sessionBeadLabel},
@@ -3858,7 +3922,7 @@ func TestWithNudgeTargetFence_FillsSessionMetadata(t *testing.T) {
 }
 
 func TestFindQueuedNudgeBead_IgnoresClosedRollbackBead(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	open, err := store.Create(beads.Bead{
 		Type:   nudgeBeadType,
 		Labels: []string{nudgeBeadLabel, "nudge:test"},
@@ -3911,7 +3975,7 @@ func TestFindQueuedNudgeBead_UsesBoundedLookup(t *testing.T) {
 	}
 	store := &waitListQueryCaptureStore{Store: mem}
 
-	if _, _, err := findQueuedNudgeBead(store, "test"); err != nil {
+	if _, _, err := findQueuedNudgeBead(beads.NudgesStore{Store: store}, "test"); err != nil {
 		t.Fatalf("findQueuedNudgeBead: %v", err)
 	}
 	if len(store.queries) != 1 {
@@ -3926,7 +3990,7 @@ func TestFindQueuedNudgeBead_UsesBoundedLookup(t *testing.T) {
 }
 
 func TestFindQueuedNudgeBead_AllowsExactLookupLimit(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	for i := 0; i < nudgeLookupLimit; i++ {
 		if _, err := store.Create(beads.Bead{
 			Type:   nudgeBeadType,
@@ -3946,7 +4010,7 @@ func TestFindQueuedNudgeBead_AllowsExactLookupLimit(t *testing.T) {
 }
 
 func TestFindQueuedNudgeBead_ReturnsVisibleOpenBeadBeforeLookupLimit(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	var newest beads.Bead
 	for i := 0; i < nudgeLookupLimit+1; i++ {
 		created, err := store.Create(beads.Bead{
@@ -3976,7 +4040,7 @@ func TestFindQueuedNudgeBead_ReturnsVisibleOpenBeadBeforeLookupLimit(t *testing.
 }
 
 func TestFindQueuedNudgeBead_ReportsLookupLimitWithoutUsableCandidate(t *testing.T) {
-	_, ok, err := findQueuedNudgeBead(unusableCappedNudgeStore{Store: beads.NewMemStore()}, "test")
+	_, ok, err := findQueuedNudgeBead(beads.NudgesStore{Store: unusableCappedNudgeStore{Store: beads.NewMemStore()}}, "test")
 	if ok {
 		t.Fatal("findQueuedNudgeBead found a bead, want lookup-limit failure")
 	}
@@ -3986,7 +4050,7 @@ func TestFindQueuedNudgeBead_ReportsLookupLimitWithoutUsableCandidate(t *testing
 }
 
 func TestEnsureQueuedNudgeBead_DoesNotCreateWhenCappedPageHasOpenCandidate(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	for i := 0; i < nudgeLookupLimit+1; i++ {
 		if _, err := store.Create(beads.Bead{
 			Type:   nudgeBeadType,
@@ -4017,7 +4081,7 @@ func TestEnsureQueuedNudgeBead_DoesNotCreateWhenCappedPageHasOpenCandidate(t *te
 }
 
 func TestFindAnyQueuedNudgeBead_ReturnsVisibleTerminalBeforeLookupLimit(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	var newestTerminal beads.Bead
 	for i := 0; i < nudgeLookupLimit+1; i++ {
 		created, err := store.Create(beads.Bead{
@@ -4050,7 +4114,7 @@ func TestFindAnyQueuedNudgeBead_ReturnsVisibleTerminalBeforeLookupLimit(t *testi
 }
 
 func TestFindAnyQueuedNudgeBead_PrefersTerminalClosedBeadOverRollbackArtifact(t *testing.T) {
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	rollback, err := store.Create(beads.Bead{
 		Type:   nudgeBeadType,
 		Labels: []string{nudgeBeadLabel, "nudge:test"},
@@ -4193,7 +4257,7 @@ func TestPruneDeadQueuedNudges_RemovesOldDeadItems(t *testing.T) {
 	// With defaultQueuedNudgeDeadRetention (1h), old should be pruned (has terminal bead), recent kept.
 	store := openNudgeBeadStore(dir)
 	err := withNudgeQueueState(dir, func(state *nudgeQueueState) error {
-		return pruneDeadQueuedNudges(state, store, now)
+		return pruneDeadQueuedNudges(state, nudgeFrontDoor(store), now, noMaintenanceDeadline())
 	})
 	if err != nil {
 		t.Fatalf("pruneDeadQueuedNudges: %v", err)
@@ -4231,7 +4295,7 @@ func TestPruneDeadQueuedNudges_RetainsItemsWithoutBeadID(t *testing.T) {
 	}
 
 	err = withNudgeQueueState(dir, func(state *nudgeQueueState) error {
-		return pruneDeadQueuedNudges(state, nil, now)
+		return pruneDeadQueuedNudges(state, nil, now, noMaintenanceDeadline())
 	})
 	if err != nil {
 		t.Fatalf("pruneDeadQueuedNudges: %v", err)
@@ -4286,7 +4350,7 @@ func TestEnqueueSupersedes_SameAgentSourceReference(t *testing.T) {
 
 	// Verify the superseded nudge has a terminal bead record with state "superseded".
 	store := openNudgeBeadStore(dir)
-	if store != nil {
+	if store.Store != nil {
 		b, ok, err := findAnyQueuedNudgeBead(store, "n-first")
 		if err != nil {
 			t.Fatalf("findAnyQueuedNudgeBead(n-first): %v", err)
@@ -4418,7 +4482,7 @@ func TestMarkQueuedNudgeTerminalStampsCloseReason(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			store := beads.NewMemStore()
+			store := beads.NudgesStore{Store: beads.NewMemStore()}
 			item := queuedNudge{
 				ID:        "nudge-" + tc.name,
 				Agent:     "agent-terminal",
@@ -4526,7 +4590,7 @@ func TestEnqueueQueuedNudgeWithStore_RollbackStampsCloseReason(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	store := beads.NewMemStore()
+	store := beads.NudgesStore{Store: beads.NewMemStore()}
 	item := newQueuedNudgeWithOptions("worker", "rollback test", "session", time.Now(), queuedNudgeOptions{
 		ID: "nudge-rollback-target",
 	})
@@ -4568,10 +4632,10 @@ func TestEnqueueQueuedNudgeWithStore_RollbackReturnsCloseFailure(t *testing.T) {
 	}
 
 	closeErr := errors.New("rollback close failed")
-	store := &rollbackCloseFailStore{
+	store := beads.NudgesStore{Store: &rollbackCloseFailStore{
 		MemStore: beads.NewMemStore(),
 		closeErr: closeErr,
-	}
+	}}
 	item := newQueuedNudgeWithOptions("worker", "rollback close failure", "session", time.Now(), queuedNudgeOptions{
 		ID: "nudge-rollback-close-failure",
 	})
@@ -4648,9 +4712,9 @@ func installCountingNudgeStoreSeam(t *testing.T) (opens, closes *int) {
 	backing := beads.NewMemStore()
 	var openCount, closeCount int
 	prev := openNudgeBeadStore
-	openNudgeBeadStore = func(string) beads.Store {
+	openNudgeBeadStore = func(string) beads.NudgesStore {
 		openCount++
-		return &countingNudgeStore{MemStore: backing, closes: &closeCount}
+		return beads.NudgesStore{Store: &countingNudgeStore{MemStore: backing, closes: &closeCount}}
 	}
 	t.Cleanup(func() { openNudgeBeadStore = prev })
 	return &openCount, &closeCount
@@ -4709,7 +4773,7 @@ func TestEnqueueQueuedNudgeWithStoreClosesOnlyOwnedStore(t *testing.T) {
 	// store==nil: the helper opens and must close exactly that store.
 	dir := t.TempDir()
 	ownItem := newQueuedNudgeWithOptions("worker", "owned", "session", time.Now(), queuedNudgeOptions{ID: "n-own"})
-	if err := enqueueQueuedNudgeWithStore(dir, nil, ownItem); err != nil {
+	if err := enqueueQueuedNudgeWithStore(dir, beads.NudgesStore{}, ownItem); err != nil {
 		t.Fatalf("enqueueQueuedNudgeWithStore(nil store): %v", err)
 	}
 	if *opens != 1 {
@@ -4724,7 +4788,7 @@ func TestEnqueueQueuedNudgeWithStoreClosesOnlyOwnedStore(t *testing.T) {
 	passed := &countingNudgeStore{MemStore: beads.NewMemStore(), closes: &passedCloses}
 	dir2 := t.TempDir()
 	passedItem := newQueuedNudgeWithOptions("worker", "passed", "session", time.Now(), queuedNudgeOptions{ID: "n-passed"})
-	if err := enqueueQueuedNudgeWithStore(dir2, passed, passedItem); err != nil {
+	if err := enqueueQueuedNudgeWithStore(dir2, beads.NudgesStore{Store: passed}, passedItem); err != nil {
 		t.Fatalf("enqueueQueuedNudgeWithStore(passed store): %v", err)
 	}
 	if *opens != 1 {
@@ -4751,7 +4815,7 @@ func TestRecordQueuedNudgeFailureDetailedClosesOnlyOwnedStore(t *testing.T) {
 	// measure the deltas around the recordQueuedNudgeFailureDetailed call.
 	opensBefore := *opens
 	closesBefore := *closes
-	if _, err := recordQueuedNudgeFailureDetailed(dir, nil, []string{"n-fail"}, context.DeadlineExceeded, now); err != nil {
+	if _, err := recordQueuedNudgeFailureDetailed(dir, beads.NudgesStore{}, []string{"n-fail"}, context.DeadlineExceeded, now); err != nil {
 		t.Fatalf("recordQueuedNudgeFailureDetailed(nil store): %v", err)
 	}
 	if *opens != opensBefore+1 {
@@ -4766,11 +4830,11 @@ func TestRecordQueuedNudgeFailureDetailedClosesOnlyOwnedStore(t *testing.T) {
 	passed := &countingNudgeStore{MemStore: beads.NewMemStore(), closes: &passedCloses}
 	dir2 := t.TempDir()
 	item2 := newQueuedNudgeWithOptions("worker", "fail2", "session", now, queuedNudgeOptions{ID: "n-fail2"})
-	if err := enqueueQueuedNudgeWithStore(dir2, passed, item2); err != nil {
+	if err := enqueueQueuedNudgeWithStore(dir2, beads.NudgesStore{Store: passed}, item2); err != nil {
 		t.Fatalf("enqueueQueuedNudgeWithStore(passed store): %v", err)
 	}
 	closesAfterEnqueue := *closes
-	if _, err := recordQueuedNudgeFailureDetailed(dir2, passed, []string{"n-fail2"}, context.DeadlineExceeded, now); err != nil {
+	if _, err := recordQueuedNudgeFailureDetailed(dir2, beads.NudgesStore{Store: passed}, []string{"n-fail2"}, context.DeadlineExceeded, now); err != nil {
 		t.Fatalf("recordQueuedNudgeFailureDetailed(passed store): %v", err)
 	}
 	if *closes != closesAfterEnqueue {

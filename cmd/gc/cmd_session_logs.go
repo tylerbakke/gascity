@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -125,16 +126,46 @@ func resolveStoredSessionLogSource(cityPath string, cfg *config.City, store bead
 	if !ok {
 		return "", "", false, ""
 	}
-	if logCtx.sessionID != "" {
-		handle, err := workerHandleForSessionWithConfig(cityPath, store, newSessionProvider(), cfg, logCtx.sessionID)
-		if err == nil {
-			if path, pathErr := handle.TranscriptPath(context.Background()); pathErr == nil && strings.TrimSpace(path) != "" {
-				return path, logCtx.provider, true, ""
-			}
-		}
+	if path := resolveSessionHandleTranscript(cityPath, cfg, store, logCtx); path != "" {
+		return path, logCtx.provider, true, ""
 	}
-	path := ""
 	fallbackAllowed := canFallbackStoredSessionLogByWorkDir(store, logCtx)
+	path := resolveStoredSessionLogPathCandidate(searchPaths, logCtx, fallbackAllowed)
+	if path == "" && fallbackAllowed {
+		path = discoverWorkDirTranscript(searchPaths, logCtx)
+	}
+	if path == "" && !fallbackAllowed {
+		path = resolveCodexSiblingLogPath(store, searchPaths, logCtx)
+	}
+	if path == "" && !fallbackAllowed {
+		return "", logCtx.provider, true, ambiguousSessionLogDiagnostic(logCtx)
+	}
+	return path, logCtx.provider, true, ""
+}
+
+// resolveSessionHandleTranscript returns the transcript path reported by the
+// session's worker handle, or "" when there is no session id, the handle cannot
+// be built, or it reports no transcript.
+func resolveSessionHandleTranscript(cityPath string, cfg *config.City, store beads.Store, logCtx sessionLogContext) string {
+	if logCtx.sessionID == "" {
+		return ""
+	}
+	handle, err := workerHandleForSessionWithConfig(cityPath, store, newSessionProvider(), cfg, logCtx.sessionID)
+	if err != nil {
+		return ""
+	}
+	path, pathErr := handle.TranscriptPath(context.Background())
+	if pathErr != nil || strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return path
+}
+
+// resolveStoredSessionLogPathCandidate resolves the primary stored transcript
+// path from the session key (preferred) or the workdir fallback, returning ""
+// when nothing fresh enough for the session is found.
+func resolveStoredSessionLogPathCandidate(searchPaths []string, logCtx sessionLogContext, fallbackAllowed bool) string {
+	path := ""
 	if strings.TrimSpace(logCtx.sessionKey) != "" {
 		path = resolveSessionKeyedLogPath(searchPaths, logCtx)
 		if path == "" && fallbackAllowed {
@@ -144,21 +175,41 @@ func resolveStoredSessionLogSource(cityPath string, cfg *config.City, store bead
 		path = resolveSessionLogPath(searchPaths, logCtx)
 	}
 	if !sessionLogPathFreshEnough(path, logCtx.createdAt) {
-		path = ""
+		return ""
 	}
-	if path == "" && fallbackAllowed {
-		factory, err := worker.NewFactory(worker.FactoryConfig{SearchPaths: searchPaths})
-		if err == nil {
-			path = factory.DiscoverWorkDirTranscript(logCtx.provider, logCtx.workDir)
-		}
+	return path
+}
+
+// discoverWorkDirTranscript resolves the workdir-based transcript fallback,
+// returning "" when the worker factory cannot be built or the transcript is not
+// fresh enough for the session.
+func discoverWorkDirTranscript(searchPaths []string, logCtx sessionLogContext) string {
+	factory, err := worker.NewFactory(worker.FactoryConfig{SearchPaths: searchPaths})
+	if err != nil {
+		return ""
 	}
+	path := factory.DiscoverWorkDirTranscript(logCtx.provider, logCtx.workDir)
 	if !sessionLogPathFreshEnough(path, logCtx.createdAt) {
-		path = ""
+		return ""
 	}
-	if path == "" && !fallbackAllowed {
-		return "", logCtx.provider, true, ambiguousSessionLogDiagnostic(logCtx)
+	return path
+}
+
+// resolveCodexSiblingLogPath resolves an ambiguous same-workdir Codex session to
+// its transcript by session-start ordering. It is used only when the plain
+// workdir fallback is disallowed because multiple live siblings share the
+// workdir. It returns "" when the sibling set cannot be gathered, the group is
+// underspecified, or the resolved transcript is not fresh enough for the session.
+func resolveCodexSiblingLogPath(store beads.Store, searchPaths []string, logCtx sessionLogContext) string {
+	siblings, err := sessionLogFallbackSiblings(store, logCtx)
+	if err != nil {
+		return ""
 	}
-	return path, logCtx.provider, true, ""
+	path := sessionpkg.ResolveCodexTranscriptBySessionOrder(searchPaths, logCtx.provider, logCtx.workDir, logCtx.sessionID, siblings)
+	if !sessionLogPathFreshEnough(path, logCtx.createdAt) {
+		return ""
+	}
+	return path
 }
 
 func resolveSessionKeyedLogPath(searchPaths []string, logCtx sessionLogContext) string {
@@ -185,7 +236,7 @@ func resolveSessionLogContext(cityPath string, cfg *config.City, store beads.Sto
 	if err != nil {
 		return sessionLogContext{}, false
 	}
-	workDir := strings.TrimSpace(b.Metadata["work_dir"])
+	workDir := strings.TrimSpace(b.Metadata[beadmeta.LegacyWorkDirMetadataKey])
 	if workDir == "" {
 		return sessionLogContext{}, false
 	}
@@ -220,9 +271,14 @@ func canFallbackStoredSessionLogByWorkDir(store beads.Store, logCtx sessionLogCo
 	if store == nil || strings.TrimSpace(logCtx.sessionID) == "" || strings.TrimSpace(logCtx.workDir) == "" {
 		return false
 	}
+	siblings, err := sessionLogFallbackSiblings(store, logCtx)
+	return err == nil && len(siblings) == 1
+}
+
+func sessionLogFallbackSiblings(store beads.Store, logCtx sessionLogContext) ([]beads.Bead, error) {
 	all, err := sessionLogFallbackCandidates(store, logCtx.workDir, logCtx.provider)
 	if err != nil {
-		return false
+		return nil, err
 	}
 	targetLive := false
 	for _, b := range all {
@@ -231,12 +287,12 @@ func canFallbackStoredSessionLogByWorkDir(store beads.Store, logCtx sessionLogCo
 			break
 		}
 	}
-	matches := 0
+	var matches []beads.Bead
 	for _, b := range all {
 		if !sessionpkg.IsSessionBeadOrRepairable(b) {
 			continue
 		}
-		if strings.TrimSpace(b.Metadata["work_dir"]) != logCtx.workDir {
+		if strings.TrimSpace(b.Metadata[beadmeta.LegacyWorkDirMetadataKey]) != logCtx.workDir {
 			continue
 		}
 		provider := strings.TrimSpace(b.Metadata["provider_kind"])
@@ -249,12 +305,9 @@ func canFallbackStoredSessionLogByWorkDir(store beads.Store, logCtx sessionLogCo
 		if targetLive && b.ID != logCtx.sessionID && !sessionLogFallbackCandidateLive(b) {
 			continue
 		}
-		matches++
-		if matches > 1 {
-			return false
-		}
+		matches = append(matches, b)
 	}
-	return matches == 1
+	return matches, nil
 }
 
 func sessionLogFallbackCandidates(store beads.Store, workDir, provider string) ([]beads.Bead, error) {
@@ -270,14 +323,14 @@ func sessionLogFallbackCandidates(store beads.Store, workDir, provider string) (
 		return nil
 	}
 	if strings.TrimSpace(provider) == "" {
-		if err := add(map[string]string{"work_dir": workDir}); err != nil {
+		if err := add(map[string]string{beadmeta.LegacyWorkDirMetadataKey: workDir}); err != nil {
 			return nil, err
 		}
 	} else {
-		if err := add(map[string]string{"work_dir": workDir, "provider": provider}); err != nil {
+		if err := add(map[string]string{beadmeta.LegacyWorkDirMetadataKey: workDir, "provider": provider}); err != nil {
 			return nil, err
 		}
-		if err := add(map[string]string{"work_dir": workDir, "provider_kind": provider}); err != nil {
+		if err := add(map[string]string{beadmeta.LegacyWorkDirMetadataKey: workDir, "provider_kind": provider}); err != nil {
 			return nil, err
 		}
 	}

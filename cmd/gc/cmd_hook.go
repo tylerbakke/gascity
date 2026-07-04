@@ -344,17 +344,20 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		stores = appendCityHookStore(stores, cityPath, cfg, &a, overrides)
 	}
 
-	runner := func(command, _ string) (string, error) {
-		out, err := firstStoreWithWork(command, stores, shellWorkQueryWithEnv)
-		if err != nil && emitFailureEvent {
-			// A killed/timed-out work query strands the session with no
-			// output and no cause on the event bus; emit one so the
-			// reconciler can escalate instead of skipping it forever
-			// (issues #1496/#1497). Ordinary command errors are ignored
-			// by emitWorkQueryFailure and stay on the stderr path below.
-			emitCityWorkQueryFailure(cityPath, stderr,
-				os.Getenv("GC_SESSION_ID"), failureTemplate, command, err)
+	// emitQueryFailure surfaces a killed/timed-out work query on the event bus
+	// so the reconciler can escalate instead of silently treating the strand as
+	// "no work" (issues #1496/#1497). Ordinary command errors are ignored by
+	// emitCityWorkQueryFailure and stay on the caller's stderr path.
+	emitQueryFailure := func(command string, err error) {
+		if err == nil || !emitFailureEvent {
+			return
 		}
+		emitCityWorkQueryFailure(cityPath, stderr,
+			os.Getenv("GC_SESSION_ID"), failureTemplate, command, err)
+	}
+	runner := func(command, _ string) (string, error) {
+		out, _, err := firstStoreWithWork(command, stores, stores[0], shellWorkQueryWithEnv)
+		emitQueryFailure(command, err)
 		return out, err
 	}
 	if opts.Claim {
@@ -362,25 +365,118 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		sessionName := strings.TrimSpace(sessionForQuery)
 		alias := strings.TrimSpace(overrides["GC_ALIAS"])
 		assignee := firstNonEmptyHookValue(sessionName, sessionID, alias, agentForQuery, resolvedAgentName)
-		routeTarget := hookClaimPrimaryRouteTarget(&a)
 		claimOpts := hookClaimOptions{
 			Assignee: assignee,
+			// IdentityCandidates governs ADOPTION of already-owned in_progress/open
+			// work (hookClaimExistingOrAssigned); it must be scoped to this
+			// session's OWN runtime identity, never the bare pool template. A
+			// suffixed pool worker resolves config via the GC_TEMPLATE fallback, so
+			// resolvedAgentName == a.QualifiedName() is the bare template, which is
+			// ALSO the [[named_session]] holder's identity — including it let a
+			// suffixed worker adopt the holder's in_progress bead (ga-80pen8). The
+			// bare template stays in RouteTargets, which governs FRESH claims of
+			// UNASSIGNED routed work. The canonical slot / named holder keep it via
+			// `alias` (GC_ALIAS == qualified bare name); only suffixed workers drop it.
 			IdentityCandidates: hookClaimIdentityCandidates(
 				assignee,
 				sessionID,
 				sessionName,
 				alias,
 				agentForQuery,
-				resolvedAgentName,
 			),
-			RouteTargets: hookClaimRouteTargets(routeTarget, resolvedAgentName, strings.TrimSpace(overrides["GC_TEMPLATE"])),
+			RouteTargets: hookClaimRouteTargets(hookClaimPrimaryRouteTarget(&a), resolvedAgentName, strings.TrimSpace(overrides["GC_TEMPLATE"])),
 			Env:          queryEnv,
 			DrainAck:     opts.DrainAck,
 			JSON:         opts.JSON,
 		}
-		return doHookClaim(workQuery, workDir, claimOpts, hookClaimOps{Runner: runner}, stdout, stderr)
+		return claimHookWork(workQuery, workDir, queryEnv, stores, claimOpts, emitQueryFailure, stdout, stderr)
 	}
 	return doHook(workQuery, workDir, false, runner, stdout, stderr)
+}
+
+// claimHookWork claims routed work for gc hook --claim from the federated store
+// set, binding the production shell work-query runner and real claim ops. See
+// claimHookWorkWithRunner for the federation and lost-claim-race semantics.
+func claimHookWork(workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
+	return claimHookWorkWithRunner(workQuery, workDir, queryEnv, stores, claimOpts, hookClaimOps{}, shellWorkQueryWithEnv, emitFailure, stdout, stderr)
+}
+
+// claimHookWorkWithRunner is claimHookWork with the work-query runner and claim
+// ops injected for tests. It selects the first store reporting ready work,
+// re-validates it for claim-time freshness and falls back to a later store if it
+// emptied since discovery (claimStoreWithFallback), then attempts the claim
+// against that store's captured rows, against that store's dir/env.
+//
+// When a selected store still reports ready work but every claimable row is lost
+// to another claimant before the mutation, the single-store claim drains without
+// work. That would strand routed work waiting in a LATER federated store behind
+// the lost race, so this loop drops the exhausted store and reselects across the
+// remaining stores. It writes the shared drain exactly once, after every store
+// has been exhausted; the drain reason is claims_errored when any exhausted
+// store's eligible claims errored rather than merely lost the race, else no_work.
+// emitFailure surfaces a work-query timeout on the event bus when eligible.
+func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, ops hookClaimOps, run hookStoreRunner, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
+	ops.applyDefaults()
+	// primary is the agent's own store (the first entry). It is captured once
+	// here, before the loop shrinks remaining: only the primary may surface a
+	// work-query error as a fatal claim failure. Once the primary loses its
+	// claim race and is dropped, a later federated store must never inherit that
+	// emit-on-timeout semantics, so it is matched by identity, not slice index.
+	var primary hookStore
+	if len(stores) > 0 {
+		primary = stores[0]
+	}
+	remaining := stores
+	// claimsErrored aggregates the per-store signal that a store reported ready
+	// work but every eligible claim mutation errored, so the shared drain below can
+	// report claims_errored instead of laundering a write failure into no_work.
+	claimsErrored := false
+	for len(remaining) > 0 {
+		_, selected, err := firstStoreWithWork(workQuery, remaining, primary, run)
+		if err != nil {
+			emitFailure(workQuery, err)
+			fmt.Fprintf(stderr, "gc hook --claim: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if isZeroHookStore(selected) {
+			break // no remaining store has ready work
+		}
+		claimOutput, claimStore, err := claimStoreWithFallback(workQuery, remaining, selected, primary, run)
+		if err != nil {
+			emitFailure(workQuery, err)
+			fmt.Fprintf(stderr, "gc hook --claim: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if isZeroHookStore(claimStore) {
+			break // selected store emptied and no later store has ready work
+		}
+		storeOpts := claimOpts
+		storeOpts.Env = queryEnv
+		if len(claimStore.env) > 0 {
+			storeOpts.Env = claimStore.env
+		}
+		storeDir := workDir
+		if dir := strings.TrimSpace(claimStore.dir); dir != "" {
+			storeDir = dir
+		}
+		storeOps := ops
+		storeOps.Runner = func(string, string) (string, error) { return claimOutput, nil }
+		res := tryHookClaim(workQuery, storeDir, &storeOpts, &storeOps, stdout, stderr)
+		if res.terminal {
+			return res.code
+		}
+		if res.claimsErrored {
+			claimsErrored = true
+		}
+		// This store reported ready work but the claim acquired nothing — every
+		// claimable row was lost to another claimant, none matched this session, or
+		// every claimable row's claim mutation errored and was skipped. Drop it and
+		// reselect from the remaining stores so routed work in a later federated
+		// store is not stranded behind it; claimsErrored carries any write-failure
+		// signal to the shared drain.
+		remaining = removeHookStore(remaining, claimStore)
+	}
+	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, stdout, stderr)
 }
 
 func hookClaimPrimaryRouteTarget(a *config.Agent) string {
@@ -437,11 +533,18 @@ func hookQueryEnv(cityPath string, cfg *config.City, a *config.Agent) (map[strin
 // dir sets the command's working directory.
 type WorkQueryRunner func(command, dir string) (string, error)
 
-// hookWorkQueryTimeout caps the work-query subprocess. Default matches
-// the pre-bounded behavior (30s) so existing tests that legitimately
-// take >15s don't regress; the package-level var lets us lower it in
-// follow-up work after slow paths are identified and optimized.
-var hookWorkQueryTimeout = 30 * time.Second
+// hookWorkQueryTimeout caps the work-query subprocess that `gc hook` and the
+// workflow serve loop run via shellWorkQueryWithEnv. The default work-probe
+// issues ~6 sequential bd/store round-trips before the pool-demand tier that
+// finds routed work; on a multi-rig dolt city under concurrent load the probe
+// intermittently exceeded the prior 30s cap, so shellWorkQueryWithEnv killed it
+// and pool operators were starved of routed work. Raised to 60s to cover the
+// realistic loaded cost. This is independent of defaultHookRunTimeout, which
+// bounds the `gc hook run` managed-hook wrapper (around nudge drain / mail
+// check) and does not enclose this work query. The package-level var lets us
+// lower it again once the probe's round-trip count is reduced and the slow
+// per-rig `bd ready`/`gc ready` paths are optimized.
+var hookWorkQueryTimeout = 60 * time.Second
 
 // shellWorkQueryWithEnv runs a work query command via sh -c and returns
 // stdout. If env is non-nil it is used as the subprocess environment
@@ -559,10 +662,11 @@ func workQueryHasReadyWork(output string) bool {
 }
 
 // filterUnreadyHookCandidates strips beads from work_query output that fail
-// bd ready semantics: future defer_until, or any open blocking dep in the
-// row's blocked_by array. The work_query is expected to gate these, but
-// defensive filtering here prevents a single broken query from cascading
-// into agent action on a bead it cannot progress.
+// bd ready semantics: future defer_until, any open blocking dep in the row's
+// blocked_by array, or the row's own is_blocked / status=="blocked" marker.
+// The work_query is expected to gate these, but defensive filtering here
+// prevents a single broken query from cascading into agent action on a bead
+// it cannot progress.
 // Pure function over JSON; takes time.Time so tests stay deterministic.
 func filterUnreadyHookCandidates(output string, now time.Time) string {
 	if output == "" {
@@ -587,6 +691,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			continue
 		}
 		if isDepBlockedHookCandidate(obj) {
+			continue
+		}
+		if isSelfBlockedHookCandidate(obj) {
 			continue
 		}
 		filtered = append(filtered, obj)
@@ -632,6 +739,22 @@ func isDepBlockedHookCandidate(item map[string]any) bool {
 		if status != "" && !strings.EqualFold(status, "closed") {
 			return true
 		}
+	}
+	return false
+}
+
+// isSelfBlockedHookCandidate reports whether a candidate carries bd's own
+// is_blocked marker or an explicit status=="blocked", independent of the
+// blocked_by dependency array checked by isDepBlockedHookCandidate. An
+// absent is_blocked field is treated as NOT blocked — bd's denormalized
+// projection is not always populated, and over-filtering here would strand
+// otherwise-ready work.
+func isSelfBlockedHookCandidate(item map[string]any) bool {
+	if blocked, ok := item["is_blocked"].(bool); ok && blocked {
+		return true
+	}
+	if status, ok := item["status"].(string); ok && strings.EqualFold(strings.TrimSpace(status), "blocked") {
+		return true
 	}
 	return false
 }

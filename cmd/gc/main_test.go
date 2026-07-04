@@ -2784,11 +2784,20 @@ func TestDoInitWritesExpectedTOML(t *testing.T) {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
 
-	// city.toml keeps only the runtime-local [workspace]; builtin packs
-	// compose via pinned [imports] in pack.toml. workspace.name lives in
-	// .gc/site.toml.
+	// city.toml keeps the runtime-local [workspace] plus the canonical
+	// default-rig imports: the gascity template seeds the gc-roles pack (bound
+	// "gc") so rigs added to the city inherit the role agents the built-in
+	// formulas route to (gascity#3832). Builtin packs compose via pinned
+	// [imports] in pack.toml; workspace.name lives in .gc/site.toml.
 	got := string(f.Files[filepath.Join("/bright-lights", "city.toml")])
 	want := `[workspace]
+
+[defaults]
+[defaults.rig]
+[defaults.rig.imports]
+[defaults.rig.imports.gc]
+source = "` + config.PublicGascityRolesPackSource + `"
+version = "` + config.PublicGascityPackVersion + `"
 
 # [mail]
 # retention_ttl controls how long read messages are retained before purge.
@@ -3753,7 +3762,7 @@ func TestInitWizardConfigFromFlagsRejectsUnknownTemplate(t *testing.T) {
 		t.Fatal(err)
 	}
 	template, _ := cmd.Flags().GetString("template")
-	if _, _, err := initWizardConfigFromFlags(cmd, "", "", nil, template, ""); err == nil {
+	if _, _, err := initWizardConfigFromFlags(cmd, "", "", nil, template, "", hostedDoltInitOptions{}); err == nil {
 		t.Fatal("expected error for unknown template")
 	}
 }
@@ -3802,7 +3811,7 @@ func TestInitWizardConfigFromFlagsDefaultProviderInfersProviders(t *testing.T) {
 		t.Fatal(err)
 	}
 	defaultProvider, _ := cmd.Flags().GetString("default-provider")
-	wiz, mode, err := initWizardConfigFromFlags(cmd, "", defaultProvider, nil, "", "")
+	wiz, mode, err := initWizardConfigFromFlags(cmd, "", defaultProvider, nil, "", "", hostedDoltInitOptions{})
 	if err != nil {
 		t.Fatalf("initWizardConfigFromFlags: %v", err)
 	}
@@ -3827,7 +3836,7 @@ func TestInitWizardConfigFromFlagsProvidersCanonicalOrder(t *testing.T) {
 	}
 	defaultProvider, _ := cmd.Flags().GetString("default-provider")
 	providers, _ := cmd.Flags().GetStringArray("providers")
-	wiz, _, err := initWizardConfigFromFlags(cmd, "", defaultProvider, providers, "", "")
+	wiz, _, err := initWizardConfigFromFlags(cmd, "", defaultProvider, providers, "", "", hostedDoltInitOptions{})
 	if err != nil {
 		t.Fatalf("initWizardConfigFromFlags: %v", err)
 	}
@@ -3842,7 +3851,7 @@ func TestInitWizardConfigFromFlagsProvidersRequireDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	providers, _ := cmd.Flags().GetStringArray("providers")
-	if _, _, err := initWizardConfigFromFlags(cmd, "", "", providers, "", ""); err == nil {
+	if _, _, err := initWizardConfigFromFlags(cmd, "", "", providers, "", "", hostedDoltInitOptions{}); err == nil {
 		t.Fatal("expected --providers without --default-provider to fail")
 	}
 }
@@ -3853,7 +3862,7 @@ func TestInitWizardConfigFromFlagsRejectsProviderListTypo(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider, _ := cmd.Flags().GetString("provider")
-	_, _, err := initWizardConfigFromFlags(cmd, provider, "", nil, "", "")
+	_, _, err := initWizardConfigFromFlags(cmd, provider, "", nil, "", "", hostedDoltInitOptions{})
 	if err == nil {
 		t.Fatal("expected deprecated --provider list typo to fail")
 	}
@@ -3872,7 +3881,7 @@ func TestInitWizardConfigFromFlagsTemplateCustomRejectsProviders(t *testing.T) {
 	}
 	template, _ := cmd.Flags().GetString("template")
 	defaultProvider, _ := cmd.Flags().GetString("default-provider")
-	if _, _, err := initWizardConfigFromFlags(cmd, "", defaultProvider, nil, template, ""); err == nil {
+	if _, _, err := initWizardConfigFromFlags(cmd, "", defaultProvider, nil, template, "", hostedDoltInitOptions{}); err == nil {
 		t.Fatal("expected --template custom with provider flags to fail")
 	}
 }

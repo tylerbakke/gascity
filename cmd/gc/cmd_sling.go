@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -80,7 +82,8 @@ The second argument is a bead ID, a formula name when --formula is set, or
 arbitrary text (which auto-creates a task bead).
 
 When target is omitted, the bead's rig prefix is used to look up the rig's
-default_sling_target from config. Requires --formula to have an explicit target.
+default_sling_targets (or default_sling_target) from config and one is chosen
+at random. Requires --formula to have an explicit target.
 Inline text also requires an explicit target.
 
 With --formula, the formula is instantiated and its root bead is routed to
@@ -283,10 +286,19 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 		if !found {
 			return fail("target_resolve_failed", fmt.Sprintf("gc sling: no rig with prefix %q for bead %s", bp, beadOrFormula))
 		}
-		if rig.DefaultSlingTarget == "" {
-			return fail("target_resolve_failed", fmt.Sprintf("gc sling: rig %q has no default_sling_target", rig.Name))
+		switch {
+		case len(rig.DefaultSlingTargets) > 0:
+			for _, t := range rig.DefaultSlingTargets {
+				if t == "" {
+					return fail("target_resolve_failed", fmt.Sprintf("gc sling: rig %q has an empty entry in default_sling_targets", rig.Name))
+				}
+			}
+			target = rig.DefaultSlingTargets[rand.Intn(len(rig.DefaultSlingTargets))] //nolint:gosec // random target selection, not security-critical
+		case rig.DefaultSlingTarget != "":
+			target = rig.DefaultSlingTarget
+		default:
+			return fail("target_resolve_failed", fmt.Sprintf("gc sling: rig %q has no default_sling_target or default_sling_targets", rig.Name))
 		}
-		target = rig.DefaultSlingTarget
 	}
 
 	// Ensure rig paths are absolute before agent/rig context resolution.
@@ -1489,14 +1501,18 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 			})
 			if nudgeErr == nil && result.Delivered {
 				telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), nil)
-				stampLastNudgeDeliveredAt(store, target.sessionID, time.Now())
+				var sessFront *session.InfoStore
+				if store != nil {
+					sessFront = sessionFrontDoor(store)
+				}
+				stampLastNudgeDeliveredAt(sessFront, target.sessionID, time.Now())
 				fmt.Fprintf(stdout, "Nudged %s\n", target.agent.QualifiedName()) //nolint:errcheck // best-effort
 				return
 			}
 		}
 	}
 
-	if err := enqueueQueuedNudgeWithStore(target.cityPath, store, newQueuedNudgeWithOptions(target.agent.QualifiedName(), msg, "sling", now, queuedNudgeOptionsFromTarget(target))); err != nil {
+	if err := enqueueQueuedNudgeWithStore(target.cityPath, beads.NudgesStore{Store: store}, newQueuedNudgeWithOptions(target.agent.QualifiedName(), msg, "sling", now, queuedNudgeOptionsFromTarget(target))); err != nil {
 		telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), err)
 		fmt.Fprintf(stderr, "gc sling: nudge failed: %v\n", err) //nolint:errcheck // best-effort
 		return

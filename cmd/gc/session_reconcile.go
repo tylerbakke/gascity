@@ -41,6 +41,19 @@ type wakeEvaluation struct {
 
 const sleepReasonRuntimeMissing = "runtime-missing"
 
+// sleepReasonProviderTerminalError parks a session that hit a terminal
+// (non-retryable) provider error. markProviderTerminalError writes it; the
+// pool-slot freeable allowlist reads it to reap the dead bead + its worktree.
+const sleepReasonProviderTerminalError = "provider-terminal-error"
+
+const (
+	sessionHealthStateMetadataKey           = "session_health"
+	sessionHealthReasonMetadataKey          = "session_health_reason"
+	sessionDrainableMetadataKey             = "session_drainable"
+	sessionProviderTerminalErrorMetadataKey = "provider_terminal_error"
+	sessionProviderTerminalErrorAtKey       = "provider_terminal_error_at"
+)
+
 // Deprecated: evaluateWakeReasons and wakeReasons are legacy functions
 // superseded by ComputeAwakeSet (compute_awake_set.go). The production
 // reconciler at session_reconciler.go:438 uses ComputeAwakeSet →
@@ -563,11 +576,11 @@ func agentTemplateIdentitiesEquivalent(cfg *config.City, a, b string) bool {
 
 // healExpiredTimers clears expired held_until and quarantined_until.
 // Separate from wakeReasons() to keep that function pure.
-func healExpiredTimers(session *beads.Bead, store beads.Store, clk clock.Clock) {
+func healExpiredTimers(session *beads.Bead, sessFront *sessionpkg.InfoStore, clk clock.Clock) {
 	if h := session.Metadata["held_until"]; h != "" {
 		if t, _ := time.Parse(time.RFC3339, h); !t.IsZero() && clk.Now().After(t) {
 			batch := sessionpkg.ClearExpiredHoldPatch(session.Metadata["sleep_reason"])
-			if err := store.SetMetadataBatch(session.ID, batch); err == nil {
+			if err := sessFront.ApplyPatch(session.ID, batch); err == nil {
 				for k, v := range batch {
 					session.Metadata[k] = v
 				}
@@ -577,7 +590,7 @@ func healExpiredTimers(session *beads.Bead, store beads.Store, clk clock.Clock) 
 	if q := session.Metadata["quarantined_until"]; q != "" {
 		if t, _ := time.Parse(time.RFC3339, q); !t.IsZero() && clk.Now().After(t) {
 			batch := sessionpkg.ClearExpiredQuarantinePatch(session.Metadata["sleep_reason"])
-			if err := store.SetMetadataBatch(session.ID, batch); err == nil {
+			if err := sessFront.ApplyPatch(session.ID, batch); err == nil {
 				for k, v := range batch {
 					session.Metadata[k] = v
 				}
@@ -598,24 +611,36 @@ func healExpiredTimers(session *beads.Bead, store beads.Store, clk clock.Clock) 
 // Edge-triggered: clears last_woke_at after recording so the same crash
 // is counted exactly once.
 // Drain-aware: draining sessions died by request, not by crash.
-func checkStability(session *beads.Bead, cfg *config.City, alive bool, dt *drainTracker, store beads.Store, clk clock.Clock, peek func(lines int) (string, error)) bool {
-	if handled, err := checkRateLimitStability(session, cfg, alive, dt, store, clk, peek); handled || err != nil {
+func checkStability(session *beads.Bead, cfg *config.City, alive bool, dt *drainTracker, sessFront *sessionpkg.InfoStore, clk clock.Clock, peek func(lines int) (string, error)) bool {
+	if handled, err := checkRateLimitStability(session, cfg, alive, dt, sessFront, clk, peek); handled || err != nil {
 		return true
 	}
 	if sessionpkg.DecideSessionExit(sessionExitFacts(session, cfg, alive, dt, clk)) != sessionpkg.ExitRapidCrash {
 		return false
 	}
-	recordWakeFailure(session, store, clk, sessionAgentMetricIdentity(*session, cfg))
-	clearLastWokeAt(session, store)
+	recordWakeFailure(session, sessFront, clk, sessionAgentMetricIdentity(*session, cfg))
+	clearLastWokeAt(session, sessFront)
 	return true
 }
 
-// checkRateLimitStability runs the rate-limit lane of the exit-classification
-// decider: a dead crash candidate whose provider screen shows a rate-limit
-// message is quarantined without counting a crash. Returns handled=true when
-// the quarantine was recorded, or the write error when recording failed; the
-// caller skips further processing for the session in either case.
-func checkRateLimitStability(session *beads.Bead, cfg *config.City, alive bool, dt *drainTracker, store beads.Store, clk clock.Clock, peek func(lines int) (string, error)) (bool, error) {
+// checkRateLimitStability runs the provider-screen lane of the
+// exit-classification decider for a dead crash candidate. It peeks the
+// session's provider screen and records, without counting an ordinary crash:
+//
+//   - a terminal (non-retryable) provider error → mark the session
+//     unhealthy + drainable so pool sizing excludes its slot. Terminal errors
+//     take precedence over the rate-limit screen: they are non-retryable.
+//   - otherwise a rate-limit screen → quarantine with a back-off and a
+//     distinct sleep_reason, so the session is retried rather than crashed.
+//
+// Returns handled=true when either was recorded, or the write error when
+// recording failed; the caller skips further processing for the session in
+// either case.
+//
+// This is the non-zombie counterpart to the reconciler's `running && !alive`
+// zombie screen capture: a session that died without satisfying that screen
+// but still exposes a terminal provider error via peek is classified here.
+func checkRateLimitStability(session *beads.Bead, cfg *config.City, alive bool, dt *drainTracker, sessFront *sessionpkg.InfoStore, clk clock.Clock, peek func(lines int) (string, error)) (bool, error) {
 	if session == nil {
 		return false, nil
 	}
@@ -624,15 +649,23 @@ func checkRateLimitStability(session *beads.Bead, cfg *config.City, alive bool, 
 	dec := sessionpkg.DecideSessionExit(facts)
 	for dec == sessionpkg.ExitGatherScreen {
 		facts.Screen = sessionpkg.ScreenOther
-		if content, err := peek(rateLimitPeekLines); err == nil && runtime.ContainsProviderRateLimitScreen(content) {
-			facts.Screen = sessionpkg.ScreenRateLimit
+		if content, err := peek(rateLimitPeekLines); err == nil {
+			if reason := runtime.ProviderTerminalErrorReason(content); reason != "" {
+				if markErr := markProviderTerminalError(session, sessFront, clk, reason); markErr != nil {
+					return false, markErr
+				}
+				return true, nil
+			}
+			if runtime.ContainsProviderRateLimitScreen(content) {
+				facts.Screen = sessionpkg.ScreenRateLimit
+			}
 		}
 		dec = sessionpkg.DecideSessionExit(facts)
 	}
 	if dec != sessionpkg.ExitRateLimitQuarantine {
 		return false, nil
 	}
-	if err := recordRateLimitQuarantine(session, store, clk); err != nil {
+	if err := recordRateLimitQuarantine(session, sessFront, clk); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -662,20 +695,20 @@ func sessionExitFacts(session *beads.Bead, cfg *config.City, alive bool, dt *dra
 	}
 }
 
-func clearLastWokeAt(session *beads.Bead, store beads.Store) {
-	_ = store.SetMetadata(session.ID, "last_woke_at", "")
+func clearLastWokeAt(session *beads.Bead, sessFront *sessionpkg.InfoStore) {
+	_ = sessFront.SetMarker(session.ID, "last_woke_at", "")
 	session.Metadata["last_woke_at"] = ""
 }
 
 // recordRateLimitQuarantine backs off a session that exited into a provider
 // rate-limit screen without treating the exit as a crash or resetting its
 // conversation metadata.
-func recordRateLimitQuarantine(session *beads.Bead, store beads.Store, clk clock.Clock) error {
+func recordRateLimitQuarantine(session *beads.Bead, sessFront *sessionpkg.InfoStore, clk clock.Clock) error {
 	if session.Metadata == nil {
 		session.Metadata = make(map[string]string)
 	}
 	batch := sessionpkg.RateLimitQuarantinePatch(clk.Now().Add(defaultRateLimitQuarantineDuration))
-	if err := store.SetMetadataBatch(session.ID, batch); err != nil {
+	if err := sessFront.ApplyPatch(session.ID, batch); err != nil {
 		fmt.Fprintf(os.Stderr, "recordRateLimitQuarantine: SetMetadataBatch %s: %v\n", session.ID, err) //nolint:errcheck
 		return err
 	}
@@ -685,11 +718,56 @@ func recordRateLimitQuarantine(session *beads.Bead, store beads.Store, clk clock
 	return nil
 }
 
+func markProviderTerminalError(session *beads.Bead, sessFront *sessionpkg.InfoStore, clk clock.Clock, reason string) error {
+	if session == nil || sessFront == nil {
+		return nil
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return nil
+	}
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string)
+	}
+	now := time.Now().UTC()
+	if clk != nil {
+		now = clk.Now().UTC()
+	}
+	batch := map[string]string{
+		"state":                                 string(sessionpkg.StateAsleep),
+		"sleep_reason":                          sleepReasonProviderTerminalError,
+		"last_woke_at":                          "",
+		"pending_create_claim":                  "",
+		"pending_create_started_at":             "",
+		sessionHealthStateMetadataKey:           "unhealthy",
+		sessionHealthReasonMetadataKey:          reason,
+		sessionDrainableMetadataKey:             boolMetadata(true),
+		sessionProviderTerminalErrorMetadataKey: reason,
+		sessionProviderTerminalErrorAtKey:       now.Format(time.RFC3339),
+	}
+	if err := sessFront.ApplyPatch(session.ID, batch); err != nil {
+		return err
+	}
+	for k, v := range batch {
+		session.Metadata[k] = v
+	}
+	return nil
+}
+
+func sessionHasProviderTerminalError(session beads.Bead) bool {
+	if strings.TrimSpace(session.Metadata[sessionProviderTerminalErrorMetadataKey]) != "" {
+		return true
+	}
+	return strings.TrimSpace(session.Metadata[sessionHealthStateMetadataKey]) == "unhealthy" &&
+		strings.TrimSpace(session.Metadata[sessionDrainableMetadataKey]) == boolMetadata(true) &&
+		strings.TrimSpace(session.Metadata[sessionHealthReasonMetadataKey]) != ""
+}
+
 // recordWakeFailure increments wake_attempts and quarantines if threshold exceeded.
 // agentIdentity is the start-path-joinable agent label for gc.agent.quarantines.total,
 // resolved by the caller from its authoritative source (the cfg-aware metric
 // resolver for reconcile paths, tp.DisplayName() for the start-failure path).
-func recordWakeFailure(session *beads.Bead, store beads.Store, clk clock.Clock, agentIdentity string) {
+func recordWakeFailure(session *beads.Bead, sessFront *sessionpkg.InfoStore, clk clock.Clock, agentIdentity string) {
 	attempts, _ := strconv.Atoi(session.Metadata["wake_attempts"])
 
 	if session.Metadata == nil {
@@ -708,14 +786,14 @@ func recordWakeFailure(session *beads.Bead, store beads.Store, clk clock.Clock, 
 	// left behind by older builds.
 	if session.Metadata["session_key"] != "" || session.Metadata["started_config_hash"] != "" {
 		reset := sessionpkg.ConversationResetPatch(true)
-		_ = store.SetMetadataBatch(session.ID, reset)
+		_ = sessFront.ApplyPatch(session.ID, reset)
 		for k, v := range reset {
 			session.Metadata[k] = v
 		}
 	}
 	accrual := sessionpkg.WakeFailureAccrualPatch(attempts, defaultMaxWakeAttempts, clk.Now().Add(defaultQuarantineDuration))
 	if accrual.Quarantined {
-		if err := store.SetMetadataBatch(session.ID, accrual.Patch); err == nil {
+		if err := sessFront.ApplyPatch(session.ID, accrual.Patch); err == nil {
 			for k, v := range accrual.Patch {
 				session.Metadata[k] = v
 			}
@@ -723,13 +801,13 @@ func recordWakeFailure(session *beads.Bead, store beads.Store, clk clock.Clock, 
 		}
 	} else {
 		next := accrual.Patch["wake_attempts"]
-		_ = store.SetMetadata(session.ID, "wake_attempts", next)
+		_ = sessFront.SetMarker(session.ID, "wake_attempts", next)
 		session.Metadata["wake_attempts"] = next
 	}
 }
 
 // clearWakeFailures resets crash counter and quarantine for a stable session.
-func clearWakeFailures(session *beads.Bead, store beads.Store) {
+func clearWakeFailures(session *beads.Bead, sessFront *sessionpkg.InfoStore) {
 	batch := make(map[string]string, 2)
 	if session.Metadata["wake_attempts"] != "" && session.Metadata["wake_attempts"] != "0" {
 		batch["wake_attempts"] = "0"
@@ -740,7 +818,7 @@ func clearWakeFailures(session *beads.Bead, store beads.Store) {
 	if len(batch) == 0 {
 		return
 	}
-	if err := store.SetMetadataBatch(session.ID, batch); err == nil {
+	if err := sessFront.ApplyPatch(session.ID, batch); err == nil {
 		if session.Metadata == nil {
 			session.Metadata = make(map[string]string)
 		}
@@ -757,19 +835,19 @@ func clearWakeFailures(session *beads.Bead, store beads.Store) {
 //
 // Returns true if a churn event was recorded (caller should skip further
 // processing for this session).
-func checkChurn(session *beads.Bead, cfg *config.City, alive bool, dt *drainTracker, store beads.Store, clk clock.Clock) bool {
+func checkChurn(session *beads.Bead, cfg *config.City, alive bool, dt *drainTracker, sessFront *sessionpkg.InfoStore, clk clock.Clock) bool {
 	switch sessionpkg.DecideSessionExit(sessionExitFacts(session, cfg, alive, dt, clk)) {
 	case sessionpkg.ExitChurn:
-		recordChurn(session, store, clk, sessionAgentMetricIdentity(*session, cfg))
+		recordChurn(session, sessFront, clk, sessionAgentMetricIdentity(*session, cfg))
 		// Clear last_woke_at so this death is not re-counted next tick
 		// (edge-triggered, same pattern as checkStability).
-		_ = store.SetMetadata(session.ID, "last_woke_at", "")
+		_ = sessFront.SetMarker(session.ID, "last_woke_at", "")
 		session.Metadata["last_woke_at"] = ""
 		return true
 	case sessionpkg.ExitProductiveDeath:
 		// Session was productive — clear any stale churn count so it
 		// doesn't carry over and cause premature quarantine next time.
-		clearChurn(session, store)
+		clearChurn(session, sessFront)
 		return false
 	default:
 		// Rapid crashes belong to checkStability, which ran first.
@@ -786,7 +864,7 @@ func isDeliberateSleepReason(reason string) bool {
 // the counter reaches defaultMaxChurnCycles, the session is quarantined.
 // agentIdentity is the start-path-joinable agent label for
 // gc.agent.quarantines.total, resolved by the caller.
-func recordChurn(session *beads.Bead, store beads.Store, clk clock.Clock, agentIdentity string) {
+func recordChurn(session *beads.Bead, sessFront *sessionpkg.InfoStore, clk clock.Clock, agentIdentity string) {
 	count, _ := strconv.Atoi(session.Metadata["churn_count"])
 
 	if session.Metadata == nil {
@@ -798,7 +876,7 @@ func recordChurn(session *beads.Bead, store beads.Store, clk clock.Clock, agentI
 	// re-hitting the same wall.
 	if session.Metadata["session_key"] != "" {
 		reset := sessionpkg.ConversationResetPatch(false)
-		_ = store.SetMetadataBatch(session.ID, reset)
+		_ = sessFront.ApplyPatch(session.ID, reset)
 		for k, v := range reset {
 			session.Metadata[k] = v
 		}
@@ -806,7 +884,7 @@ func recordChurn(session *beads.Bead, store beads.Store, clk clock.Clock, agentI
 
 	accrual := sessionpkg.ChurnAccrualPatch(count, defaultMaxChurnCycles, clk.Now().Add(defaultQuarantineDuration))
 	if accrual.Quarantined {
-		if err := store.SetMetadataBatch(session.ID, accrual.Patch); err == nil {
+		if err := sessFront.ApplyPatch(session.ID, accrual.Patch); err == nil {
 			for k, v := range accrual.Patch {
 				session.Metadata[k] = v
 			}
@@ -816,16 +894,16 @@ func recordChurn(session *beads.Bead, store beads.Store, clk clock.Clock, agentI
 	}
 
 	next := accrual.Patch["churn_count"]
-	_ = store.SetMetadata(session.ID, "churn_count", next)
+	_ = sessFront.SetMarker(session.ID, "churn_count", next)
 	session.Metadata["churn_count"] = next
 }
 
 // clearChurn resets the churn counter for a productive session.
-func clearChurn(session *beads.Bead, store beads.Store) {
+func clearChurn(session *beads.Bead, sessFront *sessionpkg.InfoStore) {
 	if session.Metadata["churn_count"] == "" || session.Metadata["churn_count"] == "0" {
 		return
 	}
-	_ = store.SetMetadata(session.ID, "churn_count", "0")
+	_ = sessFront.SetMarker(session.ID, "churn_count", "0")
 	session.Metadata["churn_count"] = "0"
 }
 
@@ -888,8 +966,8 @@ func isPoolExcess(session beads.Bead, cfg *config.City, poolDesired map[string]i
 }
 
 // healState updates advisory state metadata only when changed (dirty check).
-func healState(session *beads.Bead, alive bool, store beads.Store, clk clock.Clock) {
-	healStateWithRollback(session, alive, store, clk, 0, true)
+func healState(session *beads.Bead, alive bool, sessFront *sessionpkg.InfoStore, clk clock.Clock) {
+	healStateWithRollback(session, alive, sessFront, clk, 0, true)
 }
 
 // healStateWithRollback is the explicit-control variant of healState. When
@@ -899,7 +977,7 @@ func healState(session *beads.Bead, alive bool, store beads.Store, clk clock.Clo
 // proper rollback. When true (default), healState clears the stale claim
 // in-line after startupTimeout has elapsed to break the state=creating ↔
 // state=asleep oscillation described in ga-mf1.
-func healStateWithRollback(session *beads.Bead, alive bool, store beads.Store, clk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) map[string]string {
+func healStateWithRollback(session *beads.Bead, alive bool, sessFront *sessionpkg.InfoStore, clk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) map[string]string {
 	if session == nil {
 		return nil
 	}
@@ -919,7 +997,7 @@ func healStateWithRollback(session *beads.Bead, alive bool, store beads.Store, c
 	if session.Metadata == nil {
 		session.Metadata = make(map[string]string, len(batch))
 	}
-	if err := store.SetMetadataBatch(session.ID, batch); err != nil {
+	if err := sessFront.ApplyPatch(session.ID, batch); err != nil {
 		fmt.Fprintf(os.Stderr, "healState: SetMetadataBatch %s: %v\n", session.ID, err) //nolint:errcheck
 	}
 	for k, v := range batch {

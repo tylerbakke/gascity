@@ -35,6 +35,9 @@ import (
 )
 
 const (
+	// labelOrderTracking is the label applied to order-dispatch tracking beads.
+	// coordclass mirrors this string privately (as labelOrderTracking) for store
+	// routing; the two must stay in sync.
 	labelOrderTracking    = "order-tracking"
 	labelTriggerEnvFailed = "trigger-env-failed"
 
@@ -284,6 +287,7 @@ type memoryOrderDispatcher struct {
 	cityPath             string
 	cacheMu              sync.Mutex
 	lastRunCache         map[string]time.Time
+	gateBackoffUntil     map[string]time.Time
 
 	dispatchCtx    context.Context
 	dispatchCancel context.CancelFunc
@@ -508,11 +512,19 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			storeKeysForGate = append(storeKeysForGate, orderStoreTargetKey(legacyOrderCityTarget(cityPath, m.cfg)))
 		}
 		scoped := a.ScopedName()
+		if m.gateBackoffActive(scoped, now) {
+			continue
+		}
 		hasOpenTracking, err := gateOpenWorkBounded(ctx, orderGateTimeout, scoped, func() (bool, error) {
 			return trackingIndex.hasOpenTracking(storesForGate, storeKeysForGate, scoped)
 		})
 		if err != nil {
 			if m.gateFailClosed(ctx, a, scoped, err) {
+				if errors.Is(err, errGateTimeout) {
+					// Anchor to actual wall clock after the gate consumed orderGateTimeout;
+					// using the tick-start 'now' would set a deadline that has already passed.
+					m.setGateBackoff(scoped, time.Now().Add(orderGateBackoffDuration))
+				}
 				continue
 			}
 		}
@@ -551,11 +563,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			logDispatchError(m.stderr, "gc: order dispatch: building trigger env for %s: %s", a.ScopedName(), redacted)
 			// Leave this open so the existing open-work gate suppresses repeat
 			// ticks until the normal stale tracking sweep gives the order another try.
-			trackingBead, createErr := store.Create(beads.Bead{
-				Title:     "order:" + scoped,
-				Labels:    []string{"order-run:" + scoped, labelOrderTracking, labelTriggerEnvFailed},
-				NoHistory: true,
-			})
+			trackingBead, createErr := orders.NewStore(beads.OrdersStore{Store: store}).CreateRun(scoped, orders.RunOpts{Outcome: orders.RunOutcomeTriggerEnvFailed})
 			if createErr != nil {
 				logDispatchError(m.stderr, "gc: order dispatch: creating trigger env failure tracking bead for %s: %v", scoped, createErr)
 			} else {
@@ -606,6 +614,11 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		})
 		if err != nil {
 			if m.gateFailClosed(ctx, a, scoped, err) {
+				if errors.Is(err, errGateTimeout) {
+					// Anchor to actual wall clock after the gate consumed orderGateTimeout;
+					// using the tick-start 'now' would set a deadline that has already passed.
+					m.setGateBackoff(scoped, time.Now().Add(orderGateBackoffDuration))
+				}
 				continue
 			}
 		}
@@ -615,11 +628,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 
 		// Create tracking bead synchronously BEFORE dispatch goroutine.
 		// This prevents the cooldown trigger from re-firing on the next tick.
-		trackingBead, err := store.Create(beads.Bead{
-			Title:     "order:" + scoped,
-			Labels:    []string{"order-run:" + scoped, labelOrderTracking},
-			NoHistory: true,
-		})
+		trackingBead, err := orders.NewStore(beads.OrdersStore{Store: store}).CreateRun(scoped, orders.RunOpts{})
 		if err != nil {
 			logDispatchError(m.stderr, "gc: order dispatch: creating tracking bead for %s: %v", scoped, err)
 			continue
@@ -1004,6 +1013,62 @@ func (m *memoryOrderDispatcher) carryLastRunCacheFrom(prev *memoryOrderDispatche
 	}
 }
 
+// gateBackoffActive reports whether the named order is in a gate-timeout
+// backoff window. Call before either open-work gate to suppress re-entry after
+// a prior timeout; the backoff expires naturally so the order resumes once the
+// store recovers.
+func (m *memoryOrderDispatcher) gateBackoffActive(key string, now time.Time) bool {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.gateBackoffUntil == nil {
+		return false
+	}
+	until, ok := m.gateBackoffUntil[key]
+	return ok && now.Before(until)
+}
+
+// setGateBackoff records a gate-timeout backoff for the named order. The
+// backoff suppresses both open-work gates on every subsequent tick until the
+// deadline passes (see gateBackoffActive). Only the latest/furthest deadline
+// is retained.
+func (m *memoryOrderDispatcher) setGateBackoff(key string, until time.Time) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.gateBackoffUntil == nil {
+		m.gateBackoffUntil = make(map[string]time.Time)
+	}
+	if existing, ok := m.gateBackoffUntil[key]; !ok || until.After(existing) {
+		m.gateBackoffUntil[key] = until
+	}
+}
+
+// carryGateBackoffFrom copies non-expired gate-backoff entries from a previous
+// dispatcher so a reload/rescan-triggered rebuild preserves active backoffs.
+// now is used to filter out already-expired entries; only call after draining
+// the previous dispatcher.
+func (m *memoryOrderDispatcher) carryGateBackoffFrom(prev *memoryOrderDispatcher, now time.Time) {
+	if m == nil || prev == nil {
+		return
+	}
+	prev.cacheMu.Lock()
+	defer prev.cacheMu.Unlock()
+	if len(prev.gateBackoffUntil) == 0 {
+		return
+	}
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.gateBackoffUntil == nil {
+		m.gateBackoffUntil = make(map[string]time.Time, len(prev.gateBackoffUntil))
+	}
+	for key, until := range prev.gateBackoffUntil {
+		if until.After(now) {
+			if existing, ok := m.gateBackoffUntil[key]; !ok || until.After(existing) {
+				m.gateBackoffUntil[key] = until
+			}
+		}
+	}
+}
+
 func orderHistoryCacheKey(orderName string, storeKeys []string) string {
 	return orderName + "\x00" + strings.Join(storeKeys, "\x00")
 }
@@ -1044,7 +1109,13 @@ func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Sto
 	})
 
 	if a.IsExec() {
-		m.dispatchExec(childCtx, store, target, a, cityPath, trackingID)
+		// dispatchExec is order-only: hand it the typed order front door so the
+		// goroutine leaf has no raw beads.Store to misuse. Constructed here (the
+		// per-order coordination point that still holds the raw store for the
+		// closeOrderTrackingBead defer) from the same store, so the bead writes
+		// stay byte-identical.
+		front := orders.NewStore(beads.OrdersStore{Store: store})
+		m.dispatchExec(childCtx, front, target, a, cityPath, trackingID)
 	} else {
 		m.dispatchWisp(childCtx, store, a, cityPath, trackingID)
 	}
@@ -1155,9 +1226,9 @@ func openOrderTrackingIDs(store beads.Store, ids []string) ([]string, error) {
 }
 
 // dispatchExec runs an exec order's shell command.
-func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string) {
+func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string) {
 	scoped := a.ScopedName()
-	labels := []string{"exec"}
+	outcome := orders.RunOutcomeExec
 	var headSeq uint64
 	var hasEventCursor bool
 	if a.Trigger == "event" && m.ep != nil {
@@ -1165,9 +1236,9 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, store beads.St
 		headSeq, err = m.ep.LatestSeq()
 		if err != nil {
 			errMsg := fmt.Sprintf("reading event cursor: %v", err)
-			labels = []string{"exec-failed"}
+			outcome = orders.RunOutcomeExecFailed
 			logDispatchError(m.stderr, "gc: order dispatch: reading event cursor for %s: %v", scoped, err)
-			if updateErr := store.Update(trackingID, beads.UpdateOpts{Labels: labels}); updateErr != nil {
+			if updateErr := front.SetOutcome(trackingID, outcome); updateErr != nil {
 				logDispatchError(m.stderr, "gc: order %s: failed to label exec tracking bead %s: %v", scoped, trackingID, updateErr)
 			}
 			m.rec.Record(events.Event{
@@ -1181,10 +1252,10 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, store beads.St
 		hasEventCursor = true
 		// Event-triggered exec orders persist the cursor before the command
 		// runs; otherwise a crash after the side effect can replay the event.
-		if err := store.Update(trackingID, beads.UpdateOpts{Labels: eventCursorLabels(scoped, headSeq)}); err != nil {
+		if err := front.SetCursor(trackingID, scoped, orders.EventCursor(headSeq)); err != nil {
 			logDispatchError(m.stderr, "gc: order %s: failed to label exec event cursor on tracking bead %s: %v", scoped, trackingID, err)
-			labels = []string{"exec-failed"}
-			if updateErr := store.Update(trackingID, beads.UpdateOpts{Labels: labels}); updateErr != nil {
+			outcome = orders.RunOutcomeExecFailed
+			if updateErr := front.SetOutcome(trackingID, outcome); updateErr != nil {
 				logDispatchError(m.stderr, "gc: order %s: failed to label exec tracking bead %s: %v", scoped, trackingID, updateErr)
 			}
 			m.rec.Record(events.Event{
@@ -1204,14 +1275,14 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, store beads.St
 		redactionEnv := append(os.Environ(), env...)
 		redacted := redactOrderEnvError(err, redactionEnv)
 		execErrMsg = "exec env failed: " + redacted
-		labels = []string{"exec-env-failed"}
+		outcome = orders.RunOutcomeExecEnvFailed
 		logDispatchError(m.stderr, "gc: order exec %s env failed: %s", scoped, redacted)
 	} else {
 		output, err = m.execRun(ctx, a.Exec, target.ScopeRoot, env)
 		if err != nil {
 			redactionEnv := append(os.Environ(), env...)
 			execErrMsg = execenv.RedactText(err.Error(), redactionEnv)
-			labels = []string{"exec-failed"}
+			outcome = orders.RunOutcomeExecFailed
 			logDispatchError(m.stderr, "gc: order exec %s failed: %s", scoped, execErrMsg)
 			if len(output) > 0 {
 				logDispatchError(m.stderr, "gc: order exec %s output: %s", scoped, execenv.RedactText(string(output), redactionEnv))
@@ -1221,7 +1292,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, store beads.St
 
 	// Label tracking bead with outcome via store (not CLI). For event execs,
 	// cursor labels were already persisted before the command ran.
-	if err := store.Update(trackingID, beads.UpdateOpts{Labels: labels}); err != nil {
+	if err := front.SetOutcome(trackingID, outcome); err != nil {
 		logDispatchError(m.stderr, "gc: order %s: failed to label exec tracking bead %s: %v", scoped, trackingID, err)
 		msg := fmt.Sprintf("exec tracking bead %s label failed: %v", trackingID, err)
 		if hasEventCursor {
@@ -1287,7 +1358,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 			Subject: scoped,
 			Message: err.Error(),
 		})
-		store.Update(trackingID, beads.UpdateOpts{Labels: []string{"wisp", "wisp-canceled"}}) //nolint:errcheck // best-effort
+		orders.NewStore(beads.OrdersStore{Store: store}).SetOutcome(trackingID, orders.RunOutcomeWispCanceled) //nolint:errcheck // best-effort
 		return
 	}
 
@@ -1411,7 +1482,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 	})
 
 	// Label tracking bead with outcome.
-	store.Update(trackingID, beads.UpdateOpts{Labels: []string{"wisp"}}) //nolint:errcheck // best-effort
+	orders.NewStore(beads.OrdersStore{Store: store}).SetOutcome(trackingID, orders.RunOutcomeWisp) //nolint:errcheck // best-effort
 }
 
 // orderRigSuspended reports whether the order targets a suspended rig.
@@ -1532,11 +1603,11 @@ func isOrderWispRootCandidate(b beads.Bead) bool {
 	if beads.IsMoleculeType(b.Type) {
 		return true
 	}
-	return b.Metadata[beadmeta.KindMetadataKey] == "workflow" || b.Metadata[beadmeta.KindMetadataKey] == "wisp"
+	return b.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflow || b.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWisp
 }
 
 func isOrderRootOnlyWispCandidate(b beads.Bead) bool {
-	return b.Metadata[beadmeta.KindMetadataKey] == "wisp" && !beads.IsMoleculeType(b.Type)
+	return b.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWisp && !beads.IsMoleculeType(b.Type)
 }
 
 // isTransientNotificationBead reports whether a bead is a short-lived delivery
@@ -1800,6 +1871,13 @@ func (m *memoryOrderDispatcher) hasOpenWorkInStoresStrict(stores []beads.Store, 
 // the rest of the sweep proceeds. Package-level var so it is tunable and
 // overridable in tests.
 var orderGateTimeout = 8 * time.Second
+
+// orderGateBackoffDuration is the suppression window set after a gate timeout,
+// anchored to the actual wall clock at the moment the timeout fires (not the
+// tick-start timestamp). It is intentionally larger than orderGateTimeout so
+// the expensive gate query is genuinely skipped for a bounded span; an equal
+// window would be consumed by the gate itself, yielding no real suppression.
+var orderGateBackoffDuration = 24 * time.Second
 
 // errGateTimeout marks an open-work gate error caused by the per-order
 // bound elapsing (the #2893 contention case), as opposed to ctx cancel or a

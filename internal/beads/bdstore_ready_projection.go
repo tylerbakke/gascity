@@ -99,8 +99,14 @@ func (s *BdStore) fetchReadyProjection(ids []string) (map[string]bool, error) {
 		return result, nil
 	}
 
-	// bd exposes this as a full active-row projection. The ids argument is a
-	// cache-side allow-list so callers can keep their requested surface bounded.
+	// bd exposes this as an active-row projection: the SQL filters out closed
+	// rows so cache prime/reconcile cost stays O(active work) instead of
+	// scanning unbounded closed issue/wisp history every cycle. The ids
+	// argument is a cache-side allow-list so callers can keep their requested
+	// surface bounded. A row that races closed between the list snapshot and
+	// this fetch drops out of the projection; the reconciler preserves its last
+	// cached is_blocked (preserveCachedReadyProjectionLocked) so the absence
+	// does not flap a spurious bead.updated.
 	out, err := s.runner(s.dir, "bd", "sql", readyProjectionSQL(), "--json")
 	if err != nil {
 		return nil, fmt.Errorf("bd sql ready projection: %w", err)

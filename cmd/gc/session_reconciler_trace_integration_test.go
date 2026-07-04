@@ -104,7 +104,7 @@ func TestSessionReconcilerTraceLifecycleRecordsTick(t *testing.T) {
 		},
 		ScaleCheckCounts: map[string]int{"repo/polecat": 1},
 	}
-	cr.beadReconcileTick(context.Background(), result, sessionBeads, cycle)
+	cr.beadReconcileTick(context.Background(), result, sessionBeads, cycle, false)
 	if err := cycle.End(TraceCompletionCompleted, traceRecordPayload{"phase": "tick"}); err != nil {
 		t.Fatalf("cycle.End: %v", err)
 	}
@@ -652,7 +652,7 @@ func TestSessionReconcilerTraceGH1654WorkRequestedStartCandidates(t *testing.T) 
 				stdout:              io.Discard,
 				stderr:              io.Discard,
 			}
-			cr.beadReconcileTick(context.Background(), dsResult, sessionBeads, cycle)
+			cr.beadReconcileTick(context.Background(), dsResult, sessionBeads, cycle, false)
 			if !cr.waitForAsyncStarts() {
 				t.Fatal("async starts did not finish")
 			}
@@ -715,7 +715,7 @@ func createRoutedReadyWork(t *testing.T, store beads.Store, template string, cou
 func createCanonicalPoolSession(t *testing.T, store beads.Store, cfgAgent *config.Agent, now time.Time, slot int) beads.Bead {
 	t.Helper()
 	_, qualifiedInstance := poolInstanceIdentity(cfgAgent, slot, io.Discard)
-	session, err := createPoolSessionBead(store, cfgAgent.QualifiedName(), now, poolSessionCreateIdentity{
+	session, err := createPoolSessionBead(sessionFrontDoor(store), cfgAgent.QualifiedName(), now, poolSessionCreateIdentity{
 		AgentName: qualifiedInstance,
 		Alias:     qualifiedInstance,
 		Slot:      slot,

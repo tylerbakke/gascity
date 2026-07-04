@@ -188,13 +188,19 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 		clearCityDoltConfig(cityPath)
 	}
 	skipLocalDolt := false
-	if cityUsesManagedDoltBeadsLifecycle(cityPath) {
+	switch {
+	case isExternalDolt(cityPath):
+		// An externally-pinned dolt endpoint (city_canonical / explicit, e.g. a
+		// hosted beads-gateway) is not a gc-managed local lifecycle: connect to
+		// the external server, never spawn or adopt a local managed Dolt for it.
+		skipLocalDolt = true
+	case cityUsesManagedDoltBeadsLifecycle(cityPath):
 		owned, err := managedDoltLifecycleOwned(cityPath)
 		if err != nil {
 			return err
 		}
 		skipLocalDolt = !owned
-	} else if cityUsesDoltliteBeadsBackend(cityPath) {
+	case cityUsesDoltliteBeadsBackend(cityPath):
 		skipLocalDolt = true
 	}
 	if !skipLocalDolt {
@@ -254,6 +260,16 @@ func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 			return false, err
 		}
 		if !owned {
+			// An unverified external (hosted) endpoint has no guaranteed
+			// credentials at init time. Write the canonical scope files and
+			// defer the live bd init to gc start, which carries the credential
+			// command; init never requires a live connection (R5).
+			if cityExternalDoltEndpointUnverified(cityPath) {
+				if err := seedDeferredManagedBeadsErr(cityPath, dir, prefix, ""); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
 			if err := initDirIfReadyInitAndHookDir(cityPath, dir, prefix); err != nil {
 				return false, err
 			}
@@ -591,6 +607,14 @@ func allowLegacyDoltMetadataRepair(fs fsys.FS, path string, err error) bool {
 // the helper is safe to call from new sites without re-checking.
 var verifyManagedDoltDatabaseExistsAfterInit = func(cityPath, dir, dbName string) error {
 	if !cityUsesBdStoreContract(cityPath) {
+		return nil
+	}
+	if isExternalDolt(cityPath) {
+		// External/hosted dolt endpoint (e.g. a per-tenant beads-gateway): the
+		// managed-local catalog is irrelevant, and the gateway denies the
+		// SHOW DATABASES catalog listing this guard relies on (it scopes each
+		// connection to its own provisioner-created project DB). Reachability of
+		// that DB is already proven by bd init's own connection.
 		return nil
 	}
 	port := currentResolvableManagedDoltPort(cityPath)

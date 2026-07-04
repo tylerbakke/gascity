@@ -30,7 +30,7 @@ var errTokenMismatch = errors.New("instance token mismatch")
 // Returns the new generation and instance token on success.
 func preWakeCommit(
 	session *beads.Bead,
-	store beads.Store,
+	sessFront *sessions.InfoStore,
 	clk clock.Clock,
 ) (newGen int, token string, err error) {
 	name := session.Metadata["session_name"]
@@ -65,7 +65,7 @@ func preWakeCommit(
 		SleepReason:       sleepReason,
 		FreshWake:         freshWake,
 	})
-	if writeErr := store.SetMetadataBatch(session.ID, batch); writeErr != nil {
+	if writeErr := sessFront.ApplyPatch(session.ID, batch); writeErr != nil {
 		return 0, "", fmt.Errorf("pre-wake metadata commit: %w", writeErr)
 	}
 	traceFreshWakeMetadataReset(name, session.Metadata, batch, freshWake)
@@ -442,6 +442,12 @@ func advanceSessionDrainsWithSessionsTraced(
 	if wakeEvals == nil {
 		wakeEvals = computeWakeEvaluations(sessions, cfg, sp, poolDesired, workSet, readyWaitSet, clk)
 	}
+	// Session front door constructed once from the same store; nil when store is
+	// nil so completeDrain keeps its store==nil short-circuit.
+	sessFront := sessionFrontDoor(store)
+	if store == nil {
+		sessFront = nil
+	}
 	for id, ds := range dt.all() {
 		session := sessionLookup(id)
 		if session == nil {
@@ -476,7 +482,7 @@ func advanceSessionDrainsWithSessionsTraced(
 		}
 		if !running {
 			// Process exited — drain complete.
-			completeDrain(session, store, ds, clk)
+			completeDrain(session, sessFront, ds, clk)
 			dt.clearIdleProbe(id)
 			dt.remove(id)
 			telemetry.RecordDrainTransition(context.Background(), name, ds.reason, "complete")
@@ -511,7 +517,7 @@ func advanceSessionDrainsWithSessionsTraced(
 			}
 		}
 
-		// Cancelation check: if wake reasons reappeared, cancel the in-memory
+		// Cancellation check: if wake reasons reappeared, cancel the in-memory
 		// drain. Orphaned, suspended, and ordinary config-drift drains are not
 		// canceled here.
 		if drainReasonCancelable(ds.reason) {
@@ -563,7 +569,7 @@ func advanceSessionDrainsWithSessionsTraced(
 			}
 		}
 
-		// Pending-interaction guards and wake-based cancelation run before this
+		// Pending-interaction guards and wake-based cancellation run before this
 		// timeout path. Preserve that ordering if this block is refactored.
 		if clk.Now().After(ds.deadline) {
 			// Drain timed out — force stop.
@@ -590,7 +596,7 @@ func advanceSessionDrainsWithSessionsTraced(
 				running = false
 			}
 			if !running {
-				completeDrain(session, store, ds, clk)
+				completeDrain(session, sessFront, ds, clk)
 				dt.clearIdleProbe(id)
 				dt.remove(id)
 				telemetry.RecordDrainTransition(context.Background(), name, ds.reason, "timeout")
@@ -605,10 +611,10 @@ func advanceSessionDrainsWithSessionsTraced(
 }
 
 // completeDrain writes drain-complete metadata to the bead.
-func completeDrain(session *beads.Bead, store beads.Store, ds *drainState, clk clock.Clock) {
+func completeDrain(session *beads.Bead, sessFront *sessions.InfoStore, ds *drainState, clk clock.Clock) {
 	batch := sessions.CompleteDrainPatch(clk.Now(), ds.reason, session.Metadata["wake_mode"] == "fresh")
-	if store != nil {
-		if err := store.SetMetadataBatch(session.ID, batch); err != nil {
+	if sessFront != nil {
+		if err := sessFront.ApplyPatch(session.ID, batch); err != nil {
 			return
 		}
 	}

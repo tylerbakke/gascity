@@ -180,7 +180,7 @@ func doctorOrderFiringCurrentLastRunFunc(cityPath string, cfg *config.City, stde
 		if err != nil {
 			return time.Time{}, err
 		}
-		return orders.LastRunAcrossStores(stores...)(order.ScopedName())
+		return orders.LastRunAcrossStores(unwrapOrdersStores(stores)...)(order.ScopedName())
 	}
 }
 
@@ -230,7 +230,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(doctor.NewServiceSecretsPermsCheck(cfg, cityPath))
 		register(doctor.NewSkillCollisionCheck(cfg, cityPath))
 		register(doctor.NewOrderFiringCurrentCheck(cfg, cityPath, doctor.WithOrderFiringCurrentLastRunFunc(doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, opts.Stderr))))
-		register(newCodexHooksDriftCheck(codexHookWorkDirs(cityPath, cfg)))
+		register(newCodexHooksDriftCheck(cityPath, codexHookWorkDirs(cityPath, cfg)))
 		register(doctor.NewRigPackCoverageCheck(cfg, cityPath))
 		register(newPackRuntimesDoctorCheck(cfg))
 		register(newMCPConfigDoctorCheck(cityPath, cfg, exec.LookPath))

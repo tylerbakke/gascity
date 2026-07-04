@@ -48,6 +48,13 @@ type MaintenanceProvider interface {
 
 // State provides read access to controller-managed state.
 // The controller implements this with RWMutex-protected hot-reload.
+//
+// The per-coordination-class store seam is exposed as named accessors
+// (GraphBeadStore / SessionsBeadStore / NudgesBeadStore) so a future per-class
+// backend becomes a change in the implementation rather than at every call
+// site. Callers that need the store for a specific bead class route through
+// those accessors; on a single-store city every one collapses to the same
+// concrete store CityBeadStore() returns, so they are byte-identical today.
 type State interface {
 	// Config returns the current city config snapshot.
 	Config() *config.City
@@ -99,6 +106,40 @@ type State interface {
 	// CityBeadStore returns the city-level bead store for session beads.
 	// Returns nil if no store is available.
 	CityBeadStore() beads.Store
+
+	// NudgesBeadStore returns the store backing the nudge-queue shadow beads
+	// (gc:nudge). At the default backend this is the same store as
+	// CityBeadStore; when [beads.classes.nudges] is relocated it is the
+	// per-class store, so nudge-shadow ops (e.g. withdrawing wait nudges on
+	// session close/wake) reach the relocated beads instead of orphaning them
+	// on the work store. The strongly-typed beads.NudgesStore return makes the
+	// nudges class statically visible at the call site; its embedded .Store is
+	// nil when no store is available.
+	NudgesBeadStore() beads.NudgesStore
+
+	// SessionsBeadStore returns the store backing session-class beads — session
+	// lifecycle (type=session/gc:session) and durable session waits
+	// (type=gate/gc:wait). At the default backend this is the same store as
+	// CityBeadStore; when [beads.classes.sessions] is relocated it is the
+	// per-class store, so session/wait reads and writes reach the relocated
+	// beads instead of the work store. Session handlers source their store from
+	// here (not CityBeadStore); cross-class WORK-bead reads stay on
+	// CityBeadStore. The strongly-typed beads.SessionStore return makes the
+	// session class statically visible at the call site; its embedded .Store is
+	// nil when no store is available.
+	SessionsBeadStore() beads.SessionStore
+
+	// GraphBeadStore returns the store backing graph-class beads — the formula-v2
+	// execution topology and control lane (molecules, wisps, convoys, control
+	// steps). At the default backend this is the same store as CityBeadStore;
+	// when [beads.classes.graph] is relocated it is the dedicated graph store at
+	// the legacy <cityPath>/.gc/beads.sqlite (SQLite) or the gcg Postgres schema,
+	// so graph reads and writes reach the relocated beads instead of the work
+	// store. This is the class-aware graph leg; cross-class WORK-bead reads stay
+	// on CityBeadStore. The strongly-typed beads.GraphStore return makes the graph
+	// class statically visible at the call site; its embedded .Store is nil when no
+	// store is available.
+	GraphBeadStore() beads.GraphStore
 
 	// Orders returns the current active set of scanned orders.
 	// Returns nil if orders are not configured.
@@ -174,6 +215,7 @@ type ProviderUpdate struct {
 	Env                map[string]string // nil = not set, non-nil = additive merge
 	OptionsSchemaMerge *string
 	OptionsSchema      []config.ProviderOption // nil = not set, non-nil = replace
+	OptionDefaults     map[string]string       // nil = not set, non-nil = additive merge
 }
 
 // RawConfigProvider is optionally implemented by State to provide the
@@ -276,4 +318,33 @@ type StateMutator interface {
 
 	// DisableOrder disables an order via overrides in city.toml.
 	DisableOrder(name, rig string) error
+}
+
+// FormulaMutator is an optional State extension for editing city-local formula
+// sources (separate TOML files under <cityRoot>/formulas, not city.toml). Like
+// StateMutator it is type-asserted by handlers, so a State that does not support
+// formula edits simply does not implement it.
+type FormulaMutator interface {
+	// FormulaSource returns the raw TOML of an editable city-local formula, or
+	// ok=false when no such source exists.
+	FormulaSource(name string) (content []byte, ok bool, err error)
+	// UpsertFormula creates or replaces a city-local formula source. Callers
+	// must validate the content first; the write is atomic and refreshes state.
+	UpsertFormula(name string, content []byte) error
+	// DeleteFormula removes a city-local formula source.
+	DeleteFormula(name string) error
+}
+
+// ConfigWriteSerializer is an optional State extension that runs fn under the
+// per-city config write lock. Pack import add/remove mutate city config files
+// (pack.toml, packs.lock, and sometimes city.toml) outside the
+// configedit.Editor callback shape, so running them through this seam
+// serializes them against the agent/rig/provider/formula mutations that take
+// the same Editor lock — otherwise two concurrent net/http goroutines could
+// interleave load→mutate→write and lose an update or desync manifest and
+// lockfile. Like StateMutator it is type-asserted by handlers; a State that
+// does not implement it runs the mutation without extra serialization.
+type ConfigWriteSerializer interface {
+	// SerializeConfigWrite runs fn while holding the per-city config write lock.
+	SerializeConfigWrite(fn func() error) error
 }

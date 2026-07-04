@@ -6,6 +6,7 @@ package graphroute
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
@@ -76,14 +77,11 @@ type graphStepTarget struct {
 }
 
 // IsControlDispatcherKind reports whether a gc.kind value is a control-
-// dispatcher kind (routed to the control dispatcher agent).
+// dispatcher kind (routed to the control dispatcher agent). This is exactly
+// beadmeta.ControlKinds: every kind the ProcessControl switch executes is
+// routed to the control dispatcher.
 func IsControlDispatcherKind(kind string) bool {
-	switch kind {
-	case "check", "drain", "fanout", "retry-eval", "scope-check", "workflow-finalize", "retry", "ralph":
-		return true
-	default:
-		return false
-	}
+	return beadmeta.IsControlKind(kind)
 }
 
 // IsWorkflowTopologyKind reports whether a gc.kind value identifies a
@@ -91,12 +89,7 @@ func IsControlDispatcherKind(kind string) bool {
 // Routing never lands on these — they exist to structure the graph, not
 // to be claimed by an agent.
 func IsWorkflowTopologyKind(kind string) bool {
-	switch kind {
-	case "workflow", "scope", "spec":
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(beadmeta.WorkflowTopologyKinds, kind)
 }
 
 // IsCompiledGraphWorkflow reports whether a compiled recipe is a graph.v2
@@ -106,7 +99,7 @@ func IsCompiledGraphWorkflow(recipe *formula.Recipe) bool {
 		return false
 	}
 	root := recipe.Steps[0]
-	return root.Metadata[beadmeta.KindMetadataKey] == "workflow" && root.Metadata[beadmeta.FormulaContractMetadataKey] == "graph.v2"
+	return root.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflow && root.Metadata[beadmeta.FormulaContractMetadataKey] == beadmeta.FormulaContractGraphV2
 }
 
 // GraphWorkflowRouteVars builds the route variable map by merging recipe
@@ -326,27 +319,26 @@ func resolveControlDispatcherBinding(_ beads.Store, _ string, cfg *config.City, 
 	if deps.Resolver == nil {
 		return GraphRouteBinding{}, fmt.Errorf("ResolveAgent not configured")
 	}
-	agentCfg, ok := deps.Resolver.ResolveAgent(cfg, config.ControlDispatcherAgentName, rigContext)
-	if !ok {
-		agentCfg, ok = configuredControlDispatcherForScope(cfg, rigContext)
+	// Primary lookup: find the deterministic control-dispatcher directly, by
+	// behavior (IsDeterministicControlDispatcher) rather than bare-name string
+	// match. Since 9fa6b7fec the dispatcher ships bound (core.control-dispatcher),
+	// so AgentMatchesIdentity rejects the bare-name fallback for it and the
+	// per-rig fleet makes the bare-name scan ambiguous — both break a
+	// Resolver-based lookup. PreferredDeterministicControlDispatcher prefers the
+	// city-level singleton (Dir == "") across every scope, keeping the stamped
+	// route on the one session that actually runs (max_active_sessions=1) and
+	// curing the stranded-control-bead.
+	if agentCfg, ok := config.PreferredDeterministicControlDispatcher(cfg, rigContext); ok {
+		return GraphRouteBinding{QualifiedName: agentCfg.QualifiedName(), MetadataOnly: true}, nil
 	}
+	// Fallback for configs without a deterministic dispatcher (e.g. a plain
+	// control-dispatcher agent carrying no convoy-control StartCommand): defer
+	// to the name-based resolver path, preserving the rig-context preference.
+	agentCfg, ok := deps.Resolver.ResolveAgent(cfg, config.ControlDispatcherAgentName, rigContext)
 	if !ok {
 		return GraphRouteBinding{}, fmt.Errorf("control-dispatcher agent %q not found", config.ControlDispatcherAgentName)
 	}
 	return GraphRouteBinding{QualifiedName: agentCfg.QualifiedName(), MetadataOnly: true}, nil
-}
-
-func configuredControlDispatcherForScope(cfg *config.City, rigContext string) (config.Agent, bool) {
-	rigContext = strings.TrimSpace(rigContext)
-	for _, a := range cfg.Agents {
-		if !config.IsDeterministicControlDispatcher(&a) {
-			continue
-		}
-		if strings.TrimSpace(a.Dir) == rigContext {
-			return a, true
-		}
-	}
-	return config.Agent{}, false
 }
 
 // ResolveGraphStepBinding resolves the routing binding for a graph step

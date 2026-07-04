@@ -36,12 +36,21 @@ import (
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
-// controllerState implements api.State and api.StateMutator.
+// controllerState implements api.State, api.StateMutator, and
+// api.ConfigWriteSerializer.
 // Protected by an RWMutex for hot-reload: readers take RLock,
 // the controller loop takes Lock when updating cfg/sp/stores.
 type controllerState struct {
-	mu                     sync.RWMutex
-	cfg                    *config.City
+	mu  sync.RWMutex
+	cfg *config.City
+	// rawCfg is the raw (pre-expansion, site-bound) config snapshot captured
+	// at the same generation as cfg. It is the basis the mutation gate uses
+	// (Editor.UpdateAgent → AgentOrigin), cached here so provenance reads
+	// (pack_derived on GET /agents) agree with the 409 gate without
+	// re-parsing city.toml per request. Refreshed on every cfg swap; left
+	// at its prior value if a refresh load fails so the read never falls
+	// back to a nil-raw heuristic on a transient error.
+	rawCfg                 *config.City
 	sp                     runtime.Provider
 	cacheCtx               context.Context
 	beadStores             map[string]beads.Store
@@ -138,6 +147,10 @@ func newControllerState(
 		beadEventStartSeq: beadEventStartSeq,
 	}
 	cs.beadStores = cs.buildStores(cfg)
+	// Capture the initial raw config snapshot so provenance reads before the
+	// first reload still use the gate's basis. nil is tolerated: RawConfig
+	// lazily retries on the first read.
+	cs.rawCfg = cs.loadRawSnapshot()
 	// Open city-level store for session beads and mail (best-effort).
 	if opened, err := newControllerStateOpenCityStore(cityPath); err != nil {
 		fmt.Fprintf(os.Stderr, "api: city bead store: %v (session/mail endpoints disabled)\n", err)
@@ -145,7 +158,7 @@ func newControllerState(
 		store := opened.Store
 		cs.cityBeadStore = wrapWithCachingStore(ctx, store, ep, true)
 		cs.cityBeadsDiagnostic = diagnosticPtr(opened.Diagnostic)
-		cs.cityMailProv = newMailProvider(cs.cityBeadStore)
+		cs.cityMailProv = newCityMailProvider(cs.cityBeadStore, cfg, cityPath, ep)
 		svc := extmsg.NewServices(cs.cityBeadStore)
 		cs.extmsgSvc = &svc
 	}
@@ -514,10 +527,16 @@ func (cs *controllerState) runBeadCloseAutoclose(beadID string, store beads.Stor
 	if cs.eventProv != nil {
 		rec = cs.eventProv
 	}
+	// The just-closed bead is read from its owning store (store), but its
+	// molecule and wisp GRAPH parents live in the graph-class store, so the
+	// graph-root walks resolve through graphBeadStore() rather than assuming
+	// co-residence with the closed bead. On a single-store city GraphBeadStore()
+	// returns the same store, so this is identity today.
+	graphStore := cs.GraphBeadStore()
 	beadCloseAutocloseDispatch(func() {
 		doConvoyAutocloseWith(store, rec, beadID, os.Stderr, os.Stderr)
-		doWispAutocloseWith(store, beadID, os.Stderr)
-		doMoleculeAutocloseWith(store, storeRef, rec, beadID, os.Stderr)
+		doWispAutocloseWith(store, beadID, os.Stderr, graphStore.Store)
+		doMoleculeAutocloseWith(store, storeRef, rec, beadID, os.Stderr, graphStore.Store)
 	})
 }
 
@@ -542,6 +561,25 @@ func (cs *controllerState) beadEventStoresLocked(evt events.Event) []beads.Store
 }
 
 func (cs *controllerState) beadEventConfiguredStoreLocked(id string) (beads.Store, bool) {
+	// A configured prefix owns the id even when its store is not loaded: the
+	// caller treats a (nil, true) result as "owned but absent here" and skips
+	// the all-stores fallback, so nil stores are passed in as candidates.
+	//
+	// The candidate set is class-tagged: the city store under the HQ prefix is
+	// the graph/sessions/mail/nudge/order class store, and each rig store under
+	// its rig prefix is that rig's work-class store. On a single-store city these
+	// all collapse to the same value, so the resolution is identical today; the
+	// tagging marks where a future per-class backend would diverge. These read
+	// the raw cs fields rather than the class accessors (graphBeadStore /
+	// workBeadStores) because this runs under cs.mu and those accessors take the
+	// same lock.
+	//
+	// The scan is a longest-prefix, namespace-only ("prefix-") match over the
+	// configured prefixes, returning known=true when a configured prefix owns id
+	// even if that prefix's store is not loaded (matchedStore stays nil). That
+	// owned-but-unloaded signal is the call-site contract — the caller suppresses
+	// the all-stores fallback on known — so the scan resolves against the
+	// configured prefixes inline rather than each store's own IDPrefix.
 	var matchedStore beads.Store
 	matchedLen := -1
 	match := func(prefix string, store beads.Store) {
@@ -582,6 +620,9 @@ func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	// Build new stores outside the lock (may do file I/O / subprocess spawns).
 	stores := cs.buildStores(cfg)
 	storeSignature := storeMetadataSignature(cs.cityPath, cfg)
+	// Capture the raw config from the same on-disk generation as cfg, outside
+	// the lock (it does a TOML parse). nil signals "keep the prior snapshot".
+	rawCfg := cs.loadRawSnapshot()
 	// Recompute the usage sink so a changed [usage].provider takes effect on
 	// reload instead of writing to the old sink until the controller restarts.
 	usageSink := usageSinkForCity(cfg, cs.cityPath)
@@ -596,7 +637,7 @@ func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	var extSvc *extmsg.Services
 	if cityStore != nil {
 		cityStore = wrapWithCachingStore(cs.cacheCtx, cityStore, cs.eventProv, true)
-		cityMailProv = newMailProvider(cityStore)
+		cityMailProv = newCityMailProvider(cityStore, cfg, cs.cityPath, cs.eventProv)
 		svc := extmsg.NewServices(cityStore)
 		extSvc = &svc
 	}
@@ -606,6 +647,9 @@ func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	var oldRigStores map[string]beads.Store
 	cs.mu.Lock()
 	cs.cfg = cfg
+	if rawCfg != nil {
+		cs.rawCfg = rawCfg
+	}
 	cs.sp = sp
 	cs.usageSink = usageSink
 	oldRigStores = cs.beadStores
@@ -730,8 +774,12 @@ func (cs *controllerState) updateConfigAndProviderOnly(cfg *config.City, sp runt
 	// Recompute the usage sink so a changed [usage].provider takes effect even on
 	// the store-reuse reload path.
 	usageSink := usageSinkForCity(cfg, cs.cityPath)
+	rawCfg := cs.loadRawSnapshot()
 	cs.mu.Lock()
 	cs.cfg = cfg
+	if rawCfg != nil {
+		cs.rawCfg = rawCfg
+	}
 	cs.sp = sp
 	cs.usageSink = usageSink
 	cs.mu.Unlock()
@@ -1079,14 +1127,21 @@ func (cs *controllerState) ClearCrashHistory(sessionName string) {
 	ct.clearHistory(sessionName)
 }
 
-// RawConfig returns the raw (pre-expansion) config for provenance detection.
-// Implements api.RawConfigProvider.
-//
-// Holds cs.mu.RLock during the load to ensure the raw config is from the
-// same generation as the expanded cs.cfg snapshot.
-func (cs *controllerState) RawConfig() *config.City {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
+// loadRawSnapshot loads the raw (pre-expansion, site-bound) config using the
+// same basis as the mutation gate (Editor.UpdateAgent → AgentOrigin), so a
+// cached snapshot drives provenance reads that must agree with the
+// ErrPackDerived/409 gate. Returns nil on any load error; callers treat nil as
+// "keep the previous snapshot" rather than poisoning the cache. Does no
+// locking — call it outside cs.mu (it does TOML I/O).
+func (cs *controllerState) loadRawSnapshot() *config.City {
+	if cs.editor != nil {
+		if raw, err := cs.editor.LoadRaw(); err == nil {
+			return raw
+		}
+		return nil
+	}
+	// Defensive fallback for states constructed without an editor (e.g. some
+	// tests): load directly. Still nil-on-error.
 	tomlPath := filepath.Join(cs.cityPath, "city.toml")
 	raw, err := config.Load(fsys.OSFS{}, tomlPath)
 	if err != nil {
@@ -1095,11 +1150,84 @@ func (cs *controllerState) RawConfig() *config.City {
 	return raw
 }
 
+// RawConfig returns the cached raw (pre-expansion) config for provenance
+// detection. Implements api.RawConfigProvider.
+//
+// The snapshot is captured at every cfg swap from the same on-disk generation
+// as cs.cfg, so reads are O(1) (no per-request TOML parse) and agree with the
+// mutation gate. If a swap-time load failed, the prior snapshot is retained,
+// and on the very first reads before any swap-time capture it falls back to a
+// one-time load so provenance is never decided on a nil-raw heuristic.
+func (cs *controllerState) RawConfig() *config.City {
+	cs.mu.RLock()
+	cached := cs.rawCfg
+	cs.mu.RUnlock()
+	if cached != nil {
+		return cached
+	}
+	// First-read fallback: no snapshot captured yet. Load once and memoize so
+	// the read path still uses the gate's basis rather than nil.
+	raw := cs.loadRawSnapshot()
+	if raw == nil {
+		return nil
+	}
+	cs.mu.Lock()
+	if cs.rawCfg == nil {
+		cs.rawCfg = raw
+	}
+	cached = cs.rawCfg
+	cs.mu.Unlock()
+	return cached
+}
+
 // CityBeadStore returns the city-level bead store for session beads.
 func (cs *controllerState) CityBeadStore() beads.Store {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	return cs.cityBeadStore
+}
+
+// NudgesBeadStore returns the store backing the nudge-queue shadow beads. At the
+// default backend resolveNudgesStore returns cityBeadStore, so this is byte-identical
+// to CityBeadStore; when [beads.classes.nudges] is relocated it returns the per-class
+// store. cs.eventProv is the recorder (an events.Recorder), matching how the city mail
+// store is wired (newCityMailProvider), so relocated writes through this store emit
+// bead.* exactly like the controller's own nudge writes. The result is wrapped in the
+// strongly-typed beads.NudgesStore so the nudges class is statically visible to callers;
+// the wrapper carries the same underlying store value, so runtime behavior is unchanged.
+func (cs *controllerState) NudgesBeadStore() beads.NudgesStore {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return beads.NudgesStore{Store: resolveNudgesStore(cs.cityBeadStore, cs.cfg, cs.cityPath, cs.eventProv)}
+}
+
+// SessionsBeadStore returns the store backing session-class beads. At the default
+// backend resolveSessionStore returns cityBeadStore, so this is byte-identical to
+// CityBeadStore; when [beads.classes.sessions] is relocated it returns the per-class
+// store. cs.eventProv is the recorder, matching the nudges/mail wiring, so relocated
+// session writes emit bead.* exactly like the controller's own session writes. The
+// result is wrapped in the strongly-typed beads.SessionStore so the session class is
+// statically visible to callers; the wrapper carries the same underlying store value,
+// so runtime behavior is unchanged.
+func (cs *controllerState) SessionsBeadStore() beads.SessionStore {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return beads.SessionStore{Store: resolveSessionStore(cs.cityBeadStore, cs.cfg, cs.cityPath, cs.eventProv)}
+}
+
+// GraphBeadStore returns the store backing graph-class beads. At the default backend
+// resolveGraphStore returns cityBeadStore, so this is byte-identical to CityBeadStore;
+// when [beads.classes.graph] is relocated it returns the dedicated graph store at the
+// legacy .gc/beads.sqlite location (or the gcg Postgres schema). cs.eventProv is
+// passed for signature parity with the other accessors but is ignored by
+// resolveGraphStore: the graph store stays event-silent, matching the prior Router
+// graph leg. The result is wrapped in the strongly-typed beads.GraphStore so the
+// graph class is statically visible to callers; the wrapper carries the same
+// underlying store value, so runtime behavior is unchanged.
+func (cs *controllerState) GraphBeadStore() beads.GraphStore {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return beads.GraphStore{Store: resolveGraphStore(cs.cityBeadStore, cs.cfg, cs.cityPath, cs.eventProv)}
 }
 
 // CityBeadsDiagnostic returns the city-level bead store selection diagnostic.
@@ -1171,6 +1299,18 @@ func (cs *controllerState) DisableOrder(name, rig string) error {
 	})
 }
 
+// SerializeConfigWrite runs fn under the same per-city mutation lock the
+// configedit.Editor uses for agent/rig/provider/formula edits. The HTTP pack
+// import add/remove handlers write pack.toml, packs.lock, and sometimes
+// city.toml outside the Editor callback shape, so routing them through this
+// shared lock keeps concurrent config writers from interleaving and losing an
+// update or desyncing the manifest and lockfile.
+func (cs *controllerState) SerializeConfigWrite(fn func() error) error {
+	return cs.editor.Do(fn)
+}
+
+var _ api.ConfigWriteSerializer = (*controllerState)(nil)
+
 // SuspendAgent writes suspended=true to durable agent config.
 // Uses configedit.Editor for provenance-aware edit (inline vs discovered vs patch).
 func (cs *controllerState) SuspendAgent(name string) error {
@@ -1231,6 +1371,82 @@ func (cs *controllerState) CreateAgent(a config.Agent) error {
 	return cs.mutateAndPoke(func() error {
 		return cs.editor.CreateAgent(a)
 	})
+}
+
+// FormulaSource returns the raw TOML of an editable city-local formula. It is a
+// read, so it does not refresh or poke.
+func (cs *controllerState) FormulaSource(name string) ([]byte, bool, error) {
+	return cs.editor.FormulaSource(name)
+}
+
+// UpsertFormula creates or replaces a city-local formula source, then refreshes
+// the config snapshot so the new formula is re-discovered (FormulaLayers is
+// recomputed during composition) and pokes the reconciler. If the post-write
+// refresh fails, the prior on-disk source is restored so the file write does not
+// outlive a rolled-back mutation. A rollback that itself fails (a double fault)
+// is joined into the returned error rather than swallowed, mirroring the
+// snapshot-restore discipline in mutateAndPoke, so disk-vs-memory divergence is
+// never silent. If a prior source exists but cannot be read, the mutation aborts
+// before any write, since rollback would have no basis to restore it.
+func (cs *controllerState) UpsertFormula(name string, content []byte) error {
+	// The read-prior -> write -> refresh -> rollback sequence is not atomic across
+	// concurrent editor ops (the pre-existing mutateAndPoke rollback race class):
+	// a same-name racing upsert could see this rollback's delete-on-no-prior erase
+	// its committed file. Very low risk on a single-operator control plane; a
+	// coarse per-city mutation lock is deferred as out of scope for this change.
+	prior, hadPrior, readErr := cs.editor.FormulaSource(name)
+	if readErr != nil {
+		// FormulaSource reports a missing source as (nil, false, nil); a non-nil
+		// error means a prior source exists but is unreadable. Treating that as
+		// absent would let a refresh failure delete or overwrite the only
+		// restorable copy, so abort before mutating.
+		return fmt.Errorf("reading prior formula %q before upsert: %w", name, readErr)
+	}
+	err := cs.mutateAndPoke(func() error {
+		return cs.editor.UpsertFormula(name, content)
+	})
+	if err != nil {
+		var rollbackErr error
+		if hadPrior {
+			rollbackErr = cs.editor.UpsertFormula(name, prior)
+		} else {
+			// No prior file existed, so the desired rollback post-state is
+			// "absent". A brand-new write that faulted before creating the file
+			// leaves nothing to delete, and DeleteFormula then returns
+			// ErrNotFound — that desired state, not a rollback failure. Joining it
+			// would let mutationError map the create's real infrastructure or
+			// validation failure to HTTP 404, masking the true error class, so
+			// treat ErrNotFound here as a satisfied rollback.
+			if rb := cs.editor.DeleteFormula(name); rb != nil && !errors.Is(rb, configedit.ErrNotFound) {
+				rollbackErr = rb
+			}
+		}
+		if rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("rolling back formula %q write: %w", name, rollbackErr))
+		}
+	}
+	return err
+}
+
+// DeleteFormula removes a city-local formula source and refreshes state. A failed
+// refresh restores the prior source; a restore that itself fails is joined into
+// the returned error rather than swallowed. If the prior source exists but cannot
+// be read, the delete aborts before mutating, since rollback would have no basis
+// to restore it.
+func (cs *controllerState) DeleteFormula(name string) error {
+	prior, hadPrior, readErr := cs.editor.FormulaSource(name)
+	if readErr != nil {
+		return fmt.Errorf("reading prior formula %q before delete: %w", name, readErr)
+	}
+	err := cs.mutateAndPoke(func() error {
+		return cs.editor.DeleteFormula(name)
+	})
+	if err != nil && hadPrior {
+		if rollbackErr := cs.editor.UpsertFormula(name, prior); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("rolling back formula %q delete: %w", name, rollbackErr))
+		}
+	}
+	return err
 }
 
 // WaitForAgentVisibility blocks until findAgent in the controller's hot-reloaded
@@ -1356,6 +1572,7 @@ func (cs *controllerState) UpdateProvider(name string, patch api.ProviderUpdate)
 			Env:                patch.Env,
 			OptionsSchemaMerge: patch.OptionsSchemaMerge,
 			OptionsSchema:      patch.OptionsSchema,
+			OptionDefaults:     patch.OptionDefaults,
 		})
 	})
 }

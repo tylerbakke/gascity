@@ -333,7 +333,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 				return 1
 			}
 
-			titleDone := maybeAutoTitle(store, info.ID, title, titleHint, titleProvider, info.WorkDir, stderr)
+			titleDone := maybeAutoTitle(sessionFrontDoor(store), info.ID, title, titleHint, titleProvider, info.WorkDir, stderr)
 			defer func() { <-titleDone }() // ensure title goroutine completes on all exit paths
 
 			// Poke again after bead creation to trigger immediate reconciler tick.
@@ -367,7 +367,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 
 			// Wait for the reconciler to start the session before attaching.
 			fmt.Fprintln(stdout, "Waiting for session to start...") //nolint:errcheck // best-effort stdout
-			if waitErr := waitForSession(sp, info.SessionName, waitTimeout, store, info.ID, stderr); waitErr != nil {
+			if waitErr := waitForSession(sp, info.SessionName, waitTimeout, sessionFrontDoor(store), info.ID, stderr); waitErr != nil {
 				fmt.Fprintf(stderr, "gc session new: %v\n", waitErr) //nolint:errcheck // best-effort stderr
 				return 1
 			}
@@ -447,7 +447,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 		return 1
 	}
 
-	titleDone := maybeAutoTitle(store, info.ID, title, titleHint, titleProvider, info.WorkDir, stderr)
+	titleDone := maybeAutoTitle(sessionFrontDoor(store), info.ID, title, titleHint, titleProvider, info.WorkDir, stderr)
 	defer func() { <-titleDone }() // ensure title goroutine completes on all exit paths
 
 	if jsonOutput {
@@ -518,8 +518,8 @@ func newSessionStoredMCPMetadata(
 // channel that is closed when background title generation completes.
 // Short-lived CLI paths (e.g. --no-attach) should block on it before
 // exiting to ensure the model-refined title is persisted.
-func maybeAutoTitle(store beads.Store, beadID, userTitle, titleHint string, provider *config.ResolvedProvider, workDir string, stderr io.Writer) <-chan struct{} {
-	return api.MaybeGenerateTitleAsync(store, beadID, userTitle, titleHint, provider, workDir, func(format string, args ...any) {
+func maybeAutoTitle(sessFront *session.InfoStore, beadID, userTitle, titleHint string, provider *config.ResolvedProvider, workDir string, stderr io.Writer) <-chan struct{} {
+	return api.MaybeGenerateTitleAsync(sessFront.Store().Store, beadID, userTitle, titleHint, provider, workDir, func(format string, args ...any) {
 		fmt.Fprintf(stderr, "session %s: "+format+"\n", append([]any{beadID}, args...)...) //nolint:errcheck // best-effort stderr
 	})
 }
@@ -658,7 +658,7 @@ func sessionNewAliasOwner(cfg *config.City, agent *config.Agent) string {
 // waitForSession polls the provider until the session is running or timeout.
 // If a bead store is provided, it checks for early failure (bead transitioned
 // to "closed" state) and logs progress every 5 seconds.
-func waitForSession(sp runtime.Provider, sessionName string, timeout time.Duration, store beads.Store, beadID string, stderr io.Writer) error {
+func waitForSession(sp runtime.Provider, sessionName string, timeout time.Duration, sessFront *session.InfoStore, beadID string, stderr io.Writer) error {
 	deadline := time.Now().Add(timeout)
 	lastProgress := time.Now()
 	for time.Now().Before(deadline) {
@@ -666,8 +666,8 @@ func waitForSession(sp runtime.Provider, sessionName string, timeout time.Durati
 			return nil
 		}
 		// Check for early failure: bead closed or stuck in creating.
-		if store != nil && beadID != "" {
-			if b, err := store.Get(beadID); err == nil {
+		if sessFront != nil && beadID != "" {
+			if b, err := sessFront.Store().Get(beadID); err == nil {
 				if b.Status == "closed" {
 					return fmt.Errorf("session %q failed to start (bead %s closed)", sessionName, beadID)
 				}
@@ -1628,7 +1628,7 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 			// Controller is running — metadata-only suspend.
 			// Set held_until far in the future so the reconciler drains/stops the session.
 			heldUntil := time.Now().Add(indefiniteHoldDuration).UTC().Format(time.RFC3339)
-			if err := store.SetMetadataBatch(sessionID, map[string]string{
+			if err := sessionFrontDoor(store).ApplyPatch(sessionID, map[string]string{
 				"held_until":   heldUntil,
 				"sleep_intent": "user-hold",
 				"state":        "suspended",
@@ -2206,6 +2206,10 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 	return cmd
 }
 
+// sessionKillPokeController is a mutable global test seam over pokeController.
+// Tests that swap it MUST NOT call t.Parallel().
+var sessionKillPokeController = pokeController
+
 // cmdSessionKill is the CLI entry point for "gc session kill".
 func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
 	asJSON := sessionJSONRequested(jsonOutput)
@@ -2259,6 +2263,31 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 	}
 	if killErr != nil {
 		fmt.Fprintf(stderr, "gc session kill: warning: session %s runtime was already inactive; cleared named-session circuit breaker\n", sessionID) //nolint:errcheck // best-effort stderr
+	}
+
+	// Sync the bead to asleep so a later `gc session wake` / reconcile starts
+	// a fresh runtime instead of short-circuiting on the stale live state the
+	// kill leaves behind (#3629). Written here at the CLI layer rather than in
+	// Manager.Kill so the drain-ack async-stop path (verifiedStop ->
+	// handle.Kill -> Manager.Kill) keeps owning its own lifecycle state.
+	if beadErr == nil {
+		now := time.Now().UTC()
+		patch := session.SleepPatch(now, "killed")
+		patch["synced_at"] = now.Format(time.RFC3339)
+		if err := store.SetMetadataBatch(sessionID, patch); err != nil {
+			fmt.Fprintf(stderr, "gc session kill: warning: syncing session %s to asleep: %v\n", sessionID, err) //nolint:errcheck // best-effort stderr
+		}
+	}
+
+	// Poke the controller after the asleep sync so the reconciler observes the
+	// killed state immediately instead of waiting a full patrol interval to
+	// revive an always-named session (#3812), the same poke-after-state-write
+	// approach the drain-ack path uses (doRuntimeDrainAck). Best-effort and
+	// unconditional: a poke failure (e.g. no controller running) is non-fatal,
+	// and a spurious poke when the asleep sync was skipped is harmless — the
+	// reconciler observes unchanged state and continues.
+	if err := sessionKillPokeController(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc session kill: warning: poke failed: %v\n", err) //nolint:errcheck // best-effort stderr
 	}
 
 	// Use the resolved session ID as the canonical Subject for event

@@ -5,7 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/configedit"
@@ -164,6 +167,58 @@ func TestEdit_SetsAgentSuspended(t *testing.T) {
 	t.Error("mayor not found after edit")
 }
 
+// TestDo_SerializesConcurrentCalls proves Editor.Do runs its callbacks under
+// the same mutex as Edit, so a config-write surface that runs outside the
+// load→mutate→write shape (pack import add/remove) never overlaps another
+// mutation of the same city. If Do did not lock, the concurrent callbacks would
+// observe more than one in-flight at once.
+func TestDo_SerializesConcurrentCalls(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	var inFlight, overlaps, ran int32
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = ed.Do(func() error {
+				if atomic.AddInt32(&inFlight, 1) != 1 {
+					atomic.StoreInt32(&overlaps, 1)
+				}
+				time.Sleep(time.Millisecond)
+				atomic.AddInt32(&ran, 1)
+				atomic.AddInt32(&inFlight, -1)
+				return nil
+			})
+		}()
+	}
+	wg.Wait()
+
+	if overlaps != 0 {
+		t.Fatal("Editor.Do allowed concurrent callbacks to overlap; the lock did not serialize")
+	}
+	if ran != 32 {
+		t.Fatalf("ran = %d, want 32", ran)
+	}
+}
+
+// TestDo_PropagatesResult confirms Do surfaces the callback's error unchanged.
+func TestDo_PropagatesResult(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	sentinel := errors.New("boom")
+	if err := ed.Do(func() error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Fatalf("Do error = %v, want %v", err, sentinel)
+	}
+	if err := ed.Do(func() error { return nil }); err != nil {
+		t.Fatalf("Do(nil) = %v, want nil", err)
+	}
+}
+
 func TestEdit_ValidationFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, minimalCity())
@@ -295,6 +350,33 @@ func TestAgentOrigin_Inline(t *testing.T) {
 	origin := configedit.AgentOrigin(cfg, cfg, "mayor")
 	if origin != configedit.OriginInline {
 		t.Errorf("got %v, want OriginInline", origin)
+	}
+}
+
+// TestLoadRaw_MatchesGateBasis verifies Editor.LoadRaw returns the same raw
+// (pre-expansion, site-bound) config the mutation gate uses. The read path's
+// provenance must be computed from this exact basis so pack_derived agrees
+// with the ErrPackDerived/409 gate (Editor.UpdateAgent → AgentOrigin).
+func TestLoadRaw_MatchesGateBasis(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	raw, err := ed.LoadRaw()
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	if raw == nil {
+		t.Fatal("LoadRaw returned nil config")
+	}
+	// minimalCity declares "mayor" inline. AgentOrigin computed against the
+	// LoadRaw basis must agree it is inline (not pack-derived), which is the
+	// exact decision the 409 gate makes.
+	if got := configedit.AgentOrigin(raw, raw, "mayor"); got != configedit.OriginInline {
+		t.Errorf("AgentOrigin(LoadRaw) = %v, want OriginInline", got)
+	}
+	if len(raw.Agents) != 1 || raw.Agents[0].Name != "mayor" {
+		t.Errorf("LoadRaw agents = %+v, want single inline mayor", raw.Agents)
 	}
 }
 
@@ -2287,6 +2369,118 @@ func TestUpdateProvider_PreservesUnchangedFields(t *testing.T) {
 	}
 	if got.DisplayName != "Custom Agent" {
 		t.Errorf("display_name was lost: %q", got.DisplayName)
+	}
+}
+
+// cityWithModelProvider returns a city.toml with a custom provider whose
+// options_schema declares model + permission_mode, so option_defaults for
+// those keys pass schema validation.
+func cityWithModelProvider() string {
+	return `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+provider = "custom"
+
+[providers.custom]
+command = "custom-cli"
+
+[[providers.custom.options_schema]]
+key = "model"
+label = "Model"
+type = "select"
+default = "x"
+
+  [[providers.custom.options_schema.choices]]
+  value = "x"
+  label = "X"
+  flag_args = ["--model", "x"]
+
+  [[providers.custom.options_schema.choices]]
+  value = "y"
+  label = "Y"
+  flag_args = ["--model", "y"]
+
+[[providers.custom.options_schema]]
+key = "permission_mode"
+label = "Permission Mode"
+type = "select"
+default = "plan"
+
+  [[providers.custom.options_schema.choices]]
+  value = "plan"
+  label = "Plan"
+  flag_args = ["--permission-mode", "plan"]
+
+  [[providers.custom.options_schema.choices]]
+  value = "unrestricted"
+  label = "Unrestricted"
+  flag_args = ["--dangerously-skip-permissions"]
+`
+}
+
+// TestCreateProvider_OptionDefaults verifies a create with an option_defaults
+// map (e.g. model) round-trips to the provider's TOML.
+func TestCreateProvider_OptionDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	spec := config.ProviderSpec{
+		Command: "custom-cli",
+		OptionsSchema: []config.ProviderOption{{
+			Key:   "model",
+			Label: "Model",
+			Type:  "select",
+			Choices: []config.OptionChoice{
+				{Value: "x", Label: "X", FlagArgs: []string{"--model", "x"}},
+				{Value: "y", Label: "Y", FlagArgs: []string{"--model", "y"}},
+			},
+		}},
+		OptionDefaults: map[string]string{"model": "x"},
+	}
+	if err := ed.CreateProvider("myprov", spec); err != nil {
+		t.Fatalf("CreateProvider: %v", err)
+	}
+
+	cfg := readTOML(t, path)
+	got := cfg.Providers["myprov"]
+	if got.OptionDefaults["model"] != "x" {
+		t.Errorf("OptionDefaults[model] = %q, want %q", got.OptionDefaults["model"], "x")
+	}
+}
+
+// TestUpdateProvider_OptionDefaultsMergeNotReplace verifies that updating
+// option_defaults merges keys: a model-only edit changes model while leaving
+// a pre-existing unrelated option-default key untouched.
+func TestUpdateProvider_OptionDefaultsMergeNotReplace(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, cityWithModelProvider())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	// Seed a provider with two option defaults.
+	if err := ed.UpdateProvider("custom", configedit.ProviderUpdate{
+		OptionDefaults: map[string]string{"model": "x", "permission_mode": "unrestricted"},
+	}); err != nil {
+		t.Fatalf("seed UpdateProvider: %v", err)
+	}
+
+	// Edit only model; permission_mode must survive.
+	if err := ed.UpdateProvider("custom", configedit.ProviderUpdate{
+		OptionDefaults: map[string]string{"model": "y"},
+	}); err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+
+	cfg := readTOML(t, path)
+	got := cfg.Providers["custom"]
+	if got.OptionDefaults["model"] != "y" {
+		t.Errorf("OptionDefaults[model] = %q, want %q", got.OptionDefaults["model"], "y")
+	}
+	if got.OptionDefaults["permission_mode"] != "unrestricted" {
+		t.Errorf("OptionDefaults[permission_mode] = %q, want %q (merge, not replace)",
+			got.OptionDefaults["permission_mode"], "unrestricted")
 	}
 }
 

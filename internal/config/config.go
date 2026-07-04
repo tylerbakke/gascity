@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/BurntSushi/toml"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/orders"
@@ -89,6 +90,41 @@ func IsDeterministicControlDispatcher(agent *Agent) bool {
 		strings.TrimSpace(agent.StartCommand) != "" &&
 		strings.TrimSpace(agent.Provider) == "" &&
 		strings.Contains(agent.StartCommand, "convoy control --serve")
+}
+
+// PreferredDeterministicControlDispatcher returns the deterministic control-
+// dispatcher to route a scope's control beads to, binding-agnostic. The
+// city-level singleton (Dir == "") is preferred for every scope — given
+// max_active_sessions=1, it is the one whose session actually runs and claims
+// the control queue — and a rig-scoped instance (Dir == rigContext) is used only
+// when no city-level deterministic dispatcher is configured. Routing to a
+// rig-scoped copy when a city singleton exists strands the control bead, since
+// the singleton session never claims a <rig>/... route. This is the canonical
+// selection shared by the graph.v2 decoration path (internal/graphroute) and the
+// attempt-time control re-route path (internal/dispatch); keep them in lockstep.
+func PreferredDeterministicControlDispatcher(cfg *City, rigContext string) (Agent, bool) {
+	if cfg == nil {
+		return Agent{}, false
+	}
+	rigContext = strings.TrimSpace(rigContext)
+	var rigScoped Agent
+	haveRigScoped := false
+	for _, a := range cfg.Agents {
+		if !IsDeterministicControlDispatcher(&a) {
+			continue
+		}
+		if strings.TrimSpace(a.Dir) == "" {
+			return a, true
+		}
+		if !haveRigScoped && strings.TrimSpace(a.Dir) == rigContext {
+			rigScoped = a
+			haveRigScoped = true
+		}
+	}
+	if haveRigScoped {
+		return rigScoped, true
+	}
+	return Agent{}, false
 }
 
 // BindingQualifiedName returns the binding-qualified agent identity without a
@@ -248,6 +284,9 @@ type City struct {
 	Services []Service `toml:"service,omitempty"`
 	// GitHub configures GitHub-facing repository monitors.
 	GitHub GitHubConfig `toml:"github,omitempty"`
+	// ExtMsg configures the external-messaging fabric (default routes
+	// for inbound conversations with no binding).
+	ExtMsg ExtMsgConfig `toml:"extmsg,omitempty"`
 	// AgentDefaults provides root city defaults for agents that don't override
 	// them (canonical TOML key: agent_defaults). Pack-local defaults use the
 	// same table shape in pack.toml. The runtime currently applies provider,
@@ -577,6 +616,12 @@ type Rig struct {
 	// invoked with only a bead ID (no explicit target). Resolved via
 	// resolveAgentIdentity. Example: "rig/polecat"
 	DefaultSlingTarget string `toml:"default_sling_target,omitempty"`
+	// DefaultSlingTargets is the plural form of DefaultSlingTarget.
+	// When set, targetless gc sling picks one entry at random each dispatch.
+	// Takes precedence over DefaultSlingTarget when non-empty. Each entry is
+	// resolved the same way as DefaultSlingTarget. Example:
+	//   default_sling_targets = ["rig/polecat-a", "rig/polecat-b"]
+	DefaultSlingTargets []string `toml:"default_sling_targets,omitempty"`
 	// SessionSleep overrides workspace-level idle sleep defaults for agents in
 	// this rig.
 	SessionSleep SessionSleepConfig `toml:"session_sleep,omitempty"`
@@ -1095,6 +1140,18 @@ func (r *Rig) EffectivePrefix() string {
 	}
 	return DeriveBeadsPrefix(r.Name)
 }
+
+// Coordination class names, mirroring coordclass.Class.String(). They are part of
+// the [beads.classes.<name>] config contract and must not change without a
+// migration.
+const (
+	BeadClassWork      = "work"
+	BeadClassGraph     = "graph"
+	BeadClassMessaging = "messaging"
+	BeadClassSessions  = "sessions"
+	BeadClassOrders    = "orders"
+	BeadClassNudges    = "nudges"
+)
 
 // EffectiveDefaultBranch returns the rig's recorded default branch, or the
 // empty string if none is set. Callers should fall back to a runtime probe
@@ -2021,6 +2078,27 @@ type APIConfig struct {
 	// non-localhost. Set to true in containerized environments where the API
 	// must bind to 0.0.0.0 for health probes but mutations are still safe.
 	AllowMutations bool `toml:"allow_mutations,omitempty"`
+	// WriteAuthVerifyKey, when set, requires every mutating request to an
+	// already-registered city — the per-city routes under /v0/city/{cityName} —
+	// to carry a signed write grant from a configured trusted authority. It
+	// gates all per-city writes (beads, mail, sessions, agents, and config), not
+	// only config edits. City registry creation (POST /v0/city) is not covered:
+	// a grant binds a path-resident city name, which a not-yet-created city
+	// lacks, so creation stays governed by the supervisor-registry guards.
+	// Built-in callers (the bundled gc API client and dashboard SPA) send only
+	// the CSRF header and mint no grant, so enabling this gate turns their direct
+	// city mutations away with a clear 401; such deployments front mutations
+	// through the trusted authority that mints grants instead. The value is one
+	// or more "kid:base64-ed25519-pubkey" entries, comma separated.
+	// The GC_CITY_WRITE_PUBKEY env var overrides this. Grant revocation via an
+	// epoch floor is an ops-plane control set only through the
+	// GC_CITY_WRITE_EPOCH_FLOOR env var; it has no config field.
+	WriteAuthVerifyKey string `toml:"write_auth_verify_key,omitempty"`
+	// WriteAuthRequired makes a missing or empty WriteAuthVerifyKey a startup
+	// error instead of silently disabling the gate, so a config that intends to
+	// gate writes fails closed if the key is ever dropped. The
+	// GC_CITY_WRITE_REQUIRED=1 env var has the same effect.
+	WriteAuthRequired bool `toml:"write_auth_required,omitempty"`
 }
 
 // BindOrDefault returns the bind address, defaulting to "127.0.0.1".
@@ -3422,8 +3500,16 @@ func bdReadyIncludeEphemeralArg(includeEphemeralReady bool) string {
 	return ""
 }
 
+// jqMeta renders the jq expression that reads a bead-metadata key with an
+// empty-string default, e.g. (.metadata["gc.routed_to"] // ""). Shell/jq
+// builders use it so embedded key spellings stay anchored to the beadmeta
+// vocabulary constants.
+func jqMeta(key string) string {
+	return `(.metadata["` + key + `"] // "")`
+}
+
 func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string {
-	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json ` + limitFlag
+	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "` + beadmeta.RoutedToMetadataKey + `=$target" --unassigned --exclude-type=epic --json ` + limitFlag
 }
 
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
@@ -3435,11 +3521,11 @@ func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string
 // requires jq in the default worker/reconciler environment; remove it with the
 // Go-side legacy candidates after the backfill completion tracked by ga-dhf44.
 func bdReadyPoolDemandMigrationShell(limitFlag string, includeEphemeralReady bool) string {
-	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest ` + limitFlag
+	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "` + beadmeta.RunTargetMetadataKey + `=$target" --metadata-field "` + beadmeta.KindMetadataKey + `=` + beadmeta.KindWorkflow + `" --unassigned --exclude-type=epic --json --sort oldest ` + limitFlag
 }
 
 func poolDemandMigrationFilterJQ(limit int) string {
-	filter := `[.[] | select((.metadata["gc.routed_to"] // "") == "")]`
+	filter := `[.[] | select(` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "")]`
 	if limit > 0 {
 		filter += ` | .[:` + strconv.Itoa(limit) + `]`
 	}
@@ -3473,7 +3559,7 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 	}
 	filter := legacyEphemeralReadyFilterJQ(
 		`select((.assignee // "") == "")`+
-			` | select(((.metadata["gc.routed_to"] // "") == $target) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $target) and ((.metadata["gc.kind"] // "") == "workflow")))`,
+			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`")))`,
 		limit,
 	)
 	query := bdQueryEphemeralStatusShell("open")
@@ -3509,8 +3595,12 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 
 func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// The shared predicate stays order-free so the count-form does no wasted
-	// sorting; the worker first-row path asks bd for the oldest candidate.
-	return bdReadyPoolDemandShell("--sort oldest --limit=1", includeEphemeralReady) + ` 2>/dev/null`
+	// sorting; the worker first-row path asks bd for the oldest candidates.
+	// The tier is widened past a single row (limit=20, not limit=1) so a
+	// self-blocked head (is_blocked / status==blocked) has Ready routed work
+	// behind it to fall through to instead of idle-exiting; the hook layer
+	// (filterUnreadyHookCandidates) strips the blocked head from the result.
+	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -3808,7 +3898,7 @@ func (a *Agent) EffectiveSlingQuery() string {
 // this agent. Callers outside config should prefer this helper over rebuilding
 // the command string to preserve the bd boundary invariant.
 func (a *Agent) DefaultSlingQuery() string {
-	return "bd update {} --set-metadata gc.routed_to=" + a.QualifiedName()
+	return "bd update {} --set-metadata " + beadmeta.RoutedToMetadataKey + "=" + a.QualifiedName()
 }
 
 // EffectiveDefaultSlingFormula returns the default sling formula for
@@ -4040,7 +4130,7 @@ func (a *Agent) effectiveOnDeath(includeEphemeralInProgress bool) string {
 	}
 	_ = includeEphemeralInProgress
 	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq -r --arg assignee ` + shellquote.Quote(a.QualifiedName()) + ` '.[] | select((.assignee // "") == $assignee) | [.id, (.metadata["gc.run_target"] // ""), (.metadata["gc.routed_to"] // "")] | @tsv' 2>/dev/null; `
+		`jq -r --arg assignee ` + shellquote.Quote(a.QualifiedName()) + ` '.[] | select((.assignee // "") == $assignee) | [.id, ` + jqMeta(beadmeta.RunTargetMetadataKey) + `, ` + jqMeta(beadmeta.RoutedToMetadataKey) + `] | @tsv' 2>/dev/null; `
 	// Reset both assignee and status: clearing assignee alone leaves the bead
 	// invisible to every work_query tier (Tier 1 needs assignee match, Tiers
 	// 2/3 only match "ready" status). The next worker re-claims via Tier 3.
@@ -4050,14 +4140,14 @@ func (a *Agent) effectiveOnDeath(includeEphemeralInProgress bool) string {
 	return `{ ` +
 		`bd list --assignee=` + a.QualifiedName() +
 		` --status=in_progress --json 2>/dev/null | ` +
-		`jq -r '.[] | [.id, (.metadata["gc.run_target"] // ""), (.metadata["gc.routed_to"] // "")] | @tsv' 2>/dev/null; ` +
+		`jq -r '.[] | [.id, ` + jqMeta(beadmeta.RunTargetMetadataKey) + `, ` + jqMeta(beadmeta.RoutedToMetadataKey) + `] | @tsv' 2>/dev/null; ` +
 		ephemeralRead +
 		`} | ` +
 		`while IFS="$(printf '\t')" read -r id run_target routed_to; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`if [ -n "$run_target" ] || [ -n "$routed_to" ]; then ` +
 		`bd update "$id" --assignee "" --status open 2>/dev/null; ` +
-		`else bd update "$id" --assignee "" --status open --set-metadata ` + shellquote.Quote("gc.run_target="+route) + ` 2>/dev/null; ` +
+		`else bd update "$id" --assignee "" --status open --set-metadata ` + shellquote.Quote(beadmeta.RunTargetMetadataKey+"="+route) + ` 2>/dev/null; ` +
 		`fi; ` +
 		`done`
 }
@@ -4085,13 +4175,13 @@ func (a *Agent) effectiveOnBoot(includeEphemeralInProgress bool) string {
 	}
 	_ = includeEphemeralInProgress
 	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq -r --arg template "$template" '.[] | select((.assignee // "") == "") | select(((.metadata["gc.routed_to"] // "") == $template) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $template) and ((.metadata["gc.kind"] // "") == "workflow"))) | .id' 2>/dev/null; `
+		`jq -r --arg template "$template" '.[] | select((.assignee // "") == "") | select((` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == $template) or ((` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") and (` + jqMeta(beadmeta.RunTargetMetadataKey) + ` == $template) and (` + jqMeta(beadmeta.KindMetadataKey) + ` == "` + beadmeta.KindWorkflow + `"))) | .id' 2>/dev/null; `
 	return `template=` + shellquote.Quote(template) + `; ` +
 		`{ ` +
-		`bd list --metadata-field "gc.routed_to=$template" --status=in_progress --no-assignee --json 2>/dev/null | ` +
+		`bd list --metadata-field "` + beadmeta.RoutedToMetadataKey + `=$template" --status=in_progress --no-assignee --json 2>/dev/null | ` +
 		`jq -r '.[].id' 2>/dev/null; ` +
-		`bd list --metadata-field "gc.run_target=$template" --metadata-field "gc.kind=workflow" --status=in_progress --no-assignee --json 2>/dev/null | ` +
-		`jq -r '.[] | select((.metadata["gc.routed_to"] // "") == "") | .id' 2>/dev/null; ` +
+		`bd list --metadata-field "` + beadmeta.RunTargetMetadataKey + `=$template" --metadata-field "` + beadmeta.KindMetadataKey + `=` + beadmeta.KindWorkflow + `" --status=in_progress --no-assignee --json 2>/dev/null | ` +
+		`jq -r '.[] | select(` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") | .id' 2>/dev/null; ` +
 		ephemeralRead +
 		`} | awk 'NF && !seen[$0]++' | ` +
 		`xargs -rI{} bd update {} --status open 2>/dev/null`
@@ -4734,6 +4824,16 @@ func validateDependsOn(agents []Agent) error {
 // ValidateRigs checks rig configurations for errors. It returns an error if
 // any rig is missing required fields, has duplicate names, or has colliding
 // prefixes. The hqPrefix is the city's HQ prefix for collision checks.
+//
+// Reserved coordination-class id-prefixes (gcg/gcm/gcs/gco/gcn) are not rejected
+// here. On a default city the relocated SQLite class stores are an identity
+// seam — every class store resolves to the work store and the by-id class-prefix
+// routing arm never fires — so a work prefix that shadows one is harmless until
+// the multi-backend fork makes per-class stores independently routable. Making
+// the prefix fatal would break gc start and config reload for an existing city
+// that already uses one, so ReservedPrefixWarnings surfaces it as a non-fatal
+// advisory instead. Promote it back into a hard error here once per-class
+// routing activates.
 func ValidateRigs(rigs []Rig, hqPrefix string) error {
 	seenNames := make(map[string]bool, len(rigs))
 	seenPrefixes := make(map[string]string) // lowercase prefix → rig name (for error messages)
@@ -4766,6 +4866,29 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 		seenPrefixes[prefix] = r.Name
 	}
 	return nil
+}
+
+// ReservedPrefixWarnings returns advisory warnings for any effective HQ or rig
+// work-store prefix that shadows a reserved coordination-class id-prefix
+// (gcg/gcm/gcs/gco/gcn). The relocated SQLite class stores that mint these
+// prefixes are an identity seam on a default city, so such a prefix is allowed
+// today (see ValidateRigs) and only becomes ambiguous once the multi-backend
+// fork activates per-class routing. Callers should surface these as non-fatal
+// operator warnings so an existing city or rig that already uses one keeps
+// starting and reloading while it still has time to rename. The hqPrefix must
+// already be site-bound resolved (e.g. via EffectiveHQPrefix).
+func ReservedPrefixWarnings(rigs []Rig, hqPrefix string) []string {
+	var warnings []string
+	if IsReservedClassPrefix(hqPrefix) {
+		warnings = append(warnings, fmt.Sprintf("HQ prefix %q is a reserved coordination-class id-prefix (%s); it is allowed today because class-store relocation is inert, but rename it before per-class stores activate or class ids will be ambiguous", strings.ToLower(strings.TrimSpace(hqPrefix)), reservedClassPrefixListText()))
+	}
+	for _, r := range rigs {
+		prefix := strings.ToLower(r.EffectivePrefix())
+		if IsReservedClassPrefix(prefix) {
+			warnings = append(warnings, fmt.Sprintf("rig %q prefix %q is a reserved coordination-class id-prefix (%s); it is allowed today because class-store relocation is inert, but rename it before per-class stores activate or class ids will be ambiguous", r.Name, prefix, reservedClassPrefixListText()))
+		}
+	}
+	return warnings
 }
 
 // DefaultCity returns a City with the given name and a single default
@@ -4879,9 +5002,13 @@ func GastownCity(name, provider, startCommand string) City {
 
 // GascityCityWithProviders returns a minimal managed city that imports the
 // public gascity planning/implementation skills pack: a single mayor agent
-// plus [imports.gascity] pinned to the registry release. The pack ships
-// skills and formulas only (no agents), so the city shape matches the
-// minimal template with the pack layered on top.
+// plus [imports.gascity] (skills and formulas) pinned to the registry release.
+// The gascity formulas route their steps to role agents (gc.run-operator,
+// gc.requirements-planner, ...) that ship in the separate gc-roles subpack, so
+// the template also seeds that pack as a default rig import bound "gc" — every
+// rig added to the city then inherits the providerless, rig-scoped roles the
+// formulas coordinate. Without it a fresh city can discover a formula but fails
+// to launch with `agent "gc.run-operator" not found in city.toml` (gascity#3832).
 func GascityCityWithProviders(name, defaultProvider string, providers []string) City {
 	city := WizardCityWithProviders(name, defaultProvider, providers)
 	city.Imports = map[string]Import{
@@ -4890,6 +5017,13 @@ func GascityCityWithProviders(name, defaultProvider string, providers []string) 
 			Version: PublicGascityPackVersion,
 		},
 	}
+	city.DefaultRigImports = map[string]Import{
+		"gc": {
+			Source:  PublicGascityRolesPackSource,
+			Version: PublicGascityPackVersion,
+		},
+	}
+	city.DefaultRigImportOrder = []string{"gc"}
 	return city
 }
 
